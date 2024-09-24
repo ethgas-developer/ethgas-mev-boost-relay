@@ -185,6 +185,11 @@ func (c *ProdBeaconInstance) SyncStatus() (*SyncStatusPayloadData, error) {
 	timeout := 5 * time.Second
 	resp := new(SyncStatusPayload)
 	_, err := fetchBeacon(http.MethodGet, uri, nil, resp, &http.Client{Timeout: timeout}, http.Header{}, false)
+	if resp.Data.HeadSlot == 0 {
+		resp.Data.IsSyncing = false
+		return &resp.Data, nil
+	}
+
 	if err != nil {
 		return nil, err
 	}
