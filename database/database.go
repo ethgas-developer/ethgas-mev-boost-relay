@@ -10,10 +10,10 @@ import (
 	"strings"
 	"time"
 
+	"bitbucket.org/infinity-exchange/mev-boost-relay/common"
+	"bitbucket.org/infinity-exchange/mev-boost-relay/database/migrations"
+	"bitbucket.org/infinity-exchange/mev-boost-relay/database/vars"
 	builderApiV1 "github.com/attestantio/go-builder-client/api/v1"
-	"github.com/flashbots/mev-boost-relay/common"
-	"github.com/flashbots/mev-boost-relay/database/migrations"
-	"github.com/flashbots/mev-boost-relay/database/vars"
 	"github.com/holiman/uint256"
 	"github.com/jmoiron/sqlx"
 	_ "github.com/lib/pq"

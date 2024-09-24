@@ -3,6 +3,7 @@ package api
 import (
 	"testing"
 
+	"bitbucket.org/infinity-exchange/mev-boost-relay/common"
 	builderApiCapella "github.com/attestantio/go-builder-client/api/capella"
 	builderApiDeneb "github.com/attestantio/go-builder-client/api/deneb"
 	builderApiV1 "github.com/attestantio/go-builder-client/api/v1"
@@ -16,7 +17,6 @@ import (
 	"github.com/flashbots/go-boost-utils/ssz"
 	"github.com/flashbots/go-boost-utils/types"
 	"github.com/flashbots/go-boost-utils/utils"
-	"github.com/flashbots/mev-boost-relay/common"
 	"github.com/holiman/uint256"
 	"github.com/stretchr/testify/require"
 )

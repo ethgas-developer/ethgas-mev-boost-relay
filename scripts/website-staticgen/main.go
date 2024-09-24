@@ -7,7 +7,7 @@ import (
 	"io"
 	"os"
 
-	"github.com/flashbots/mev-boost-relay/services/website"
+	"bitbucket.org/infinity-exchange/mev-boost-relay/services/website"
 )
 
 func main() {

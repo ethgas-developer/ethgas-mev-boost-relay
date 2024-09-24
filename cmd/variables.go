@@ -3,7 +3,7 @@ package cmd
 import (
 	"os"
 
-	"github.com/flashbots/mev-boost-relay/common"
+	"bitbucket.org/infinity-exchange/mev-boost-relay/common"
 )
 
 var (

@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"bitbucket.org/infinity-exchange/mev-boost-relay/common"
 	"github.com/attestantio/go-eth2-client/spec/capella"
-	"github.com/flashbots/mev-boost-relay/common"
 	"github.com/r3labs/sse/v2"
 	"github.com/sirupsen/logrus"
 )

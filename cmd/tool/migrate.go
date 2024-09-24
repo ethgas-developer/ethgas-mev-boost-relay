@@ -3,8 +3,8 @@ package tool
 import (
 	"net/url"
 
-	"github.com/flashbots/mev-boost-relay/database/migrations"
-	"github.com/flashbots/mev-boost-relay/database/vars"
+	"bitbucket.org/infinity-exchange/mev-boost-relay/database/migrations"
+	"bitbucket.org/infinity-exchange/mev-boost-relay/database/vars"
 	"github.com/jmoiron/sqlx"
 	migrate "github.com/rubenv/sql-migrate"
 	"github.com/spf13/cobra"

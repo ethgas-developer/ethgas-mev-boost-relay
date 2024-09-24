@@ -4,11 +4,11 @@ import (
 	"encoding/json"
 	"errors"
 
+	"bitbucket.org/infinity-exchange/mev-boost-relay/common"
 	builderApi "github.com/attestantio/go-builder-client/api"
 	builderApiDeneb "github.com/attestantio/go-builder-client/api/deneb"
 	"github.com/attestantio/go-eth2-client/spec"
 	"github.com/attestantio/go-eth2-client/spec/capella"
-	"github.com/flashbots/mev-boost-relay/common"
 )
 
 var ErrUnsupportedExecutionPayload = errors.New("unsupported execution payload version")

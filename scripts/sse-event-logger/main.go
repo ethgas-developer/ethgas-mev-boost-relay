@@ -7,8 +7,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/flashbots/mev-boost-relay/beaconclient"
-	"github.com/flashbots/mev-boost-relay/common"
+	"bitbucket.org/infinity-exchange/mev-boost-relay/beaconclient"
+	"bitbucket.org/infinity-exchange/mev-boost-relay/common"
 	"github.com/sirupsen/logrus"
 )
 

@@ -12,10 +12,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"bitbucket.org/infinity-exchange/mev-boost-relay/common"
 	"github.com/attestantio/go-eth2-client/spec"
 	"github.com/flashbots/go-utils/cli"
 	"github.com/flashbots/go-utils/jsonrpc"
-	"github.com/flashbots/mev-boost-relay/common"
 )
 
 var (

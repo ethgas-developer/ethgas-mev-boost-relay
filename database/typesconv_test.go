@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/flashbots/mev-boost-relay/common"
+	"bitbucket.org/infinity-exchange/mev-boost-relay/common"
 	"github.com/stretchr/testify/require"
 )
 

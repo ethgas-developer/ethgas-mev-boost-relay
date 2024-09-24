@@ -7,9 +7,9 @@ import (
 	"os"
 	"strings"
 
-	"github.com/flashbots/mev-boost-relay/common"
-	"github.com/flashbots/mev-boost-relay/database"
-	"github.com/flashbots/mev-boost-relay/database/vars"
+	"bitbucket.org/infinity-exchange/mev-boost-relay/common"
+	"bitbucket.org/infinity-exchange/mev-boost-relay/database"
+	"bitbucket.org/infinity-exchange/mev-boost-relay/database/vars"
 	"github.com/spf13/cobra"
 )
 

@@ -3,7 +3,7 @@ package cmd
 import (
 	"fmt"
 
-	"github.com/flashbots/mev-boost-relay/cmd/tool"
+	"bitbucket.org/infinity-exchange/mev-boost-relay/cmd/tool"
 	"github.com/spf13/cobra"
 )
 

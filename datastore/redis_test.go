@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"bitbucket.org/infinity-exchange/mev-boost-relay/common"
 	"github.com/alicebob/miniredis/v2"
 	builderApiCapella "github.com/attestantio/go-builder-client/api/capella"
 	builderApiV1 "github.com/attestantio/go-builder-client/api/v1"
@@ -15,7 +16,6 @@ import (
 	"github.com/attestantio/go-eth2-client/spec"
 	"github.com/attestantio/go-eth2-client/spec/bellatrix"
 	"github.com/attestantio/go-eth2-client/spec/phase0"
-	"github.com/flashbots/mev-boost-relay/common"
 	"github.com/go-redis/redis/v9"
 	"github.com/holiman/uint256"
 	"github.com/stretchr/testify/require"

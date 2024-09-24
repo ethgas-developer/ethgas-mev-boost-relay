@@ -3,6 +3,7 @@ package api
 import (
 	"fmt"
 
+	"bitbucket.org/infinity-exchange/mev-boost-relay/common"
 	builderApi "github.com/attestantio/go-builder-client/api"
 	"github.com/attestantio/go-eth2-client/spec"
 	"github.com/attestantio/go-eth2-client/spec/capella"
@@ -10,7 +11,6 @@ import (
 	eth2UtilCapella "github.com/attestantio/go-eth2-client/util/capella"
 	"github.com/flashbots/go-boost-utils/bls"
 	"github.com/flashbots/go-boost-utils/utils"
-	"github.com/flashbots/mev-boost-relay/common"
 	"github.com/pkg/errors"
 )
 

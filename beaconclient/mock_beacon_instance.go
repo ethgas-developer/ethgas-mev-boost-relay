@@ -4,7 +4,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/flashbots/mev-boost-relay/common"
+	"bitbucket.org/infinity-exchange/mev-boost-relay/common"
 )
 
 type MockBeaconInstance struct {

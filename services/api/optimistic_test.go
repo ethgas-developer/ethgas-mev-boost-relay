@@ -11,6 +11,10 @@ import (
 	"testing"
 	"time"
 
+	"bitbucket.org/infinity-exchange/mev-boost-relay/beaconclient"
+	"bitbucket.org/infinity-exchange/mev-boost-relay/common"
+	"bitbucket.org/infinity-exchange/mev-boost-relay/database"
+	"bitbucket.org/infinity-exchange/mev-boost-relay/datastore"
 	"github.com/alicebob/miniredis/v2"
 	builderApiV1 "github.com/attestantio/go-builder-client/api/v1"
 	"github.com/attestantio/go-eth2-client/spec"
@@ -19,10 +23,6 @@ import (
 	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/flashbots/go-boost-utils/bls"
 	"github.com/flashbots/go-boost-utils/utils"
-	"github.com/flashbots/mev-boost-relay/beaconclient"
-	"github.com/flashbots/mev-boost-relay/common"
-	"github.com/flashbots/mev-boost-relay/database"
-	"github.com/flashbots/mev-boost-relay/datastore"
 	"github.com/holiman/uint256"
 	"github.com/stretchr/testify/require"
 )

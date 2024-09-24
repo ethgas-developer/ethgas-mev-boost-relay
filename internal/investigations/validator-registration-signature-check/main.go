@@ -8,11 +8,11 @@ import (
 	"fmt"
 	"time"
 
+	"bitbucket.org/infinity-exchange/mev-boost-relay/common"
 	builderApiV1 "github.com/attestantio/go-builder-client/api/v1"
 	"github.com/flashbots/go-boost-utils/bls"
 	"github.com/flashbots/go-boost-utils/ssz"
 	"github.com/flashbots/go-boost-utils/utils"
-	"github.com/flashbots/mev-boost-relay/common"
 )
 
 var (

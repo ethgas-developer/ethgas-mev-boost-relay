@@ -5,11 +5,11 @@ import (
 	"os"
 	"strings"
 
-	"github.com/flashbots/mev-boost-relay/beaconclient"
-	"github.com/flashbots/mev-boost-relay/common"
-	"github.com/flashbots/mev-boost-relay/database"
-	"github.com/flashbots/mev-boost-relay/datastore"
-	"github.com/flashbots/mev-boost-relay/services/housekeeper"
+	"bitbucket.org/infinity-exchange/mev-boost-relay/beaconclient"
+	"bitbucket.org/infinity-exchange/mev-boost-relay/common"
+	"bitbucket.org/infinity-exchange/mev-boost-relay/database"
+	"bitbucket.org/infinity-exchange/mev-boost-relay/datastore"
+	"bitbucket.org/infinity-exchange/mev-boost-relay/services/housekeeper"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )

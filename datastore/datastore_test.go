@@ -3,9 +3,9 @@ package datastore
 import (
 	"testing"
 
+	"bitbucket.org/infinity-exchange/mev-boost-relay/common"
+	"bitbucket.org/infinity-exchange/mev-boost-relay/database"
 	"github.com/alicebob/miniredis/v2"
-	"github.com/flashbots/mev-boost-relay/common"
-	"github.com/flashbots/mev-boost-relay/database"
 	"github.com/stretchr/testify/require"
 )
 

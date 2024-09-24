@@ -5,7 +5,7 @@ import (
 	"math/big"
 	"text/template"
 
-	"github.com/flashbots/mev-boost-relay/database"
+	"bitbucket.org/infinity-exchange/mev-boost-relay/database"
 	"golang.org/x/text/cases"
 	"golang.org/x/text/language"
 	"golang.org/x/text/message"

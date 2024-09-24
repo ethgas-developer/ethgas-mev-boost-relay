@@ -1,8 +1,8 @@
 package beaconclient
 
 import (
+	"bitbucket.org/infinity-exchange/mev-boost-relay/common"
 	"github.com/attestantio/go-eth2-client/spec/capella"
-	"github.com/flashbots/mev-boost-relay/common"
 )
 
 type MockMultiBeaconClient struct{}
