@@ -734,6 +734,16 @@ func (r *RedisCache) GetTopBidValue(ctx context.Context, pipeliner redis.Pipelin
 	return topBidValue, nil
 }
 
+func (r *RedisCache) GetBuilderLatestBid(slot uint64, parentHash, proposerPubkey, builderPubkey string) (*builderSpec.VersionedSignedBuilderBid, error) {
+	key := r.keyLatestBidByBuilder(slot, parentHash, proposerPubkey, builderPubkey)
+	resp := new(builderSpec.VersionedSignedBuilderBid)
+	err := r.GetObj(key, resp)
+	if errors.Is(err, redis.Nil) {
+		return nil, nil
+	}
+	return resp, err
+}
+
 // GetBuilderLatestValue gets the latest bid value for a given slot+parent+proposer combination for a specific builder pubkey.
 func (r *RedisCache) GetBuilderLatestValue(slot uint64, parentHash, proposerPubkey, builderPubkey string) (topBidValue *big.Int, err error) {
 	keyLatestValue := r.keyBlockBuilderLatestBidsValue(slot, parentHash, proposerPubkey)

@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -87,10 +88,11 @@ var (
 	numValidatorRegProcessors = cli.GetEnvInt("NUM_VALIDATOR_REG_PROCESSORS", 10)
 
 	// various timings
-	timeoutGetPayloadRetryMs  = cli.GetEnvInt("GETPAYLOAD_RETRY_TIMEOUT_MS", 100)
-	getHeaderRequestCutoffMs  = cli.GetEnvInt("GETHEADER_REQUEST_CUTOFF_MS", 3000)
-	getPayloadRequestCutoffMs = cli.GetEnvInt("GETPAYLOAD_REQUEST_CUTOFF_MS", 4000)
-	getPayloadResponseDelayMs = cli.GetEnvInt("GETPAYLOAD_RESPONSE_DELAY_MS", 1000)
+	timeoutGetPayloadRetryMs   = cli.GetEnvInt("GETPAYLOAD_RETRY_TIMEOUT_MS", 100)
+	getTargetedBuilderCutoffMs = cli.GetEnvInt("GETHEADER_TARGETED_BUILDER_REQUEST_CUTOFF_MS", 1000)
+	getHeaderRequestCutoffMs   = cli.GetEnvInt("GETHEADER_REQUEST_CUTOFF_MS", 3000)
+	getPayloadRequestCutoffMs  = cli.GetEnvInt("GETPAYLOAD_REQUEST_CUTOFF_MS", 4000)
+	getPayloadResponseDelayMs  = cli.GetEnvInt("GETPAYLOAD_RESPONSE_DELAY_MS", 1000)
 
 	// api settings
 	apiReadTimeoutMs       = cli.GetEnvInt("API_TIMEOUT_READ_MS", 1500)
@@ -113,6 +115,72 @@ var (
 		"mev-boost/v1.5.0 Go-http-client/1.1", // Prysm v4.0.1 (Shapella signing issue)
 	})
 )
+
+// PreconfRequest structure to match the TypeScript server's response
+// https://bitbucket.org/infinity-exchange/infinity-core/src/ce4bbcc9e72068d711e0719893bbaf841cf4d402/scripts/preconfMultiTxServer.ts?at=enhancement%2F8_jan
+// using this as response structure for test
+// type PreconfRequest struct {
+// 	PreconfTx         []byte            `json:"preconf_tx"`
+// 	PreconfConditions PreconfConditions `json:"preconf_conditions"`
+// 	SignedTx          string            `json:"signedTx"`
+// }
+
+// type PreconfConditions struct {
+// 	OrderingMetaData OrderingMetaData `json:"ordering_meta_data"`
+// }
+
+// type OrderingMetaData struct {
+// 	Index int `json:"index"`
+// }
+
+// type PreconfTxData struct {
+// 	Hash      string `json:"hash"`
+// 	Signature struct {
+// 		R          string `json:"r"`
+// 		S          string `json:"s"`
+// 		OddYParity bool   `json:"odd_y_parity"`
+// 	} `json:"signature"`
+// 	Transaction Transaction `json:"transaction"` // Transaction is an object, not a string
+// }
+
+// type Transaction struct {
+// 	Eip1559 Eip1559Transaction `json:"Eip1559"`
+// }
+
+// type Eip1559Transaction struct {
+// 	ChainID              int      `json:"chain_id"`
+// 	Nonce                uint64   `json:"nonce"`
+// 	GasLimit             uint64   `json:"gas_limit"`
+// 	MaxFeePerGas         uint64   `json:"max_fee_per_gas"`
+// 	MaxPriorityFeePerGas uint64   `json:"max_priority_fee_per_gas"`
+// 	To                   Call     `json:"to"`
+// 	Value                string   `json:"value"`       // Hex string
+// 	AccessList           []string `json:"access_list"` // Assuming empty list for now
+// 	Input                string   `json:"input"`
+// }
+
+// // Call represents the "to" field in the EIP-1559 transaction
+// type Call struct {
+// 	Call string `json:"Call"` // Represents the address in the "to" field
+// }
+
+// match this response
+// https://bitbucket.org/infinity-exchange/infinity-core/src/eafb819faac26b8fe23e27f44c0be30a2ef5058b/scripts/preconfMultiTxAsyncServer.ts?at=enhancement%2F8_jan
+type PreconfResponse struct {
+	PreconfTxs        [][]byte `json:"preconf_txs"`
+	PreconfConditions struct {
+		OrderingMetaData struct {
+			Index int `json:"index"`
+		} `json:"ordering_meta_data"`
+	} `json:"preconf_conditions"`
+	SignedTxs   []string `json:"signedTxs"`
+	AvgBidPrice uint64   `json:"avg_bid_price"`
+}
+
+type BuilderResponse struct {
+	Builder         string `json:"builder"`
+	FallbackBuilder string `json:"fallbackBuilder"`
+}
 
 // RelayAPIOpts contains the options for a relay
 type RelayAPIOpts struct {
@@ -1159,6 +1227,7 @@ func (api *RelayAPI) handleRegisterValidator(w http.ResponseWriter, req *http.Re
 	w.WriteHeader(http.StatusOK)
 }
 
+// > validator get header suppose getting lastest one (also check the preconf list)
 func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 	vars := mux.Vars(req)
 	slotStr := vars["slot"]
@@ -1231,8 +1300,18 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+	log.Info("=============get builder")
 
-	bid, err := api.redis.GetBestBid(slot, parentHashHex, proposerPubkeyHex)
+	builderResp, err := FetchBuilderPubKey("http://localhost:3210", slot)
+	if err != nil {
+		log.Info("cannot get builder id for this slot")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	log.Info("builder id", builderResp.Builder)
+	// bid, err := api.redis.GetBestBid(slot, parentHashHex, proposerPubkeyHex)
+	bid, err := api.redis.GetBuilderLatestBid(slot, parentHashHex, proposerPubkeyHex, builderResp.Builder)
+
 	if err != nil {
 		log.WithError(err).Error("could not get bid")
 		api.RespondError(w, http.StatusBadRequest, err.Error())
@@ -1240,8 +1319,31 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 	}
 
 	if bid == nil || bid.IsEmpty() {
-		w.WriteHeader(http.StatusNoContent)
-		return
+		//check if almost timeout to build next block, then use fallback builder (ethgas pubkey)
+		// within slot started 1 - 3 sec
+		if getTargetedBuilderCutoffMs > 0 && msIntoSlot > 0 && msIntoSlot > int64(getTargetedBuilderCutoffMs) {
+			log.Info("use fallback builder id", builderResp.FallbackBuilder)
+
+			bid, err = api.redis.GetBuilderLatestBid(slot, parentHashHex, proposerPubkeyHex, builderResp.FallbackBuilder)
+
+			if err != nil {
+				log.WithError(err).Error("could not get bid")
+				api.RespondError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+
+			if bid == nil || bid.IsEmpty() {
+				log.Info("no fallback bid")
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+
+		} else {
+			log.Info("no targeted bid, remain time: ", msIntoSlot)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
 	}
 
 	value, err := bid.Value()
@@ -1255,11 +1357,12 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 		api.RespondError(w, http.StatusBadRequest, err.Error())
 	}
 
-	// Error on bid without value
-	if value.Cmp(uint256.NewInt(0)) == 0 {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
+	// preconf txs should have 0 bid value if there have no public txs
+	// // Error on bid without value
+	// if value.Cmp(uint256.NewInt(0)) == 0 {
+	// 	w.WriteHeader(http.StatusNoContent)
+	// 	return
+	// }
 
 	log.WithFields(logrus.Fields{
 		"value":     value.String(),
@@ -1883,6 +1986,7 @@ func (api *RelayAPI) updateRedisBid(opts redisUpdateBidOpts) (*datastore.SaveBid
 	return &updateBidResult, getPayloadResponse, true
 }
 
+// check handleSubmitNewBlock
 func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Request) {
 	var pf common.Profile
 	var prevTime, nextTime time.Time
@@ -1890,6 +1994,27 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	headSlot := api.headSlot.Load()
 	receivedAt := time.Now().UTC()
 	prevTime = receivedAt
+
+	// Fetch the preconf list from the preconf server
+	// TODO configable value
+	//config PreconfServerURL = localhost.....
+	url := fmt.Sprintf("%s/preconf_request/%d", "http://localhost:3210", headSlot)
+	resp, _err := http.Get(url)
+	if _err != nil {
+		api.log.Println("Error fetching preconf list:", _err)
+		return
+	}
+	defer resp.Body.Close()
+
+	var preconfArr []PreconfResponse
+
+	_err = json.NewDecoder(resp.Body).Decode(&preconfArr)
+	if _err != nil {
+		api.log.Println("Error decoding preconf response:", _err)
+		return
+	}
+	api.log.Info("=============preconfs==========")
+	api.log.Println(preconfArr)
 
 	args := req.URL.Query()
 	isCancellationEnabled := args.Get("cancellations") == "1"
@@ -1990,6 +2115,51 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		api.RespondError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
+	//------logic to Checking dose preconf transaction inculded in the block
+	blockTxMap := make(map[string]struct{})
+	for _, tx := range submission.Transactions {
+		log.Println("=======tx")
+		// log.Println(tx)
+		log.Println("0x" + hex.EncodeToString(tx))
+
+		blockTxMap["0x"+hex.EncodeToString(tx)] = struct{}{}
+	}
+	missingTxs := []string{}
+	count := 0
+	for _, preconf := range preconfArr {
+		for _, preconfTx := range preconf.SignedTxs {
+			count++
+			if _, exists := blockTxMap[preconfTx]; !exists {
+				// log.Printf("Missing preconf transaction: %s", preconfTxHex) // Log the missing transaction in hex
+				missingTxs = append(missingTxs, preconfTx) // Add to missing transactions
+			}
+		}
+	}
+	// for _, preconfTx := range preconfs.Txs {
+	// 	// log.Println("=======preconf")
+	// 	// log.Println(preconfTxHex)
+
+	// 	// Check if the preconf transaction exists in the block transactions
+	// 	if _, exists := blockTxMap[preconfTx]; !exists {
+	// 		// log.Printf("Missing preconf transaction: %s", preconfTxHex) // Log the missing transaction in hex
+	// 		missingTxs = append(missingTxs, preconfTx) // Add to missing transactions
+	// 	}
+	// }
+
+	// After checking all transactions, log the results
+	if len(missingTxs) > 0 {
+		log.Printf("Total missing transactions: %d", len(missingTxs))
+		log.Printf("Number of transactions: %d", len(submission.Transactions))
+
+		log.Println("Missing preconf transaction hexes:", missingTxs)
+		return //drop this block
+	} else {
+		log.Printf("All preconf transactions are included in the block! submissed Transactions:%d, preconf transaction: %d", len(submission.Transactions), count)
+	}
+
+	//end of check
+
 	log = log.WithFields(logrus.Fields{
 		"timestampAfterDecoding": time.Now().UTC().UnixMilli(),
 		"slot":                   submission.BidTrace.Slot,
@@ -2081,6 +2251,8 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		simResultC:           simResultC,
 		submission:           submission,
 	}
+
+	//TODO remove floor bid checking
 	floorBidValue, ok := api.checkFloorBidValue(bfOpts)
 	if !ok {
 		return
@@ -2656,4 +2828,32 @@ func (api *RelayAPI) handleReadyz(w http.ResponseWriter, req *http.Request) {
 	} else {
 		api.RespondMsg(w, http.StatusServiceUnavailable, "not ready")
 	}
+}
+
+// FetchBuilderPubKey fetches the builder and fallbackBuilder from the /preconf_builder_pubkey/:slot endpoint
+func FetchBuilderPubKey(apiURL string, slot uint64) (*BuilderResponse, error) {
+	// Construct the URL for the API request
+	url := fmt.Sprintf("%s/preconf_builder_pubkey/%d", apiURL, slot)
+
+	// Send HTTP GET request
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	// Check if the HTTP response status code is OK (200)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("received non-OK status code: %d", resp.StatusCode)
+	}
+
+	// Parse the JSON response
+	var builderResp BuilderResponse
+	err = json.NewDecoder(resp.Body).Decode(&builderResp)
+	if err != nil {
+		return nil, err
+	}
+
+	// Return the parsed builder and fallbackBuilder
+	return &builderResp, nil
 }
