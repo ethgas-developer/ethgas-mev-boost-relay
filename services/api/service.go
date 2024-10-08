@@ -88,11 +88,12 @@ var (
 	numValidatorRegProcessors = cli.GetEnvInt("NUM_VALIDATOR_REG_PROCESSORS", 10)
 
 	// various timings
-	timeoutGetPayloadRetryMs   = cli.GetEnvInt("GETPAYLOAD_RETRY_TIMEOUT_MS", 100)
-	getTargetedBuilderCutoffMs = cli.GetEnvInt("GETHEADER_TARGETED_BUILDER_REQUEST_CUTOFF_MS", 1000)
-	getHeaderRequestCutoffMs   = cli.GetEnvInt("GETHEADER_REQUEST_CUTOFF_MS", 3000)
-	getPayloadRequestCutoffMs  = cli.GetEnvInt("GETPAYLOAD_REQUEST_CUTOFF_MS", 4000)
-	getPayloadResponseDelayMs  = cli.GetEnvInt("GETPAYLOAD_RESPONSE_DELAY_MS", 1000)
+	timeoutGetPayloadRetryMs     = cli.GetEnvInt("GETPAYLOAD_RETRY_TIMEOUT_MS", 100)
+	getExchangeFinalizedCutoffMs = cli.GetEnvInt("GETHEADER_EXCHANGE_FINALIZED_CUTOFF_MS", -1000)
+	getTargetedBuilderCutoffMs   = cli.GetEnvInt("GETHEADER_TARGETED_BUILDER_REQUEST_CUTOFF_MS", 0)
+	getHeaderRequestCutoffMs     = cli.GetEnvInt("GETHEADER_REQUEST_CUTOFF_MS", 3000)
+	getPayloadRequestCutoffMs    = cli.GetEnvInt("GETPAYLOAD_REQUEST_CUTOFF_MS", 4000)
+	getPayloadResponseDelayMs    = cli.GetEnvInt("GETPAYLOAD_RESPONSE_DELAY_MS", 1000)
 
 	// api settings
 	apiReadTimeoutMs       = cli.GetEnvInt("API_TIMEOUT_READ_MS", 1500)
@@ -1300,13 +1301,24 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+
+	// Only allow requests for the current slot after exchange finished trading
+	if msIntoSlot < int64(getExchangeFinalizedCutoffMs) {
+		log.Info("getHeader sent too early, wait for exchange finalized")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	log.Info("=============get builder")
 
 	builderResp, err := FetchBuilderPubKey("http://localhost:3210", slot)
 	if err != nil {
-		log.Info("cannot get builder id for this slot")
-		w.WriteHeader(http.StatusNoContent)
-		return
+		builderResp = &BuilderResponse{
+			Builder:         "0xa1885d66bef164889a2e35845c3b626545d7b0e513efe335e97c3a45e534013fa3bc38c3b7e6143695aecc4872ac52c4",
+			FallbackBuilder: "0xa1885d66bef164889a2e35845c3b626545d7b0e513efe335e97c3a45e534013fa3bc38c3b7e6143695aecc4872ac52c4",
+		}
+		// log.Info("cannot get builder id for this slot")
+		// w.WriteHeader(http.StatusNoContent)
+		// return
 	}
 	log.Info("builder id", builderResp.Builder)
 	// bid, err := api.redis.GetBestBid(slot, parentHashHex, proposerPubkeyHex)
@@ -1320,8 +1332,7 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 
 	if bid == nil || bid.IsEmpty() {
 		//check if almost timeout to build next block, then use fallback builder (ethgas pubkey)
-		// within slot started 1 - 3 sec
-		if getTargetedBuilderCutoffMs > 0 && msIntoSlot > 0 && msIntoSlot > int64(getTargetedBuilderCutoffMs) {
+		if msIntoSlot > int64(getTargetedBuilderCutoffMs) {
 			log.Info("use fallback builder id", builderResp.FallbackBuilder)
 
 			bid, err = api.redis.GetBuilderLatestBid(slot, parentHashHex, proposerPubkeyHex, builderResp.FallbackBuilder)
@@ -1995,30 +2006,10 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	receivedAt := time.Now().UTC()
 	prevTime = receivedAt
 
-	// Fetch the preconf list from the preconf server
-	// TODO configable value
-	//config PreconfServerURL = localhost.....
-	url := fmt.Sprintf("%s/preconf_request/%d", "http://localhost:3210", headSlot)
-	resp, _err := http.Get(url)
-	if _err != nil {
-		api.log.Println("Error fetching preconf list:", _err)
-		return
-	}
-	defer resp.Body.Close()
-
-	var preconfArr []PreconfResponse
-
-	_err = json.NewDecoder(resp.Body).Decode(&preconfArr)
-	if _err != nil {
-		api.log.Println("Error decoding preconf response:", _err)
-		return
-	}
-	api.log.Info("=============preconfs==========")
-	api.log.Println(preconfArr)
-
-	args := req.URL.Query()
-	isCancellationEnabled := args.Get("cancellations") == "1"
-
+	//always true to allow replace old preconf order
+	// args := req.URL.Query()
+	// isCancellationEnabled := args.Get("cancellations") == "1"
+	isCancellationEnabled := true
 	log := api.log.WithFields(logrus.Fields{
 		"method":                "submitNewBlock",
 		"contentLength":         req.ContentLength,
@@ -2115,8 +2106,38 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		api.RespondError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	slotStartTimestamp := api.genesisInfo.Data.GenesisTime + ((submission.BidTrace.Slot) * common.SecondsPerSlot)
+	msIntoSlot := receivedAt.UnixMilli() - int64((slotStartTimestamp * 1000))
+	api.log.Info("=====msIntoSlo")
+
+	api.log.Info(msIntoSlot)
+	if msIntoSlot < int64(getExchangeFinalizedCutoffMs) {
+		api.log.Info("handleSubmitNewBlock sent too early, wait for exchange finalized")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 
 	//------logic to Checking dose preconf transaction inculded in the block
+	// Fetch the preconf list from the preconf server
+	// TODO configable value
+	//config PreconfServerURL = localhost.....
+	url := fmt.Sprintf("%s/preconf_request/%d", "http://localhost:3210", headSlot)
+	resp, _err := http.Get(url)
+	if _err != nil {
+		api.log.Println("Error fetching preconf list:", _err)
+		return
+	}
+	defer resp.Body.Close()
+
+	var preconfArr []PreconfResponse
+
+	_err = json.NewDecoder(resp.Body).Decode(&preconfArr)
+	if _err != nil {
+		api.log.Println("Error decoding preconf response:", _err)
+		return
+	}
+	api.log.Info("=============preconfs==========")
+	api.log.Println(preconfArr)
 	blockTxMap := make(map[string]struct{})
 	for _, tx := range submission.Transactions {
 		log.Println("=======tx")
@@ -2199,12 +2220,13 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		return
 	}
 
-	// Don't accept blocks with 0 value
-	if submission.BidTrace.Value.ToBig().Cmp(ZeroU256.BigInt()) == 0 || len(submission.Transactions) == 0 {
-		log.Info("submitNewBlock failed: block with 0 value or no txs")
-		w.WriteHeader(http.StatusOK)
-		return
-	}
+	// preconf txs should have 0 bid value if there have no public txs
+	// // Don't accept blocks with 0 value
+	// if submission.BidTrace.Value.ToBig().Cmp(ZeroU256.BigInt()) == 0 || len(submission.Transactions) == 0 {
+	// 	log.Info("submitNewBlock failed: block with 0 value or no txs")
+	// 	w.WriteHeader(http.StatusOK)
+	// 	return
+	// }
 
 	// Sanity check the submission
 	err = SanityCheckBuilderBlockSubmission(payload)
