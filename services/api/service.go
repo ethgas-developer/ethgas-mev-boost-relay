@@ -6,7 +6,6 @@ import (
 	"compress/gzip"
 	"context"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -87,9 +86,13 @@ var (
 	// number of goroutines to save active validator
 	numValidatorRegProcessors = cli.GetEnvInt("NUM_VALIDATOR_REG_PROCESSORS", 10)
 
+	// API URL
+	exchangeAPIURL = GetEnvStr("EXCHANGE_API_URL", "http://localhost:3210")
+	defaultBuilder = GetEnvStr("DEFAULT_BUILDER_PUBKEY", "0xa1885d66bef164889a2e35845c3b626545d7b0e513efe335e97c3a45e534013fa3bc38c3b7e6143695aecc4872ac52c4")
+
 	// various timings
 	timeoutGetPayloadRetryMs     = cli.GetEnvInt("GETPAYLOAD_RETRY_TIMEOUT_MS", 100)
-	getExchangeFinalizedCutoffMs = cli.GetEnvInt("GETHEADER_EXCHANGE_FINALIZED_CUTOFF_MS", -1000)
+	getExchangeFinalizedCutoffMs = cli.GetEnvInt("GETHEADER_EXCHANGE_FINALIZED_CUTOFF_MS", -2000)
 	getTargetedBuilderCutoffMs   = cli.GetEnvInt("GETHEADER_TARGETED_BUILDER_REQUEST_CUTOFF_MS", 0)
 	getHeaderRequestCutoffMs     = cli.GetEnvInt("GETHEADER_REQUEST_CUTOFF_MS", 3000)
 	getPayloadRequestCutoffMs    = cli.GetEnvInt("GETPAYLOAD_REQUEST_CUTOFF_MS", 4000)
@@ -116,6 +119,13 @@ var (
 		"mev-boost/v1.5.0 Go-http-client/1.1", // Prysm v4.0.1 (Shapella signing issue)
 	})
 )
+
+func GetEnvStr(key, defaultValue string) string {
+	if value, ok := os.LookupEnv(key); ok {
+		return value
+	}
+	return defaultValue
+}
 
 // PreconfRequest structure to match the TypeScript server's response
 // https://bitbucket.org/infinity-exchange/infinity-core/src/ce4bbcc9e72068d711e0719893bbaf841cf4d402/scripts/preconfMultiTxServer.ts?at=enhancement%2F8_jan
@@ -1308,17 +1318,14 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	log.Info("=============get builder")
 
-	builderResp, err := FetchBuilderPubKey("http://localhost:3210", slot)
+	builderResp, err := FetchBuilderPubKey(exchangeAPIURL, slot)
 	if err != nil {
 		builderResp = &BuilderResponse{
-			Builder:         "0xa1885d66bef164889a2e35845c3b626545d7b0e513efe335e97c3a45e534013fa3bc38c3b7e6143695aecc4872ac52c4",
-			FallbackBuilder: "0xa1885d66bef164889a2e35845c3b626545d7b0e513efe335e97c3a45e534013fa3bc38c3b7e6143695aecc4872ac52c4",
+			Builder:         defaultBuilder,
+			FallbackBuilder: defaultBuilder,
 		}
-		// log.Info("cannot get builder id for this slot")
-		// w.WriteHeader(http.StatusNoContent)
-		// return
+		log.Error("failed to get builder id from ethgas api, will fallback to defaultBuilder")
 	}
 	log.Info("builder id", builderResp.Builder)
 	// bid, err := api.redis.GetBestBid(slot, parentHashHex, proposerPubkeyHex)
@@ -1338,7 +1345,7 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 			bid, err = api.redis.GetBuilderLatestBid(slot, parentHashHex, proposerPubkeyHex, builderResp.FallbackBuilder)
 
 			if err != nil {
-				log.WithError(err).Error("could not get bid")
+				log.WithError(err).Error("could not get fallback bid")
 				api.RespondError(w, http.StatusBadRequest, err.Error())
 				return
 			}
@@ -2117,67 +2124,68 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		return
 	}
 
+	// disable preconf checking logic
 	//------logic to Checking dose preconf transaction inculded in the block
-	// Fetch the preconf list from the preconf server
-	// TODO configable value
-	//config PreconfServerURL = localhost.....
-	url := fmt.Sprintf("%s/preconf_request/%d", "http://localhost:3210", headSlot)
-	resp, _err := http.Get(url)
-	if _err != nil {
-		api.log.Println("Error fetching preconf list:", _err)
-		return
-	}
-	defer resp.Body.Close()
+	// // Fetch the preconf list from the preconf server
+	// // TODO configable value
+	// //config PreconfServerURL = localhost.....
+	// url := fmt.Sprintf("%s/preconf_request/%d", "http://localhost:3210", submission.BidTrace.Slot)
+	// resp, _err := http.Get(url)
+	// if _err != nil {
+	// 	api.log.Println("Error fetching preconf list:", _err)
+	// 	return
+	// }
+	// defer resp.Body.Close()
 
-	var preconfArr []PreconfResponse
+	// var preconfArr []PreconfResponse
 
-	_err = json.NewDecoder(resp.Body).Decode(&preconfArr)
-	if _err != nil {
-		api.log.Println("Error decoding preconf response:", _err)
-		return
-	}
-	api.log.Info("=============preconfs==========")
-	api.log.Println(preconfArr)
-	blockTxMap := make(map[string]struct{})
-	for _, tx := range submission.Transactions {
-		log.Println("=======tx")
-		// log.Println(tx)
-		log.Println("0x" + hex.EncodeToString(tx))
+	// _err = json.NewDecoder(resp.Body).Decode(&preconfArr)
+	// if _err != nil {
+	// 	api.log.Println("Error decoding preconf response:", _err)
+	// 	return
+	// }
+	// api.log.Info("=============preconfs==========")
+	// api.log.Println(preconfArr)
+	// blockTxMap := make(map[string]struct{})
+	// for _, tx := range submission.Transactions {
+	// 	log.Println("=======tx")
+	// 	// log.Println(tx)
+	// 	log.Println("0x" + hex.EncodeToString(tx))
 
-		blockTxMap["0x"+hex.EncodeToString(tx)] = struct{}{}
-	}
-	missingTxs := []string{}
-	count := 0
-	for _, preconf := range preconfArr {
-		for _, preconfTx := range preconf.SignedTxs {
-			count++
-			if _, exists := blockTxMap[preconfTx]; !exists {
-				// log.Printf("Missing preconf transaction: %s", preconfTxHex) // Log the missing transaction in hex
-				missingTxs = append(missingTxs, preconfTx) // Add to missing transactions
-			}
-		}
-	}
-	// for _, preconfTx := range preconfs.Txs {
-	// 	// log.Println("=======preconf")
-	// 	// log.Println(preconfTxHex)
-
-	// 	// Check if the preconf transaction exists in the block transactions
-	// 	if _, exists := blockTxMap[preconfTx]; !exists {
-	// 		// log.Printf("Missing preconf transaction: %s", preconfTxHex) // Log the missing transaction in hex
-	// 		missingTxs = append(missingTxs, preconfTx) // Add to missing transactions
+	// 	blockTxMap["0x"+hex.EncodeToString(tx)] = struct{}{}
+	// }
+	// missingTxs := []string{}
+	// count := 0
+	// for _, preconf := range preconfArr {
+	// 	for _, preconfTx := range preconf.SignedTxs {
+	// 		count++
+	// 		if _, exists := blockTxMap[preconfTx]; !exists {
+	// 			// log.Printf("Missing preconf transaction: %s", preconfTxHex) // Log the missing transaction in hex
+	// 			missingTxs = append(missingTxs, preconfTx) // Add to missing transactions
+	// 		}
 	// 	}
 	// }
+	// // for _, preconfTx := range preconfs.Txs {
+	// // 	// log.Println("=======preconf")
+	// // 	// log.Println(preconfTxHex)
 
-	// After checking all transactions, log the results
-	if len(missingTxs) > 0 {
-		log.Printf("Total missing transactions: %d", len(missingTxs))
-		log.Printf("Number of transactions: %d", len(submission.Transactions))
+	// // 	// Check if the preconf transaction exists in the block transactions
+	// // 	if _, exists := blockTxMap[preconfTx]; !exists {
+	// // 		// log.Printf("Missing preconf transaction: %s", preconfTxHex) // Log the missing transaction in hex
+	// // 		missingTxs = append(missingTxs, preconfTx) // Add to missing transactions
+	// // 	}
+	// // }
 
-		log.Println("Missing preconf transaction hexes:", missingTxs)
-		return //drop this block
-	} else {
-		log.Printf("All preconf transactions are included in the block! submissed Transactions:%d, preconf transaction: %d", len(submission.Transactions), count)
-	}
+	// // After checking all transactions, log the results
+	// if len(missingTxs) > 0 {
+	// 	log.Printf("Total missing transactions: %d", len(missingTxs))
+	// 	log.Printf("Number of transactions: %d", len(submission.Transactions))
+
+	// 	log.Println("Missing preconf transaction hexes:", missingTxs)
+	// 	return //drop this block
+	// } else {
+	// 	log.Printf("All preconf transactions are included in the block! submissed Transactions:%d, preconf transaction: %d", len(submission.Transactions), count)
+	// }
 
 	//end of check
 
