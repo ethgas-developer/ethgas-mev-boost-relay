@@ -2860,10 +2860,10 @@ func (api *RelayAPI) handleReadyz(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
-// FetchBuilderPubKey fetches the builder and fallbackBuilder from the /preconf_builder_pubkey/:slot endpoint
+// FetchBuilderPubKey fetches the builder and fallbackBuilder from the /builder/pubkey/:slot endpoint
 func FetchBuilderPubKey(apiURL string, slot uint64) (*BuilderResponse, error) {
 	// Construct the URL for the API request
-	url := fmt.Sprintf("%s/preconf_builder_pubkey/%d", apiURL, slot)
+	url := fmt.Sprintf("%s/builder/pubkey/%d", apiURL, slot)
 
 	// Send HTTP GET request
 	resp, err := http.Get(url)
