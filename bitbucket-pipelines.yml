@@ -51,9 +51,9 @@ definitions:
           # (Caching using ECR registry, see https://medium.com/datamindedbe/how-we-reduced-our-docker-build-times-by-40-afea7b7f5fe7 and https://aws.amazon.com/blogs/containers/announcing-remote-cache-support-in-amazon-ecr-for-buildkit-clients/)
           - >
             if [ $BITBUCKET_BRANCH == "main" ]; then
-              docker buildx --builder docker-container build --push --platform linux/amd64 -t 857828702501.dkr.ecr.ap-east-1.amazonaws.com/ethgas-mev-boost-relay:$TAG --cache-from type=registry,ref=857828702501.dkr.ecr.ap-east-1.amazonaws.com/ethgas-mev-boost-relay:cache --cache-to mode=max,image-manifest=true,oci-mediatypes=true,type=registry,ref=857828702501.dkr.ecr.ap-east-1.amazonaws.com/ethgas-mev-boost-relay:cache -t 857828702501.dkr.ecr.ap-east-1.amazonaws.com/ethgas-mev-boost-relay .
+              docker buildx --builder docker-container build --push --platform linux/arm64,linux/amd64 -t 857828702501.dkr.ecr.ap-east-1.amazonaws.com/ethgas-mev-boost-relay:$TAG --cache-from type=registry,ref=857828702501.dkr.ecr.ap-east-1.amazonaws.com/ethgas-mev-boost-relay:cache --cache-to mode=max,image-manifest=true,oci-mediatypes=true,type=registry,ref=857828702501.dkr.ecr.ap-east-1.amazonaws.com/ethgas-mev-boost-relay:cache -t 857828702501.dkr.ecr.ap-east-1.amazonaws.com/ethgas-mev-boost-relay .
             else
-              docker buildx --builder docker-container build --push --platform linux/amd64 -t 857828702501.dkr.ecr.ap-east-1.amazonaws.com/ethgas-mev-boost-relay:$TAG --cache-from type=registry,ref=857828702501.dkr.ecr.ap-east-1.amazonaws.com/ethgas-mev-boost-relay:cache --cache-to mode=max,image-manifest=true,oci-mediatypes=true,type=registry,ref=857828702501.dkr.ecr.ap-east-1.amazonaws.com/ethgas-mev-boost-relay:cache .
+              docker buildx --builder docker-container build --push --platform linux/arm64,linux/amd64 -t 857828702501.dkr.ecr.ap-east-1.amazonaws.com/ethgas-mev-boost-relay:$TAG --cache-from type=registry,ref=857828702501.dkr.ecr.ap-east-1.amazonaws.com/ethgas-mev-boost-relay:cache --cache-to mode=max,image-manifest=true,oci-mediatypes=true,type=registry,ref=857828702501.dkr.ecr.ap-east-1.amazonaws.com/ethgas-mev-boost-relay:cache .
             fi
 
 pipelines:
