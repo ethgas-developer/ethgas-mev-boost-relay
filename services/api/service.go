@@ -694,6 +694,7 @@ func (api *RelayAPI) simulateBlock(ctx context.Context, opts blockSimOptions) (b
 		log.Warn("block validation response is nil")
 		return nil, nil, nil
 	}
+	// fmt.Println("response.BlockValue:", response.BlockValue.ToBig().Int64())
 	return response.BlockValue, nil, nil
 }
 
@@ -1171,12 +1172,12 @@ func (api *RelayAPI) handleRegisterValidator(w http.ResponseWriter, req *http.Re
 			return
 		}
 
-		// Check if a real validator
-		isKnownValidator := api.datastore.IsKnownValidator(pkHex)
-		if !isKnownValidator {
-			handleError(regLog, http.StatusBadRequest, fmt.Sprintf("not a known validator: %s", pkHex))
-			return
-		}
+		// // Check if a real validator
+		// isKnownValidator := api.datastore.IsKnownValidator(pkHex)
+		// if !isKnownValidator {
+		// 	handleError(regLog, http.StatusBadRequest, fmt.Sprintf("not a known validator: %s", pkHex))
+		// 	return
+		// }
 
 		// Check for a previous registration timestamp
 		prevTimestamp, err := api.redis.GetValidatorRegistrationTimestamp(pkHex)
