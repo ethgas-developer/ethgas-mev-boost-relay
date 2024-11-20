@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -1338,31 +1339,62 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	if bid == nil || bid.IsEmpty() {
-		//check if almost timeout to build next block, then use fallback builder (ethgas pubkey)
-		if msIntoSlot > int64(getTargetedBuilderCutoffMs) {
-			log.Info("use fallback builder id", builderResp.FallbackBuilder)
+	isBuilderValidPreconf, err := api.redis.GetIsValidPreconf(slot, parentHashHex, proposerPubkeyHex, builderResp.Builder)
+	log.Println("get header | is builder valid preconf: ", isBuilderValidPreconf)
+	if err != nil {
+		log.WithError(err).Error("[builder] could not GetIsValidPreconf")
+		api.RespondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// 1. use builder bid when isBuilderValidPreconf is true
+	if !isBuilderValidPreconf {
+		isFallbackBuilderValidPreconf, err := api.redis.GetIsValidPreconf(slot, parentHashHex, proposerPubkeyHex, builderResp.FallbackBuilder)
+		log.Println("get header | is fallback builder valid preconf: ", isFallbackBuilderValidPreconf)
+		if err != nil {
+			log.WithError(err).Error("[fallback builder] could not GetIsValidPreconf")
+			api.RespondError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 
-			bid, err = api.redis.GetBuilderLatestBid(slot, parentHashHex, proposerPubkeyHex, builderResp.FallbackBuilder)
-
-			if err != nil {
-				log.WithError(err).Error("could not get fallback bid")
-				api.RespondError(w, http.StatusBadRequest, err.Error())
-				return
-			}
-
-			if bid == nil || bid.IsEmpty() {
-				log.Info("no fallback bid")
-				w.WriteHeader(http.StatusNoContent)
-				return
-			}
-
-		} else {
-			log.Info("no targeted bid, remain time: ", msIntoSlot)
+		fallbackBid, err := api.redis.GetBuilderLatestBid(slot, parentHashHex, proposerPubkeyHex, builderResp.FallbackBuilder)
+		if err != nil {
+			log.WithError(err).Error("could not get fallback bid")
+			api.RespondError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if fallbackBid == nil || fallbackBid.IsEmpty() {
+			log.Info("no fallback bid")
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 
+		if isFallbackBuilderValidPreconf {
+			//2. use fallback bid with valid = true
+			bid = fallbackBid
+		} else {
+			//both fallback bid and builder bid valid = false
+			//3. use bid if builder bid is not empty // no change
+			//4. use fallbackBid if bid is empty
+			if bid == nil || bid.IsEmpty() {
+				bid = fallbackBid
+			}
+		}
+	}
+
+	if bid == nil || bid.IsEmpty() {
+		//5. if still empty then use best bid (which not builder nor fallback builder)
+		bid, err = api.redis.GetBestBid(slot, parentHashHex, proposerPubkeyHex)
+		if err != nil {
+			log.WithError(err).Error("could not get best bid")
+			api.RespondError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		//6. if there have no any bid then return
+		if bid == nil || bid.IsEmpty() {
+			log.Info("no targeted bid, remain time: ", msIntoSlot)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 	}
 
 	value, err := bid.Value()
@@ -1959,6 +1991,7 @@ type redisUpdateBidOpts struct {
 	receivedAt           time.Time
 	floorBidValue        *big.Int
 	payload              *common.VersionedSubmitBlockRequest
+	isValidPreconf       bool
 }
 
 func (api *RelayAPI) updateRedisBid(opts redisUpdateBidOpts) (*datastore.SaveBidAndUpdateTopBidResponse, *builderApi.VersionedSubmitBlindedBlockResponse, bool) {
@@ -1996,7 +2029,7 @@ func (api *RelayAPI) updateRedisBid(opts redisUpdateBidOpts) (*datastore.SaveBid
 	//
 	// Save to Redis
 	//
-	updateBidResult, err := api.redis.SaveBidAndUpdateTopBid(context.Background(), opts.tx, &bidTrace, opts.payload, getPayloadResponse, getHeaderResponse, opts.receivedAt, opts.cancellationsEnabled, opts.floorBidValue)
+	updateBidResult, err := api.redis.SaveBidAndUpdateTopBid(context.Background(), opts.tx, &bidTrace, opts.payload, getPayloadResponse, getHeaderResponse, opts.receivedAt, opts.cancellationsEnabled, opts.floorBidValue, opts.isValidPreconf)
 	if err != nil {
 		opts.log.WithError(err).Error("could not save bid and update top bids")
 		api.RespondError(opts.w, http.StatusInternalServerError, "failed saving and updating bid")
@@ -2119,76 +2152,73 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	api.log.Info("=====msIntoSlo")
 
 	api.log.Info(msIntoSlot)
+	//before deadline: no check, is valid = false
+	//after deadline: check builder id, is fullfilled preconf, is valid = false/true
+	//get header: 1. builder + true, 2. fallback builder + true, 3. builder + false 4. fallback builder + false 5. other builder
+	isValidPreconf := false
+
 	if msIntoSlot < int64(getExchangeFinalizedCutoffMs) {
+		// accept early submit
 		api.log.Info("handleSubmitNewBlock sent too early, wait for exchange finalized")
-		w.WriteHeader(http.StatusNoContent)
-		return
+		// w.WriteHeader(http.StatusNoContent)
+		// return
+		isValidPreconf = false
 	}
+	if msIntoSlot >= int64(getExchangeFinalizedCutoffMs) {
+		//------logic to Checking dose preconf transaction inculded in the block
+		// Fetch the preconf list from the preconf server
+		url := fmt.Sprintf("%s/preconf_request/%d", exchangeAPIURL, submission.BidTrace.Slot)
+		resp, _err := http.Get(url)
+		if _err != nil {
+			api.log.Println("Error fetching preconf list:", _err)
+			return
+		}
+		defer resp.Body.Close()
 
-	// disable preconf checking logic
-	//------logic to Checking dose preconf transaction inculded in the block
-	// // Fetch the preconf list from the preconf server
-	// // TODO configable value
-	// //config PreconfServerURL = localhost.....
-	// url := fmt.Sprintf("%s/preconf_request/%d", "http://localhost:3210", submission.BidTrace.Slot)
-	// resp, _err := http.Get(url)
-	// if _err != nil {
-	// 	api.log.Println("Error fetching preconf list:", _err)
-	// 	return
-	// }
-	// defer resp.Body.Close()
+		var preconfArr []PreconfResponse
 
-	// var preconfArr []PreconfResponse
+		_err = json.NewDecoder(resp.Body).Decode(&preconfArr)
+		if _err != nil {
+			api.log.Println("Error decoding preconf response:", _err)
+			return
+		}
+		// api.log.Info("=============preconfs==========")
+		// api.log.Println(preconfArr)
+		blockTxMap := make(map[string]struct{})
+		for _, tx := range submission.Transactions {
+			// log.Println("=======tx")
+			// log.Println(tx)
+			// log.Println("0x" + hex.EncodeToString(tx))
 
-	// _err = json.NewDecoder(resp.Body).Decode(&preconfArr)
-	// if _err != nil {
-	// 	api.log.Println("Error decoding preconf response:", _err)
-	// 	return
-	// }
-	// api.log.Info("=============preconfs==========")
-	// api.log.Println(preconfArr)
-	// blockTxMap := make(map[string]struct{})
-	// for _, tx := range submission.Transactions {
-	// 	log.Println("=======tx")
-	// 	// log.Println(tx)
-	// 	log.Println("0x" + hex.EncodeToString(tx))
+			blockTxMap["0x"+hex.EncodeToString(tx)] = struct{}{}
+		}
+		missingTxs := []string{}
+		count := 0
+		for _, preconf := range preconfArr {
+			for _, preconfTx := range preconf.SignedTxs {
+				count++
+				if _, exists := blockTxMap[preconfTx]; !exists {
+					// log.Printf("Missing preconf transaction: %s", preconfTxHex) // Log the missing transaction in hex
+					missingTxs = append(missingTxs, preconfTx) // Add to missing transactions
+				}
+			}
+		}
 
-	// 	blockTxMap["0x"+hex.EncodeToString(tx)] = struct{}{}
-	// }
-	// missingTxs := []string{}
-	// count := 0
-	// for _, preconf := range preconfArr {
-	// 	for _, preconfTx := range preconf.SignedTxs {
-	// 		count++
-	// 		if _, exists := blockTxMap[preconfTx]; !exists {
-	// 			// log.Printf("Missing preconf transaction: %s", preconfTxHex) // Log the missing transaction in hex
-	// 			missingTxs = append(missingTxs, preconfTx) // Add to missing transactions
-	// 		}
-	// 	}
-	// }
-	// // for _, preconfTx := range preconfs.Txs {
-	// // 	// log.Println("=======preconf")
-	// // 	// log.Println(preconfTxHex)
+		// After checking all transactions, log the results
+		if len(missingTxs) > 0 {
+			log.Printf("Total missing transactions: %d, inculded preconf transaction: %d", len(missingTxs), count-len(missingTxs))
+			log.Printf("Number of transactions: %d", len(submission.Transactions))
+			log.Println("Missing preconf transaction hexes:", missingTxs)
+			isValidPreconf = false
+		} else {
+			log.Printf("All preconf transactions are included in the block! submissed Transactions:%d, preconf transaction: %d", len(submission.Transactions), count)
+			isValidPreconf = true
+		}
 
-	// // 	// Check if the preconf transaction exists in the block transactions
-	// // 	if _, exists := blockTxMap[preconfTx]; !exists {
-	// // 		// log.Printf("Missing preconf transaction: %s", preconfTxHex) // Log the missing transaction in hex
-	// // 		missingTxs = append(missingTxs, preconfTx) // Add to missing transactions
-	// // 	}
-	// // }
+		log.Println("is valid preconf: ", isValidPreconf)
 
-	// // After checking all transactions, log the results
-	// if len(missingTxs) > 0 {
-	// 	log.Printf("Total missing transactions: %d", len(missingTxs))
-	// 	log.Printf("Number of transactions: %d", len(submission.Transactions))
-
-	// 	log.Println("Missing preconf transaction hexes:", missingTxs)
-	// 	return //drop this block
-	// } else {
-	// 	log.Printf("All preconf transactions are included in the block! submissed Transactions:%d, preconf transaction: %d", len(submission.Transactions), count)
-	// }
-
-	//end of check
+		//end of check
+	}
 
 	log = log.WithFields(logrus.Fields{
 		"timestampAfterDecoding": time.Now().UTC().UnixMilli(),
@@ -2245,6 +2275,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		return
 	}
 
+	//temp: disable payload checking for devnet
 	// attrs, ok := api.checkSubmissionPayloadAttrs(w, log, submission)
 
 	// if !ok {
@@ -2431,6 +2462,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		receivedAt:           receivedAt,
 		floorBidValue:        floorBidValue,
 		payload:              payload,
+		isValidPreconf:       isValidPreconf,
 	}
 	updateBidResult, getPayloadResponse, ok := api.updateRedisBid(redisOpts)
 	if !ok {

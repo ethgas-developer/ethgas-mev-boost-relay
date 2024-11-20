@@ -503,7 +503,7 @@ type SaveBidAndUpdateTopBidResponse struct {
 	TimeUpdateFloor  time.Duration
 }
 
-func (r *RedisCache) SaveBidAndUpdateTopBid(ctx context.Context, pipeliner redis.Pipeliner, trace *common.BidTraceV2WithBlobFields, payload *common.VersionedSubmitBlockRequest, getPayloadResponse *builderApi.VersionedSubmitBlindedBlockResponse, getHeaderResponse *builderSpec.VersionedSignedBuilderBid, reqReceivedAt time.Time, isCancellationEnabled bool, floorValue *big.Int) (state SaveBidAndUpdateTopBidResponse, err error) {
+func (r *RedisCache) SaveBidAndUpdateTopBid(ctx context.Context, pipeliner redis.Pipeliner, trace *common.BidTraceV2WithBlobFields, payload *common.VersionedSubmitBlockRequest, getPayloadResponse *builderApi.VersionedSubmitBlindedBlockResponse, getHeaderResponse *builderSpec.VersionedSignedBuilderBid, reqReceivedAt time.Time, isCancellationEnabled bool, floorValue *big.Int, isValidPreconf bool) (state SaveBidAndUpdateTopBidResponse, err error) {
 	var prevTime, nextTime time.Time
 	prevTime = time.Now()
 
@@ -647,6 +647,13 @@ func (r *RedisCache) SaveBidAndUpdateTopBid(ctx context.Context, pipeliner redis
 		return state, err
 	}
 
+	keyIsValidPreconf := fmt.Sprintf("%s:%d_%s_%s/%s:isValidPreconf", r.prefixBlockBuilderLatestBids, trace.Slot, trace.ParentHash, trace.ProposerPubkey, trace.BuilderPubkey)
+
+	// Set isValidPreconf value
+	err = pipeliner.Set(ctx, keyIsValidPreconf, strconv.FormatBool(isValidPreconf), expiryBidCache).Err()
+	if err != nil {
+		return state, err
+	}
 	// Execute setting the floor bid
 	_, err = pipeliner.Exec(ctx)
 
@@ -824,6 +831,28 @@ func (r *RedisCache) SetFloorBidValue(slot uint64, parentHash, proposerPubkey, v
 	keyFloorBidValue := r.keyFloorBidValue(slot, parentHash, proposerPubkey)
 	err := r.client.Set(context.Background(), keyFloorBidValue, value, 0).Err()
 	return err
+}
+
+func (r *RedisCache) GetIsValidPreconf(slot uint64, parentHash, proposerPubkey, builderPubkey string) (bool, error) {
+	// Construct the key
+	key := fmt.Sprintf("%s:%d_%s_%s/%s:isValidPreconf", r.prefixBlockBuilderLatestBids, slot, parentHash, proposerPubkey, builderPubkey)
+
+	// Get the value from Redis
+	val, err := r.client.Get(context.Background(), key).Result()
+	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			return false, nil // Key doesn't exist
+		}
+		return false, err // Other errors
+	}
+
+	// Parse the value to boolean
+	isValidPreconf, err := strconv.ParseBool(val)
+	if err != nil {
+		return false, err
+	}
+
+	return isValidPreconf, nil
 }
 
 func (r *RedisCache) NewPipeline() redis.Pipeliner { //nolint:ireturn,nolintlint
