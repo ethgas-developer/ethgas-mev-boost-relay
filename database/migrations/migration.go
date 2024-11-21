@@ -18,5 +18,6 @@ var Migrations = migrate.MemoryMigrationSource{
 		Migration009BlockBuilderRemoveReference,
 		Migration010PayloadAddBlobFields,
 		Migration011AddSimulatedBlockValue,
+		Migration012CreateGetPayload,
 	},
 }

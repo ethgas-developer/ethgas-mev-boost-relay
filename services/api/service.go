@@ -1712,6 +1712,13 @@ func (api *RelayAPI) handleGetPayload(w http.ResponseWriter, req *http.Request) 
 		log.WithError(err).Error("redis.CheckAndSetLastSlotAndHashDelivered failed")
 	}
 
+	go func() {
+		err := api.db.InsertGetPayload(uint64(slot), proposerPubkey.String(), blockHash.String(), slotStartTimestamp, uint64(receivedAt.UnixMilli()), uint64(decodeTime.UnixMilli()), uint64(msIntoSlot))
+		if err != nil {
+			log.WithError(err).Error("failed to insert payload too late into db")
+		}
+	}()
+
 	// Handle early/late requests
 	if msIntoSlot < 0 {
 		// Wait until slot start (t=0) if still in the future

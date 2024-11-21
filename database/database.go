@@ -55,6 +55,8 @@ type IDatabaseService interface {
 
 	GetTooLateGetPayload(slot uint64) (entries []*TooLateGetPayloadEntry, err error)
 	InsertTooLateGetPayload(slot uint64, proposerPubkey, blockHash string, slotStart, requestTime, decodeTime, msIntoSlot uint64) error
+
+	InsertetPayload(slot uint64, proposerPubkey, blockHash string, slotStart, requestTime, decodeTime, msIntoSlot uint64) error
 }
 
 type DatabaseService struct {
@@ -635,6 +637,25 @@ func (s *DatabaseService) InsertTooLateGetPayload(slot uint64, proposerPubkey, b
 	}
 
 	query := `INSERT INTO ` + vars.TableTooLateGetPayload + `
+		(slot, slot_start_timestamp, request_timestamp, decode_timestamp, proposer_pubkey, block_hash, ms_into_slot) VALUES
+		(:slot, :slot_start_timestamp, :request_timestamp, :decode_timestamp, :proposer_pubkey, :block_hash, :ms_into_slot)
+		ON CONFLICT (slot, proposer_pubkey, block_hash) DO NOTHING;`
+	_, err := s.DB.NamedExec(query, entry)
+	return err
+}
+
+func (s *DatabaseService) InsertetPayload(slot uint64, proposerPubkey, blockHash string, slotStart, requestTime, decodeTime, msIntoSlot uint64) error {
+	entry := TooLateGetPayloadEntry{
+		Slot:               slot,
+		SlotStartTimestamp: slotStart,
+		RequestTimestamp:   requestTime,
+		DecodeTimestamp:    decodeTime,
+		ProposerPubkey:     proposerPubkey,
+		BlockHash:          blockHash,
+		MsIntoSlot:         msIntoSlot,
+	}
+
+	query := `INSERT INTO ` + vars.TableGetPayload + `
 		(slot, slot_start_timestamp, request_timestamp, decode_timestamp, proposer_pubkey, block_hash, ms_into_slot) VALUES
 		(:slot, :slot_start_timestamp, :request_timestamp, :decode_timestamp, :proposer_pubkey, :block_hash, :ms_into_slot)
 		ON CONFLICT (slot, proposer_pubkey, block_hash) DO NOTHING;`
