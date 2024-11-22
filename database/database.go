@@ -644,7 +644,7 @@ func (s *DatabaseService) InsertTooLateGetPayload(slot uint64, proposerPubkey, b
 	return err
 }
 
-func (s *DatabaseService) InsertetPayload(slot uint64, proposerPubkey, blockHash string, slotStart, requestTime, decodeTime, msIntoSlot uint64) error {
+func (s *DatabaseService) InsertGetPayload(slot uint64, proposerPubkey, blockHash string, slotStart, requestTime, decodeTime, msIntoSlot uint64) error {
 	entry := TooLateGetPayloadEntry{
 		Slot:               slot,
 		SlotStartTimestamp: slotStart,
