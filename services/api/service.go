@@ -10,9 +10,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"math/big"
 	"net/http"
 	_ "net/http/pprof"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -31,6 +33,8 @@ import (
 	"github.com/attestantio/go-eth2-client/spec"
 	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/buger/jsonparser"
+	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/signer/core/apitypes"
 	"github.com/flashbots/go-boost-utils/bls"
 	"github.com/flashbots/go-boost-utils/ssz"
 	"github.com/flashbots/go-boost-utils/utils"
@@ -39,6 +43,7 @@ import (
 	"github.com/go-redis/redis/v9"
 	"github.com/gorilla/mux"
 	"github.com/holiman/uint256"
+	"github.com/itsahedge/go-cowswap/util/signature-scheme/eip712"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sirupsen/logrus"
@@ -128,67 +133,77 @@ func GetEnvStr(key, defaultValue string) string {
 	return defaultValue
 }
 
-// PreconfRequest structure to match the TypeScript server's response
-// https://bitbucket.org/infinity-exchange/infinity-core/src/ce4bbcc9e72068d711e0719893bbaf841cf4d402/scripts/preconfMultiTxServer.ts?at=enhancement%2F8_jan
-// using this as response structure for test
-// type PreconfRequest struct {
-// 	PreconfTx         []byte            `json:"preconf_tx"`
-// 	PreconfConditions PreconfConditions `json:"preconf_conditions"`
-// 	SignedTx          string            `json:"signedTx"`
-// }
-
-// type PreconfConditions struct {
-// 	OrderingMetaData OrderingMetaData `json:"ordering_meta_data"`
-// }
-
-// type OrderingMetaData struct {
-// 	Index int `json:"index"`
-// }
-
-// type PreconfTxData struct {
-// 	Hash      string `json:"hash"`
-// 	Signature struct {
-// 		R          string `json:"r"`
-// 		S          string `json:"s"`
-// 		OddYParity bool   `json:"odd_y_parity"`
-// 	} `json:"signature"`
-// 	Transaction Transaction `json:"transaction"` // Transaction is an object, not a string
-// }
-
-// type Transaction struct {
-// 	Eip1559 Eip1559Transaction `json:"Eip1559"`
-// }
-
-// type Eip1559Transaction struct {
-// 	ChainID              int      `json:"chain_id"`
-// 	Nonce                uint64   `json:"nonce"`
-// 	GasLimit             uint64   `json:"gas_limit"`
-// 	MaxFeePerGas         uint64   `json:"max_fee_per_gas"`
-// 	MaxPriorityFeePerGas uint64   `json:"max_priority_fee_per_gas"`
-// 	To                   Call     `json:"to"`
-// 	Value                string   `json:"value"`       // Hex string
-// 	AccessList           []string `json:"access_list"` // Assuming empty list for now
-// 	Input                string   `json:"input"`
-// }
-
-// // Call represents the "to" field in the EIP-1559 transaction
-// type Call struct {
-// 	Call string `json:"Call"` // Represents the address in the "to" field
-// }
-
-// match this response
-// https://bitbucket.org/infinity-exchange/infinity-core/src/eafb819faac26b8fe23e27f44c0be30a2ef5058b/scripts/preconfMultiTxAsyncServer.ts?at=enhancement%2F8_jan
-type PreconfResponse struct {
-	PreconfTxs        [][]byte `json:"preconf_txs"`
-	PreconfConditions struct {
-		OrderingMetaData struct {
-			Index int `json:"index"`
-		} `json:"ordering_meta_data"`
-	} `json:"preconf_conditions"`
-	SignedTxs   []string `json:"signedTxs"`
-	AvgBidPrice uint64   `json:"avg_bid_price"`
+// ApiClient represents the client for interacting with the API
+type ApiClient struct {
+	APIURL       string
+	ChainID      string
+	Client       *http.Client
+	AccessToken  string
+	RefreshToken string // Keeping this as a field for storing the refresh token
 }
 
+// LoginResponse represents the login response structure
+type LoginResponse struct {
+	Status        string `json:"status"`
+	EIP712Message string `json:"eip712Message"`
+	NonceHash     string `json:"nonceHash"`
+}
+
+// VerifyResponse represents the verification response structure
+type VerifyResponse struct {
+	User        User        `json:"user"`
+	AccessToken AccessToken `json:"accessToken"`
+}
+
+// User represents the user details returned in the verification response
+type User struct {
+	UserID    uint64  `json:"userId"`
+	Address   string  `json:"address"`
+	UserType  uint32  `json:"userType"`
+	UserClass *uint32 `json:"userClass,omitempty"`
+}
+
+// AccessToken represents the access token structure
+type AccessToken struct {
+	Token string `json:"token"`
+}
+
+// ApiResponse represents the standard API response structure
+type ApiResponse struct {
+	Success bool            `json:"success"`
+	Data    json.RawMessage `json:"data"`
+}
+
+type PreconfBundles struct {
+	Bundles []PreconfBundle `json:"bundles"`
+}
+
+// PreconfBundle represents a single preconfigured bundle.
+type PreconfBundle struct {
+	Txs             []PreconfTx `json:"txs"`
+	UUID            string      `json:"uuid"`
+	AverageBidPrice float64     `json:"averageBidPrice"`
+}
+type PreconfTx struct {
+	Tx        string `json:"tx"`        // Transaction string
+	CanRevert bool   `json:"canRevert"` // Indicates if the transaction can be reverted
+	// CreateDate uint64 `json:"createDate"` // Uncomment and use if needed
+}
+
+// // match this response
+// // https://bitbucket.org/infinity-exchange/infinity-core/src/eafb819faac26b8fe23e27f44c0be30a2ef5058b/scripts/preconfMultiTxAsyncServer.ts?at=enhancement%2F8_jan
+// type PreconfResponse struct {
+// 	PreconfTxs        [][]byte `json:"preconf_txs"`
+// 	PreconfConditions struct {
+// 		OrderingMetaData struct {
+// 			Index int `json:"index"`
+// 		} `json:"ordering_meta_data"`
+// 	} `json:"preconf_conditions"`
+// 	SignedTxs   []string `json:"signedTxs"`
+// 	AvgBidPrice uint64   `json:"avg_bid_price"`
+// }
+
+// TODO Do BuilderResponse need jwt?
 type BuilderResponse struct {
 	Builder         string `json:"builder"`
 	FallbackBuilder string `json:"fallbackBuilder"`
@@ -2174,21 +2189,92 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	if msIntoSlot >= int64(getExchangeFinalizedCutoffMs) {
 		//------logic to Checking dose preconf transaction inculded in the block
 		// Fetch the preconf list from the preconf server
-		url := fmt.Sprintf("%s/preconf_request/%d", exchangeAPIURL, submission.BidTrace.Slot)
-		resp, _err := http.Get(url)
-		if _err != nil {
-			api.log.Println("Error fetching preconf list:", _err)
+		// url := fmt.Sprintf("%s/preconf_request/%d", exchangeAPIURL, submission.BidTrace.Slot)
+		// resp, _err := http.Get(url)
+		// if _err != nil {
+		// 	api.log.Println("Error fetching preconf list:", _err)
+		// 	return
+		// }
+		// defer resp.Body.Close()
+
+		// var preconfArr []PreconfResponse
+
+		// _err = json.NewDecoder(resp.Body).Decode(&preconfArr)
+		// if _err != nil {
+		// 	api.log.Println("Error decoding preconf response:", _err)
+		// 	return
+		// }
+		//=========above logic map for mock server return
+		//=========below logic map for ethgas return
+		//TODO move login into init and refresh every 15mins
+		client := &ApiClient{
+			APIURL: "https://testapp.ethgas.com",
+			// APIURL:  "http://localhost:3210",
+			ChainID: "7a6a",
+			Client: &http.Client{
+				Timeout: 10 * time.Second,
+			},
+		}
+
+		privateKey := "8ca6e6e33b2170de9e6ce76bbb5808f8d5ec3e112c2c72cd0b97614f00061f0e"
+		accessToken, refreshToken, err := client.Login(privateKey)
+		if err != nil {
+			fmt.Println("Login failed:", err)
+			return
+		}
+		fmt.Println("Access Token:", accessToken)
+		fmt.Println("")
+
+		fmt.Println("Refresh Token:", refreshToken)
+		fmt.Println("")
+		// Refresh the access token
+		err = client.RefreshAccessToken()
+		if err != nil {
+			fmt.Println("Refresh token failed:", err)
+			return
+		}
+		fmt.Println("New Access Token:", client.AccessToken)
+
+		// submission.BidTrace.Slot
+
+		url := fmt.Sprintf("%s/api/p/bundles?slot=%d", client.APIURL, 1)
+		req, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			log.Printf("cannot fetch preconf requests from preconf server, %v", err)
+			return
+		}
+		header := fmt.Sprintf("Bearer %s", client.AccessToken)
+
+		req.Header.Set("AUTHORIZATION", header)
+
+		resp, err := client.Client.Do(req)
+		if err != nil {
+			log.Printf("cannot fetch preconf requests from preconf server, %v", err)
 			return
 		}
 		defer resp.Body.Close()
-
-		var preconfArr []PreconfResponse
-
-		_err = json.NewDecoder(resp.Body).Decode(&preconfArr)
-		if _err != nil {
-			api.log.Println("Error decoding preconf response:", _err)
+		var apiResponse ApiResponse
+		err = json.NewDecoder(resp.Body).Decode(&apiResponse)
+		if err != nil {
+			log.Printf("Failed to fetch preconf request: %v", err)
 			return
 		}
+
+		if !apiResponse.Success {
+			log.Printf("Failed to fetch inclusion preconf from server: %v", apiResponse)
+			return
+		}
+		log.Println(apiResponse.Data)
+
+		var preconfBundles PreconfBundles
+		err = json.Unmarshal(apiResponse.Data, &preconfBundles)
+		if err != nil {
+			log.Printf("Failed to unmarshal preconf bundles: %v", err)
+			return
+		}
+		log.Printf("Unmarshaled PreconfBundles: %+v", preconfBundles)
+
+		//===============================================
 		// api.log.Info("=============preconfs==========")
 		// api.log.Println(preconfArr)
 		blockTxMap := make(map[string]struct{})
@@ -2201,12 +2287,12 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		}
 		missingTxs := []string{}
 		count := 0
-		for _, preconf := range preconfArr {
-			for _, preconfTx := range preconf.SignedTxs {
+		for _, preconf := range preconfBundles.Bundles {
+			for _, preconfTx := range preconf.Txs {
 				count++
-				if _, exists := blockTxMap[preconfTx]; !exists {
+				if _, exists := blockTxMap[preconfTx.Tx]; !exists {
 					// log.Printf("Missing preconf transaction: %s", preconfTxHex) // Log the missing transaction in hex
-					missingTxs = append(missingTxs, preconfTx) // Add to missing transactions
+					missingTxs = append(missingTxs, preconfTx.Tx) // Add to missing transactions
 				}
 			}
 		}
@@ -2928,4 +3014,144 @@ func FetchBuilderPubKey(apiURL string, slot uint64) (*BuilderResponse, error) {
 
 	// Return the parsed builder and fallbackBuilder
 	return &builderResp, nil
+}
+
+// Login sends a login request and completes the EIP712 signature process
+func (c *ApiClient) Login(privateKey string) (string, string, error) {
+	privateKeyBytes, err := hex.DecodeString(privateKey)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to decode private key: %w", err)
+	}
+	privateKeyECDSA, err := crypto.ToECDSA(privateKeyBytes)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to create ECDSA private key: %w", err)
+	}
+	address := crypto.PubkeyToAddress(privateKeyECDSA.PublicKey).Hex()
+
+	loginURL := fmt.Sprintf("%s/api/user/login", c.APIURL)
+	formData := url.Values{}
+	formData.Set("addr", address)
+	formData.Set("chainId", c.ChainID)
+
+	resp, err := c.Client.PostForm(loginURL, formData)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to send login request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := ioutil.ReadAll(resp.Body)
+		return "", "", fmt.Errorf("login failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var apiResponse ApiResponse
+	if err := json.NewDecoder(resp.Body).Decode(&apiResponse); err != nil {
+		return "", "", fmt.Errorf("failed to parse login response: %w", err)
+	}
+	if !apiResponse.Success {
+		return "", "", fmt.Errorf("login failed: response indicates failure")
+	}
+
+	var loginData LoginResponse
+	if err := json.Unmarshal(apiResponse.Data, &loginData); err != nil {
+		return "", "", fmt.Errorf("failed to parse login data: %w", err)
+	}
+
+	fmt.Println("EIP712Message:", loginData.EIP712Message)
+	fmt.Println("NonceHash:", loginData.NonceHash)
+	// Parse the EIP712Message JSON string into apitypes.TypedData
+	var typedData apitypes.TypedData
+	if err := json.Unmarshal([]byte(loginData.EIP712Message), &typedData); err != nil {
+		return "", "", fmt.Errorf("failed to unmarshal EIP712Message: %w", err)
+	}
+	// signature, err := SignEIP712Message(privateKeyECDSA, loginData.EIP712Message)
+	signature, err := eip712.SignTypedData(typedData, privateKeyECDSA)
+	var signatureHash = hex.EncodeToString(signature)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to sign EIP712 message: %w", err)
+	}
+	fmt.Println("Signature:", signatureHash)
+
+	verifyURL := fmt.Sprintf("%s/api/user/login/verify", c.APIURL)
+	verifyFormData := url.Values{}
+	verifyFormData.Set("addr", address)
+	verifyFormData.Set("signature", signatureHash)
+	verifyFormData.Set("nonceHash", loginData.NonceHash)
+
+	verifyResp, err := c.Client.PostForm(verifyURL, verifyFormData)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to send verification request: %w", err)
+	}
+	defer verifyResp.Body.Close()
+
+	if verifyResp.StatusCode != http.StatusOK {
+		body, _ := ioutil.ReadAll(verifyResp.Body)
+		return "", "", fmt.Errorf("verification failed with status %d: %s", verifyResp.StatusCode, string(body))
+	}
+
+	var verifyApiResponse ApiResponse
+	if err := json.NewDecoder(verifyResp.Body).Decode(&verifyApiResponse); err != nil {
+		return "", "", fmt.Errorf("failed to parse verification response: %w", err)
+	}
+	if !verifyApiResponse.Success {
+		return "", "", fmt.Errorf("verification failed: response indicates failure")
+	}
+
+	var verifyData VerifyResponse
+	if err := json.Unmarshal(verifyApiResponse.Data, &verifyData); err != nil {
+		return "", "", fmt.Errorf("failed to parse verify data: %w", err)
+	}
+
+	c.AccessToken = verifyData.AccessToken.Token
+	c.RefreshToken = c.extractRefreshToken(verifyResp)
+	return c.AccessToken, c.RefreshToken, nil
+}
+
+// RefreshAccessToken refreshes the access token using the refresh token
+func (c *ApiClient) RefreshAccessToken() error {
+	refreshURL := fmt.Sprintf("%s/api/user/login/refresh", c.APIURL)
+
+	// Prepare the form data
+	formData := url.Values{}
+	formData.Set("refreshToken", c.RefreshToken)
+
+	// Send the refresh token request
+	resp, err := c.Client.PostForm(refreshURL, formData)
+	if err != nil {
+		return fmt.Errorf("failed to send refresh token request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := ioutil.ReadAll(resp.Body)
+		return fmt.Errorf("refresh token failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	// Parse the refresh response
+	var apiResponse ApiResponse
+	if err := json.NewDecoder(resp.Body).Decode(&apiResponse); err != nil {
+		return fmt.Errorf("failed to parse refresh token response: %w", err)
+	}
+	if !apiResponse.Success {
+		return fmt.Errorf("refresh token failed: response indicates failure")
+	}
+
+	// Extract the verify data
+	var verifyData VerifyResponse
+	if err := json.Unmarshal(apiResponse.Data, &verifyData); err != nil {
+		return fmt.Errorf("failed to parse verify data: %w", err)
+	}
+
+	// Save new access token
+	c.AccessToken = verifyData.AccessToken.Token
+	return nil
+}
+
+func (c *ApiClient) extractRefreshToken(resp *http.Response) string {
+	for _, cookie := range resp.Cookies() {
+		if cookie.Name == "x_auth_refresh_token" {
+			return cookie.Value
+		}
+	}
+	return ""
 }
