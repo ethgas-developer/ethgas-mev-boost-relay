@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"math/big"
 	"net/http"
 	_ "net/http/pprof"
@@ -93,8 +94,9 @@ var (
 	numValidatorRegProcessors = cli.GetEnvInt("NUM_VALIDATOR_REG_PROCESSORS", 10)
 
 	// API URL
-	exchangeAPIURL = GetEnvStr("EXCHANGE_API_URL", "http://localhost:3210")
-	defaultBuilder = GetEnvStr("DEFAULT_BUILDER_PUBKEY", "0xa1885d66bef164889a2e35845c3b626545d7b0e513efe335e97c3a45e534013fa3bc38c3b7e6143695aecc4872ac52c4")
+	exchangeAPIURL          = GetEnvStr("EXCHANGE_API_URL", "http://localhost:3210")
+	exchangeLoginPrivateKey = GetEnvStr("EXCHANGE_LOGIN_PRIVATE_KEY", "8ca6e6e33b2170de9e6ce76bbb5808f8d5ec3e112c2c72cd0b97614f00061f0e")
+	defaultBuilder          = GetEnvStr("DEFAULT_BUILDER_PUBKEY", "0xa1885d66bef164889a2e35845c3b626545d7b0e513efe335e97c3a45e534013fa3bc38c3b7e6143695aecc4872ac52c4")
 
 	// various timings
 	timeoutGetPayloadRetryMs     = cli.GetEnvInt("GETPAYLOAD_RETRY_TIMEOUT_MS", 100)
@@ -125,6 +127,16 @@ var (
 		"mev-boost/v1.5.0 Go-http-client/1.1", // Prysm v4.0.1 (Shapella signing issue)
 	})
 )
+
+// Declare a global variable for ApiClient
+var client = &ApiClient{
+	APIURL: exchangeAPIURL,
+	// APIURL:  "http://localhost:3210",
+	ChainID: "7a6a",
+	Client: &http.Client{
+		Timeout: 10 * time.Second,
+	},
+}
 
 func GetEnvStr(key, defaultValue string) string {
 	if value, ok := os.LookupEnv(key); ok {
@@ -430,7 +442,7 @@ func NewRelayAPI(opts RelayAPIOpts) (api *RelayAPI, err error) {
 		api.log.Warn("env: ENABLE_IGNORABLE_VALIDATION_ERRORS - some validation errors will be ignored")
 		api.ffIgnorableValidationErrors = true
 	}
-
+	go InitLoginAndStartTokenRefresh()
 	return api, nil
 }
 
@@ -2206,34 +2218,18 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		// }
 		//=========above logic map for mock server return
 		//=========below logic map for ethgas return
-		//TODO move login into init and refresh every 15mins
-		client := &ApiClient{
-			APIURL: "https://testapp.ethgas.com",
-			// APIURL:  "http://localhost:3210",
-			ChainID: "7a6a",
-			Client: &http.Client{
-				Timeout: 10 * time.Second,
-			},
-		}
+		//TODO move login into init and relogin every 30mins also change accessToken, refreshToken into global variable
 
-		privateKey := "8ca6e6e33b2170de9e6ce76bbb5808f8d5ec3e112c2c72cd0b97614f00061f0e"
-		accessToken, refreshToken, err := client.Login(privateKey)
-		if err != nil {
-			fmt.Println("Login failed:", err)
-			return
-		}
-		fmt.Println("Access Token:", accessToken)
-		fmt.Println("")
+		// accessToken, refreshToken, err := client.Login(exchangeLoginPrivateKey)
+		// if err != nil {
+		// 	fmt.Println("Login failed:", err)
+		// 	return
+		// }
+		// fmt.Println("Access Token:", accessToken)
+		// fmt.Println("")
 
-		fmt.Println("Refresh Token:", refreshToken)
-		fmt.Println("")
-		// Refresh the access token
-		err = client.RefreshAccessToken()
-		if err != nil {
-			fmt.Println("Refresh token failed:", err)
-			return
-		}
-		fmt.Println("New Access Token:", client.AccessToken)
+		// fmt.Println("Refresh Token:", refreshToken)
+		// fmt.Println("")
 
 		// submission.BidTrace.Slot
 
@@ -3154,4 +3150,50 @@ func (c *ApiClient) extractRefreshToken(resp *http.Response) string {
 		}
 	}
 	return ""
+}
+
+func InitLoginAndStartTokenRefresh() {
+	// Perform the initial login to get tokens
+	// TODO config
+
+	// privateKey := "8ca6e6e33b2170de9e6ce76bbb5808f8d5ec3e112c2c72cd0b97614f00061f0e"
+
+	accessToken, refreshToken, err := client.Login(exchangeLoginPrivateKey)
+	if err != nil || accessToken == "" || refreshToken == "" {
+		log.Printf("Failed to login during initialization: %v", err)
+		return
+	}
+
+	// Start a goroutine to refresh the tokens every 30 minutes
+	go client.startTokenRefreshLoop()
+	go client.startDailyLoginLoop(exchangeLoginPrivateKey)
+}
+
+// startTokenRefreshLoop refreshes access tokens every 30 minutes
+func (c *ApiClient) startTokenRefreshLoop() {
+	log.Println("Starting access token refresh loop...")
+	ticker := time.NewTicker(30 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		err := c.RefreshAccessToken()
+		if err != nil {
+			log.Printf("Failed to refresh access token: %v", err)
+		}
+	}
+}
+
+// startDailyLoginLoop logs in every 24 hours
+func (c *ApiClient) startDailyLoginLoop(privateKey string) {
+	log.Println("Starting daily login loop...")
+	ticker := time.NewTicker(24 * time.Hour)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		accessToken, refreshToken, err := c.Login(privateKey)
+		if err != nil || accessToken == "" || refreshToken == "" {
+			log.Printf("Failed to login during initialization: %v", err)
+			return
+		}
+	}
 }
