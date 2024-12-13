@@ -205,18 +205,21 @@ type PreconfTx struct {
 
 // // match this response
 // // https://bitbucket.org/infinity-exchange/infinity-core/src/eafb819faac26b8fe23e27f44c0be30a2ef5058b/scripts/preconfMultiTxAsyncServer.ts?at=enhancement%2F8_jan
-// type PreconfResponse struct {
-// 	PreconfTxs        [][]byte `json:"preconf_txs"`
-// 	PreconfConditions struct {
-// 		OrderingMetaData struct {
-// 			Index int `json:"index"`
-// 		} `json:"ordering_meta_data"`
-// 	} `json:"preconf_conditions"`
-// 	SignedTxs   []string `json:"signedTxs"`
-// 	AvgBidPrice uint64   `json:"avg_bid_price"`
-// }
+//
+//	type PreconfResponse struct {
+//		PreconfTxs        [][]byte `json:"preconf_txs"`
+//		PreconfConditions struct {
+//			OrderingMetaData struct {
+//				Index int `json:"index"`
+//			} `json:"ordering_meta_data"`
+//		} `json:"preconf_conditions"`
+//		SignedTxs   []string `json:"signedTxs"`
+//		AvgBidPrice uint64   `json:"avg_bid_price"`
+//	}
+type DataResponse struct {
+	Builder BuilderResponse `json:"builder"`
+}
 
-// TODO Do BuilderResponse need jwt?
 type BuilderResponse struct {
 	Builder         string `json:"builder"`
 	FallbackBuilder string `json:"fallbackBuilder"`
@@ -2988,7 +2991,7 @@ func (api *RelayAPI) handleReadyz(w http.ResponseWriter, req *http.Request) {
 // FetchBuilderPubKey fetches the builder and fallbackBuilder from the /builder/pubkey/:slot endpoint
 func FetchBuilderPubKey(apiURL string, slot uint64) (*BuilderResponse, error) {
 	// Construct the URL for the API request
-	url := fmt.Sprintf("%s/builder/pubkey/%d", apiURL, slot)
+	url := fmt.Sprintf("%s/api/p/builder/pubkey/%d", apiURL, slot)
 
 	// Send HTTP GET request
 	resp, err := http.Get(url)
@@ -3002,15 +3005,28 @@ func FetchBuilderPubKey(apiURL string, slot uint64) (*BuilderResponse, error) {
 		return nil, fmt.Errorf("received non-OK status code: %d", resp.StatusCode)
 	}
 
-	// Parse the JSON response
-	var builderResp BuilderResponse
-	err = json.NewDecoder(resp.Body).Decode(&builderResp)
+	var apiResponse ApiResponse
+	err = json.NewDecoder(resp.Body).Decode(&apiResponse)
 	if err != nil {
+		log.Printf("Failed to decode API response: %v", err)
+		return nil, fmt.Errorf("failed to decode API response: %v", err)
+	}
+
+	if !apiResponse.Success {
+		log.Printf("API response indicates failure: %v", apiResponse)
+		return nil, fmt.Errorf("API response indicates failure: %v", apiResponse)
+	}
+
+	// Parse the JSON response specific to this endpoint
+	var builderResp DataResponse
+	err = json.Unmarshal(apiResponse.Data, &builderResp)
+	if err != nil {
+		log.Printf("Failed to unmarshal builder response: %v", err)
 		return nil, err
 	}
 
 	// Return the parsed builder and fallbackBuilder
-	return &builderResp, nil
+	return &builderResp.Builder, nil
 }
 
 // Login sends a login request and completes the EIP712 signature process
