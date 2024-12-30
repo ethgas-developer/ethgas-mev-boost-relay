@@ -187,6 +187,11 @@ type ApiResponse struct {
 	Data    json.RawMessage `json:"data"`
 }
 
+// Define the slotBundle type at the top of the file
+// type SlotBundleResponse struct {
+// 	SlotBundle PreconfBundles `json:"slotBundle"`
+// }
+
 type PreconfBundles struct {
 	Bundles []PreconfBundle `json:"bundles"`
 }
@@ -194,11 +199,12 @@ type PreconfBundles struct {
 // PreconfBundle represents a single preconfigured bundle.
 type PreconfBundle struct {
 	Txs             []PreconfTx `json:"txs"`
-	UUID            string      `json:"uuid"`
+	UUID            string      `json:"replacementUuid"`
 	AverageBidPrice float64     `json:"averageBidPrice"`
 }
 type PreconfTx struct {
 	Tx        string `json:"tx"`        // Transaction string
+	TxHash    string `json:"txHash"`    // Transaction hash
 	CanRevert bool   `json:"canRevert"` // Indicates if the transaction can be reverted
 	// CreateDate uint64 `json:"createDate"` // Uncomment and use if needed
 }
@@ -2237,7 +2243,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 
 		// submission.BidTrace.Slot
 
-		url := fmt.Sprintf("%s/api/p/bundles?slot=%d", client.APIURL, 1)
+		url := fmt.Sprintf("%s/api/slot/bundles?slot=%d", client.APIURL, 1)
 		req, err := http.NewRequest("GET", url, nil)
 		if err != nil {
 			log.Printf("cannot fetch preconf requests from preconf server, %v", err)
