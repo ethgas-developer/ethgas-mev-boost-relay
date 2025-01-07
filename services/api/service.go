@@ -2243,7 +2243,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 
 		// submission.BidTrace.Slot
 
-		url := fmt.Sprintf("%s/api/slot/bundles?slot=%d", client.APIURL, 1)
+		url := fmt.Sprintf("%s/api/slot/bundles?slot=%d", client.APIURL, submission.BidTrace.Slot)
 		req, err := http.NewRequest("GET", url, nil)
 		if err != nil {
 			log.Printf("cannot fetch preconf requests from preconf server, %v", err)
