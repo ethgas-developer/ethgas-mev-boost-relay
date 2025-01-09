@@ -2435,6 +2435,11 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 			simResult = &blockSimResult{false, nil, false, nil, nil}
 		}
 
+		if !isValidPreconf {
+			simResult.requestErr = fmt.Errorf("invalid preconf")
+			log.Warn("Invalid preconf detected")
+		}
+
 		submissionEntry, err := api.db.SaveBuilderBlockSubmission(payload, simResult.requestErr, simResult.validationErr, receivedAt, eligibleAt, simResult.wasSimulated, savePayloadToDatabase, pf, simResult.optimisticSubmission, simResult.blockValue)
 		if err != nil {
 			log.WithError(err).WithFields(logrus.Fields{
