@@ -348,6 +348,13 @@ type RelayAPI struct {
 	blockBuildersCache map[string]*blockBuilderCacheEntry
 }
 
+// Add a cache map and a mutex for thread safety
+var (
+	preconfCache      = make(map[uint64]PreconfBundles)
+	preconfCacheMutex sync.RWMutex
+	currentSlot       uint64
+)
+
 // NewRelayAPI creates a new service. if builders is nil, allow any builder
 func NewRelayAPI(opts RelayAPIOpts) (api *RelayAPI, err error) {
 	if err := metrics.Setup(context.Background()); err != nil {
@@ -2209,114 +2216,92 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		isValidPreconf = false
 	}
 	if msIntoSlot >= int64(getExchangeFinalizedCutoffMs) {
-		//------logic to Checking dose preconf transaction inculded in the block
-		// Fetch the preconf list from the preconf server
-		// url := fmt.Sprintf("%s/preconf_request/%d", exchangeAPIURL, submission.BidTrace.Slot)
-		// resp, _err := http.Get(url)
-		// if _err != nil {
-		// 	api.log.Println("Error fetching preconf list:", _err)
-		// 	return
-		// }
-		// defer resp.Body.Close()
-
-		// var preconfArr []PreconfResponse
-
-		// _err = json.NewDecoder(resp.Body).Decode(&preconfArr)
-		// if _err != nil {
-		// 	api.log.Println("Error decoding preconf response:", _err)
-		// 	return
-		// }
-		//=========above logic map for mock server return
-		//=========below logic map for ethgas return
-		//TODO move login into init and relogin every 30mins also change accessToken, refreshToken into global variable
-
-		// accessToken, refreshToken, err := client.Login(exchangeLoginPrivateKey)
-		// if err != nil {
-		// 	fmt.Println("Login failed:", err)
-		// 	return
-		// }
-		// fmt.Println("Access Token:", accessToken)
-		// fmt.Println("")
-
-		// fmt.Println("Refresh Token:", refreshToken)
-		// fmt.Println("")
-
-		// submission.BidTrace.Slot
-
-		url := fmt.Sprintf("%s/api/slot/bundles?slot=%d", client.APIURL, submission.BidTrace.Slot)
-		req, err := http.NewRequest("GET", url, nil)
-		if err != nil {
-			log.Printf("cannot fetch preconf requests from preconf server, %v", err)
-			return
+		// Cache management code
+		preconfCacheMutex.Lock()
+		if submission.BidTrace.Slot != currentSlot {
+			preconfCache = make(map[uint64]PreconfBundles)
+			currentSlot = submission.BidTrace.Slot
 		}
-		header := fmt.Sprintf("Bearer %s", client.AccessToken)
+		preconfCacheMutex.Unlock()
 
-		req.Header.Set("AUTHORIZATION", header)
+		// Check cache first
+		preconfCacheMutex.RLock()
+		cachedPreconfs, exists := preconfCache[submission.BidTrace.Slot]
+		preconfCacheMutex.RUnlock()
 
-		resp, err := client.Client.Do(req)
-		if err != nil {
-			log.Printf("cannot fetch preconf requests from preconf server, %v", err)
-			return
+		if !exists {
+			url := fmt.Sprintf("%s/api/slot/bundles?slot=%d", client.APIURL, submission.BidTrace.Slot)
+			req, err := http.NewRequest("GET", url, nil)
+			if err != nil {
+				log.Printf("cannot fetch preconf requests from preconf server, %v", err)
+				return
+			}
+			header := fmt.Sprintf("Bearer %s", client.AccessToken)
+			req.Header.Set("AUTHORIZATION", header)
+
+			resp, err := client.Client.Do(req)
+			if err != nil {
+				log.Printf("cannot fetch preconf requests from preconf server, %v", err)
+				return
+			}
+			defer resp.Body.Close()
+
+			var apiResponse ApiResponse
+			err = json.NewDecoder(resp.Body).Decode(&apiResponse)
+			if err != nil {
+				log.Printf("Failed to fetch preconf request: %v", err)
+				return
+			}
+
+			if !apiResponse.Success {
+				log.Printf("Failed to fetch inclusion preconf from server: %v", apiResponse)
+				return
+			}
+
+			var preconfBundles PreconfBundles
+			err = json.Unmarshal(apiResponse.Data, &preconfBundles)
+			if err != nil {
+				log.Printf("Failed to unmarshal preconf bundles: %v", err)
+				return
+			}
+
+			// Store in cache
+			preconfCacheMutex.Lock()
+			preconfCache[submission.BidTrace.Slot] = preconfBundles
+			preconfCacheMutex.Unlock()
+
+			cachedPreconfs = preconfBundles
 		}
-		defer resp.Body.Close()
-		var apiResponse ApiResponse
-		err = json.NewDecoder(resp.Body).Decode(&apiResponse)
-		if err != nil {
-			log.Printf("Failed to fetch preconf request: %v", err)
-			return
-		}
 
-		if !apiResponse.Success {
-			log.Printf("Failed to fetch inclusion preconf from server: %v", apiResponse)
-			return
-		}
-		log.Println(apiResponse.Data)
-
-		var preconfBundles PreconfBundles
-		err = json.Unmarshal(apiResponse.Data, &preconfBundles)
-		if err != nil {
-			log.Printf("Failed to unmarshal preconf bundles: %v", err)
-			return
-		}
-		log.Printf("Unmarshaled PreconfBundles: %+v", preconfBundles)
-
-		//===============================================
-		// api.log.Info("=============preconfs==========")
-		// api.log.Println(preconfArr)
+		// Transaction checking logic
 		blockTxMap := make(map[string]struct{})
 		for _, tx := range submission.Transactions {
-			// log.Println("=======tx")
-			// log.Println(tx)
-			// log.Println("0x" + hex.EncodeToString(tx))
-
 			blockTxMap["0x"+hex.EncodeToString(tx)] = struct{}{}
 		}
+
 		missingTxs := []string{}
 		count := 0
-		for _, preconf := range preconfBundles.Bundles {
+		for _, preconf := range cachedPreconfs.Bundles {
 			for _, preconfTx := range preconf.Txs {
 				count++
 				if _, exists := blockTxMap[preconfTx.Tx]; !exists {
-					// log.Printf("Missing preconf transaction: %s", preconfTxHex) // Log the missing transaction in hex
-					missingTxs = append(missingTxs, preconfTx.Tx) // Add to missing transactions
+					missingTxs = append(missingTxs, preconfTx.Tx)
 				}
 			}
 		}
 
-		// After checking all transactions, log the results
 		if len(missingTxs) > 0 {
-			log.Printf("Total missing transactions: %d, inculded preconf transaction: %d", len(missingTxs), count-len(missingTxs))
+			log.Printf("Total missing transactions: %d, included preconf transaction: %d",
+				len(missingTxs), count-len(missingTxs))
 			log.Printf("Number of transactions: %d", len(submission.Transactions))
-			log.Println("Missing preconf transaction hexes:", missingTxs)
 			isValidPreconf = false
 		} else {
-			log.Printf("All preconf transactions are included in the block! submissed Transactions:%d, preconf transaction: %d", len(submission.Transactions), count)
+			log.Printf("All preconf transactions are included in the block! Submitted Transactions:%d, preconf transaction: %d",
+				len(submission.Transactions), count)
 			isValidPreconf = true
 		}
 
 		log.Println("is valid preconf: ", isValidPreconf)
-
-		//end of check
 	}
 
 	log = log.WithFields(logrus.Fields{
