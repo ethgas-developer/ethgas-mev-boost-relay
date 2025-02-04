@@ -2231,6 +2231,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 
 		if !exists {
 			url := fmt.Sprintf("%s/api/slot/bundles?slot=%d", client.APIURL, submission.BidTrace.Slot)
+			log.Printf(url)
 			req, err := http.NewRequest("GET", url, nil)
 			if err != nil {
 				log.Printf("cannot fetch preconf requests from preconf server, %v", err)
@@ -2274,9 +2275,11 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		}
 
 		// Transaction checking logic
+		// Convert all block transactions to lowercase for case-insensitive comparison
 		blockTxMap := make(map[string]struct{})
 		for _, tx := range submission.Transactions {
-			blockTxMap["0x"+hex.EncodeToString(tx)] = struct{}{}
+			txLower := "0x" + strings.ToLower(hex.EncodeToString(tx))
+			blockTxMap[txLower] = struct{}{}
 		}
 
 		missingTxs := []string{}
@@ -2284,8 +2287,10 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		for _, preconf := range cachedPreconfs.Bundles {
 			for _, preconfTx := range preconf.Txs {
 				count++
-				if _, exists := blockTxMap[preconfTx.Tx]; !exists {
-					missingTxs = append(missingTxs, preconfTx.Tx)
+				// Normalize preconf transaction to lowercase
+				txLower := strings.ToLower(preconfTx.Tx)
+				if _, exists := blockTxMap[txLower]; !exists {
+					missingTxs = append(missingTxs, preconfTx.Tx) // Keep original case in report
 				}
 			}
 		}
@@ -2294,6 +2299,8 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 			log.Printf("Total missing transactions: %d, included preconf transaction: %d",
 				len(missingTxs), count-len(missingTxs))
 			log.Printf("Number of transactions: %d", len(submission.Transactions))
+			log.Println("Missing preconf transaction hexes:", missingTxs)
+			log.Println("transaction in this block:", blockTxMap)
 			isValidPreconf = false
 		} else {
 			log.Printf("All preconf transactions are included in the block! Submitted Transactions:%d, preconf transaction: %d",
