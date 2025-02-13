@@ -193,7 +193,8 @@ type ApiResponse struct {
 // }
 
 type PreconfBundles struct {
-	Bundles []PreconfBundle `json:"bundles"`
+	Bundles    []PreconfBundle `json:"bundles"`
+	EmptySpace string          `json:"empty_space,omitempty"`
 }
 
 // PreconfBundle represents a single preconfigured bundle.
@@ -2206,16 +2207,12 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	//before deadline: no check, is valid = false
 	//after deadline: check builder id, is fullfilled preconf, is valid = false/true
 	//get header: 1. builder + true, 2. fallback builder + true, 3. builder + false 4. fallback builder + false 5. other builder
-	isValidPreconf := false
+	isValidPreconf := "" // empty string means valid
 
 	if msIntoSlot < int64(getExchangeFinalizedCutoffMs) {
-		// accept early submit
 		api.log.Info("handleSubmitNewBlock sent too early, wait for exchange finalized")
-		// w.WriteHeader(http.StatusNoContent)
-		// return
-		isValidPreconf = false
-	}
-	if msIntoSlot >= int64(getExchangeFinalizedCutoffMs) {
+		isValidPreconf = "submission too early, before exchange finalization cutoff"
+	} else if msIntoSlot >= int64(getExchangeFinalizedCutoffMs) {
 		// Cache management code
 		preconfCacheMutex.Lock()
 		if submission.BidTrace.Slot != currentSlot {
@@ -2301,14 +2298,29 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 			log.Printf("Number of transactions: %d", len(submission.Transactions))
 			log.Println("Missing preconf transaction hexes:", missingTxs)
 			log.Println("transaction in this block:", blockTxMap)
-			isValidPreconf = false
+			isValidPreconf = fmt.Sprintf("missing %d required preconf transactions", len(missingTxs))
 		} else {
-			log.Printf("All preconf transactions are included in the block! Submitted Transactions:%d, preconf transaction: %d",
-				len(submission.Transactions), count)
-			isValidPreconf = true
+			log.Printf("All preconf transactions are included in the block!")
+			// Remains empty string for valid case
 		}
-
-		log.Println("is valid preconf: ", isValidPreconf)
+		//check remain empty space
+		//hardcode test:
+		// cachedPreconfs.EmptySpace = "30000000"
+		if cachedPreconfs.EmptySpace != "" {
+			requiredSpace, err := strconv.ParseUint(cachedPreconfs.EmptySpace, 10, 64)
+			if err == nil {
+				remainingGas := submission.BidTrace.GasLimit - submission.BidTrace.GasUsed
+				if remainingGas < requiredSpace {
+					reason := fmt.Sprintf("block doesn't have enough empty space (remaining gas %d < required %d)",
+						remainingGas, requiredSpace)
+					if isValidPreconf != "" {
+						isValidPreconf += "; " + reason
+					} else {
+						isValidPreconf = reason
+					}
+				}
+			}
+		}
 	}
 
 	log = log.WithFields(logrus.Fields{
@@ -2427,9 +2439,9 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 			simResult = &blockSimResult{false, nil, false, nil, nil}
 		}
 
-		if !isValidPreconf {
-			simResult.requestErr = fmt.Errorf("invalid preconf")
-			log.Warn("Invalid preconf detected")
+		if isValidPreconf != "" {
+			simResult.requestErr = fmt.Errorf("invalid preconf: %s", isValidPreconf)
+			log.Warn("Invalid preconf detected: " + isValidPreconf)
 		}
 
 		submissionEntry, err := api.db.SaveBuilderBlockSubmission(payload, simResult.requestErr, simResult.validationErr, receivedAt, eligibleAt, simResult.wasSimulated, savePayloadToDatabase, pf, simResult.optimisticSubmission, simResult.blockValue)
@@ -2558,7 +2570,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		receivedAt:           receivedAt,
 		floorBidValue:        floorBidValue,
 		payload:              payload,
-		isValidPreconf:       isValidPreconf,
+		isValidPreconf:       isValidPreconf == "",
 	}
 	updateBidResult, getPayloadResponse, ok := api.updateRedisBid(redisOpts)
 	if !ok {
@@ -3065,6 +3077,7 @@ func (c *ApiClient) Login(privateKey string) (string, string, error) {
 		return "", "", fmt.Errorf("failed to parse login response: %w", err)
 	}
 	if !apiResponse.Success {
+		fmt.Println("Failed response:", apiResponse)
 		return "", "", fmt.Errorf("login failed: response indicates failure")
 	}
 
