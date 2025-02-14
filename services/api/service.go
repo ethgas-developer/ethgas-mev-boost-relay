@@ -202,6 +202,7 @@ type PreconfBundle struct {
 	Txs             []PreconfTx `json:"txs"`
 	UUID            string      `json:"replacementUuid"`
 	AverageBidPrice float64     `json:"averageBidPrice"`
+	BundleType      string      `json:"bundle_type,omitempty"`
 }
 type PreconfTx struct {
 	Tx        string `json:"tx"`        // Transaction string
@@ -1368,11 +1369,11 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 
 	builderResp, err := FetchBuilderPubKey(exchangeAPIURL, slot)
 	if err != nil {
+		log.WithError(err).Error("failed to get builder id from API")
 		builderResp = &BuilderResponse{
 			Builder:         defaultBuilder,
 			FallbackBuilder: defaultBuilder,
 		}
-		log.Error("failed to get builder id from ethgas api, will fallback to defaultBuilder")
 	}
 	log.Info("builder id", builderResp.Builder)
 	// bid, err := api.redis.GetBestBid(slot, parentHashHex, proposerPubkeyHex)
@@ -2282,6 +2283,12 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		missingTxs := []string{}
 		count := 0
 		for _, preconf := range cachedPreconfs.Bundles {
+			// Skip transaction checking for MEV-type bundles
+			if preconf.BundleType == "mev" {
+				continue
+			}
+			//check ordering
+
 			for _, preconfTx := range preconf.Txs {
 				count++
 				// Normalize preconf transaction to lowercase
@@ -3011,13 +3018,13 @@ func FetchBuilderPubKey(apiURL string, slot uint64) (*BuilderResponse, error) {
 	// Send HTTP GET request
 	resp, err := http.Get(url)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to fetch builder pubkey: %w", err)
 	}
 	defer resp.Body.Close()
 
 	// Check if the HTTP response status code is OK (200)
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("received non-OK status code: %d", resp.StatusCode)
+		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
 	var apiResponse ApiResponse
@@ -3032,7 +3039,11 @@ func FetchBuilderPubKey(apiURL string, slot uint64) (*BuilderResponse, error) {
 		return nil, fmt.Errorf("API response indicates failure: %v", apiResponse)
 	}
 
-	// Parse the JSON response specific to this endpoint
+	// Handle empty data case explicitly
+	if len(apiResponse.Data) == 0 {
+		return nil, fmt.Errorf("empty data in API response")
+	}
+
 	var builderResp DataResponse
 	err = json.Unmarshal(apiResponse.Data, &builderResp)
 	if err != nil {
@@ -3040,7 +3051,11 @@ func FetchBuilderPubKey(apiURL string, slot uint64) (*BuilderResponse, error) {
 		return nil, err
 	}
 
-	// Return the parsed builder and fallbackBuilder
+	// Validate required fields
+	if builderResp.Builder.Builder == "" || builderResp.Builder.FallbackBuilder == "" {
+		return nil, fmt.Errorf("invalid builder response: missing required fields")
+	}
+
 	return &builderResp.Builder, nil
 }
 
