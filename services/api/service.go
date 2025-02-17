@@ -2230,7 +2230,8 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		preconfCacheMutex.RUnlock()
 
 		if !exists {
-			url := fmt.Sprintf("%s/api/slot/bundles?slot=%d", client.APIURL, submission.BidTrace.Slot)
+			// url := fmt.Sprintf("%s/api/slot/bundles?slot=%d", client.APIURL, submission.BidTrace.Slot)
+			url := fmt.Sprintf("%s/api/v1/slot/bundles?slot=%d", client.APIURL, submission.BidTrace.Slot)
 			log.Printf(url)
 			req, err := http.NewRequest("GET", url, nil)
 			if err != nil {
@@ -3052,7 +3053,8 @@ func (api *RelayAPI) handleReadyz(w http.ResponseWriter, req *http.Request) {
 // FetchBuilderPubKey fetches the builder and fallbackBuilder from the /builder/pubkey/:slot endpoint
 func FetchBuilderPubKey(apiURL string, slot uint64) (*BuilderResponse, error) {
 	// Construct the URL for the API request
-	url := fmt.Sprintf("%s/api/p/builder/pubkey/%d", apiURL, slot)
+	// url := fmt.Sprintf("%s/api/p/builder/pubkey/%d", apiURL, slot)
+	url := fmt.Sprintf("%s/api/v1/p/builder/%d", apiURL, slot)
 
 	// Send HTTP GET request
 	resp, err := http.Get(url)
@@ -3110,7 +3112,9 @@ func (c *ApiClient) Login(privateKey string) (string, string, error) {
 	}
 	address := crypto.PubkeyToAddress(privateKeyECDSA.PublicKey).Hex()
 
-	loginURL := fmt.Sprintf("%s/api/user/login", c.APIURL)
+	// loginURL := fmt.Sprintf("%s/api/user/login", c.APIURL)
+	loginURL := fmt.Sprintf("%s/api/v1/user/login", c.APIURL)
+
 	formData := url.Values{}
 	formData.Set("addr", address)
 	formData.Set("chainId", c.ChainID)
@@ -3155,7 +3159,9 @@ func (c *ApiClient) Login(privateKey string) (string, string, error) {
 	}
 	fmt.Println("Signature:", signatureHash)
 
-	verifyURL := fmt.Sprintf("%s/api/user/login/verify", c.APIURL)
+	// verifyURL := fmt.Sprintf("%s/api/user/login/verify", c.APIURL)
+	verifyURL := fmt.Sprintf("%s/api/v1/user/login/verify", c.APIURL)
+
 	verifyFormData := url.Values{}
 	verifyFormData.Set("addr", address)
 	verifyFormData.Set("signature", signatureHash)
@@ -3192,7 +3198,8 @@ func (c *ApiClient) Login(privateKey string) (string, string, error) {
 
 // RefreshAccessToken refreshes the access token using the refresh token
 func (c *ApiClient) RefreshAccessToken() error {
-	refreshURL := fmt.Sprintf("%s/api/user/login/refresh", c.APIURL)
+	// refreshURL := fmt.Sprintf("%s/api/user/login/refresh", c.APIURL)
+	refreshURL := fmt.Sprintf("%s/api/v1/user/login/refresh", c.APIURL)
 
 	// Prepare the form data
 	formData := url.Values{}
