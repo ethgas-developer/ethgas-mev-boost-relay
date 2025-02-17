@@ -203,6 +203,7 @@ type PreconfBundle struct {
 	UUID            string      `json:"replacementUuid"`
 	AverageBidPrice float64     `json:"averageBidPrice"`
 	BundleType      string      `json:"bundle_type,omitempty"`
+	Ordering        string      `json:"ordering,omitempty"`
 }
 type PreconfTx struct {
 	Tx        string `json:"tx"`        // Transaction string
@@ -1460,6 +1461,14 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 	// 	w.WriteHeader(http.StatusNoContent)
 	// 	return
 	// }
+	decodeTime := time.Now().UTC()
+
+	go func() {
+		err := api.db.InsertGetPayload(uint64(slot), proposerPubkeyHex, blockHash.String(), slotStartTimestamp, uint64(requestTime.UnixMilli()), uint64(decodeTime.UnixMilli()), uint64(msIntoSlot))
+		if err != nil {
+			log.WithError(err).Error("failed to insert get header into db")
+		}
+	}()
 
 	log.WithFields(logrus.Fields{
 		"value":     value.String(),
@@ -1757,13 +1766,6 @@ func (api *RelayAPI) handleGetPayload(w http.ResponseWriter, req *http.Request) 
 		}
 		log.WithError(err).Error("redis.CheckAndSetLastSlotAndHashDelivered failed")
 	}
-
-	go func() {
-		err := api.db.InsertGetPayload(uint64(slot), proposerPubkey.String(), blockHash.String(), slotStartTimestamp, uint64(receivedAt.UnixMilli()), uint64(decodeTime.UnixMilli()), uint64(msIntoSlot))
-		if err != nil {
-			log.WithError(err).Error("failed to insert payload too late into db")
-		}
-	}()
 
 	// Handle early/late requests
 	if msIntoSlot < 0 {
@@ -2281,22 +2283,52 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		}
 
 		missingTxs := []string{}
+		missingOrderBundle := []string{}
 		count := 0
 		for _, preconf := range cachedPreconfs.Bundles {
 			// Skip transaction checking for MEV-type bundles
 			if preconf.BundleType == "mev" {
 				continue
 			}
-			//check ordering
 
-			for _, preconfTx := range preconf.Txs {
-				count++
-				// Normalize preconf transaction to lowercase
-				txLower := strings.ToLower(preconfTx.Tx)
-				if _, exists := blockTxMap[txLower]; !exists {
-					missingTxs = append(missingTxs, preconfTx.Tx) // Keep original case in report
+			// Check ordering
+			numOfTxsInBundle := len(preconf.Txs)
+
+			// hardcode test:
+			if preconf.Ordering == "1" {
+				// "1" means the top
+				// Check if the first `numOfTxsInBundle` transactions in the block match the preconf transactions
+				for i, preconfTx := range preconf.Txs {
+					if i >= len(submission.Transactions) || strings.ToLower(preconfTx.Tx) != "0x"+strings.ToLower(hex.EncodeToString(submission.Transactions[i])) {
+						missingOrderBundle = append(missingOrderBundle, preconf.UUID)
+						continue
+					}
+				}
+			} else if preconf.Ordering == "-1" {
+				// "-1" means the bottom
+				// Check if the last `numOfTxsInBundle` transactions in the block match the preconf transactions
+				for i, preconfTx := range preconf.Txs {
+					blockTxIndex := len(submission.Transactions) - numOfTxsInBundle + i
+					if blockTxIndex < 0 || strings.ToLower(preconfTx.Tx) != "0x"+strings.ToLower(hex.EncodeToString(submission.Transactions[blockTxIndex])) {
+						missingOrderBundle = append(missingOrderBundle, preconf.UUID)
+						continue
+					}
+				}
+			} else {
+				// Existing transaction existence check
+				for _, preconfTx := range preconf.Txs {
+					txLower := strings.ToLower(preconfTx.Tx)
+					if _, exists := blockTxMap[txLower]; !exists {
+						missingTxs = append(missingTxs, preconfTx.Tx)
+					}
 				}
 			}
+		}
+		if len(missingOrderBundle) > 0 {
+			log.Printf("Total missing ordering bundle: %d",
+				len(missingOrderBundle))
+			log.Println("Missing preconf transaction hexes:", missingOrderBundle)
+			isValidPreconf = fmt.Sprintf("missing ordering bundle: %s", missingOrderBundle)
 		}
 
 		if len(missingTxs) > 0 {
@@ -2305,11 +2337,18 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 			log.Printf("Number of transactions: %d", len(submission.Transactions))
 			log.Println("Missing preconf transaction hexes:", missingTxs)
 			log.Println("transaction in this block:", blockTxMap)
-			isValidPreconf = fmt.Sprintf("missing %d required preconf transactions", len(missingTxs))
+			reason := fmt.Sprintf("missing %d required preconf transactions", len(missingTxs))
+			if isValidPreconf != "" {
+				isValidPreconf += "; " + reason
+			} else {
+				isValidPreconf = reason
+			}
+
 		} else {
 			log.Printf("All preconf transactions are included in the block!")
 			// Remains empty string for valid case
 		}
+
 		//check remain empty space
 		//hardcode test:
 		// cachedPreconfs.EmptySpace = "30000000"
