@@ -202,7 +202,7 @@ type PreconfBundle struct {
 	Txs             []PreconfTx `json:"txs"`
 	UUID            string      `json:"replacementUuid"`
 	AverageBidPrice float64     `json:"averageBidPrice"`
-	BundleType      string      `json:"bundle_type,omitempty"`
+	BundleType      int         `json:"bundleType,omitempty"`
 	Ordering        string      `json:"ordering,omitempty"`
 }
 type PreconfTx struct {
@@ -1444,6 +1444,15 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 
+	// HARDCODE to modify the bid value to force validator select our block
+	// if bid.Capella != nil {
+	// 	log.Info("set fake bid.Capella.Message.Value")
+	// 	bid.Capella.Message.Value = uint256.NewInt(10000000000000000000) // Set to desired value (100 ETH)
+	// } else if bid.Deneb != nil {
+	// 	log.Info("set fake bid.Deneb.Message.Value")
+	// 	bid.Deneb.Message.Value = uint256.NewInt(10000000000000000000) // Set to desired value (100 ETH)
+	// }
+
 	value, err := bid.Value()
 	if err != nil {
 		log.WithError(err).Info("could not get bid value")
@@ -1508,7 +1517,7 @@ func (api *RelayAPI) handleGetPayload(w http.ResponseWriter, req *http.Request) 
 	})
 
 	// Log at start and end of request
-	log.Info("request initiated")
+	log.Info("handleGetPayload request initiated")
 	defer func() {
 		log.WithFields(logrus.Fields{
 			"timestampRequestFin": time.Now().UTC().UnixMilli(),
@@ -2288,14 +2297,18 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		count := 0
 		for _, preconf := range cachedPreconfs.Bundles {
 			// Skip transaction checking for MEV-type bundles
-			if preconf.BundleType == "mev" {
+			// const bundleType = {
+			// 	STANDARD: 1,
+			// 	MEV: 2,
+			// 	BLOBS: 3, //TODO
+			// }
+			if preconf.BundleType == 2 { //mev type can skip
 				continue
 			}
 
 			// Check ordering
 			numOfTxsInBundle := len(preconf.Txs)
 
-			// hardcode test:
 			if preconf.Ordering == "1" {
 				// "1" means the top
 				// Check if the first `numOfTxsInBundle` transactions in the block match the preconf transactions
