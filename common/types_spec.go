@@ -44,7 +44,6 @@ func BuildGetHeaderResponse(payload *VersionedSubmitBlockRequest, sk *bls.Secret
 	if sk == nil {
 		return nil, ErrMissingSecretKey
 	}
-
 	versionedPayload := &builderApi.VersionedExecutionPayload{Version: payload.Version}
 	switch payload.Version {
 	case spec.DataVersionCapella:
@@ -116,7 +115,10 @@ func BuilderBlockRequestToSignedBuilderBid(payload *VersionedSubmitBlockRequest,
 			Header: header.Capella,
 			Pubkey: *pubkey,
 		}
-
+		// log.Println("BuilderBlockRequestToSignedBuilderBid")
+		// log.Println(&builderBid)
+		// log.Println(&domain)
+		// log.Println(sk)
 		sig, err := ssz.SignMessage(&builderBid, domain, sk)
 		if err != nil {
 			return nil, err

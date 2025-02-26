@@ -30,7 +30,10 @@ import (
 	"bitbucket.org/infinity-exchange/mev-boost-relay/metrics"
 	"github.com/NYTimes/gziphandler"
 	builderApi "github.com/attestantio/go-builder-client/api"
+	builderApiCapella "github.com/attestantio/go-builder-client/api/capella"
+	builderApiDeneb "github.com/attestantio/go-builder-client/api/deneb"
 	builderApiV1 "github.com/attestantio/go-builder-client/api/v1"
+
 	"github.com/attestantio/go-eth2-client/spec"
 	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/buger/jsonparser"
@@ -1445,13 +1448,80 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 	}
 
 	// HARDCODE to modify the bid value to force validator select our block
-	// if bid.Capella != nil {
-	// 	log.Info("set fake bid.Capella.Message.Value")
-	// 	bid.Capella.Message.Value = uint256.NewInt(10000000000000000000) // Set to desired value (100 ETH)
-	// } else if bid.Deneb != nil {
-	// 	log.Info("set fake bid.Deneb.Message.Value")
-	// 	bid.Deneb.Message.Value = uint256.NewInt(10000000000000000000) // Set to desired value (100 ETH)
-	// }
+	if bid.Capella != nil {
+		// log.Info("set fake bid.Capella.Message.Value")
+		// log.Info("old bid.Capella.Message.Value: ", bid.Capella.Message.Value)
+		bid.Capella.Message.Value = uint256.MustFromDecimal("11000000000000000000000") // Set to desired value (11000 ETH)
+		// Serialize the bid data
+		// log.Info("new bid.Capella.Message.Value: ", bid.Capella.Message.Value)
+		// log.Info("old bid.Capella.Message.Pubkey: ", bid.Capella.Message.Pubkey)
+
+		bid.Capella.Message.Pubkey = *api.publicKey
+		// log.Info("new bid.Capella.Message.Pubkey: ", bid.Capella.Message.Pubkey)
+
+		builderBid := builderApiCapella.BuilderBid{
+			Value:  bid.Capella.Message.Value,
+			Header: bid.Capella.Message.Header,
+			Pubkey: *api.publicKey,
+		}
+
+		// print("RESIGN")
+		// log.Info(&builderBid)
+		// log.Info(&api.opts.EthNetDetails.DomainBuilder)
+		// log.Info(api.blsSk)
+		signature, err := ssz.SignMessage(&builderBid, api.opts.EthNetDetails.DomainBuilder, api.blsSk)
+
+		if err != nil {
+			log.WithError(err).Error("failed to signature bid")
+			api.RespondError(w, http.StatusInternalServerError, "failed to signature bid")
+			return
+		}
+		// Re-sign the payload with the new bid value
+		signatureBytes := signature[:]
+
+		// Ensure the signature is the correct size
+		if len(signatureBytes) != 96 {
+			log.Error("signature size is incorrect")
+			api.RespondError(w, http.StatusInternalServerError, "signature size is incorrect")
+			return
+		}
+		// log.Info("old bid.Capella.Signature: ", bid.Capella.Signature)
+
+		// Assign the signature
+		copy(bid.Capella.Signature[:], signatureBytes)
+		// log.Info("new bid.Capella.Signature: ", bid.Capella.Signature)
+
+	} else if bid.Deneb != nil {
+		// log.Info("set fake bid.Deneb.Message.Value")
+		bid.Deneb.Message.Value = uint256.NewInt(11000000000000000000) // Set to desired value (100 ETH)
+		bid.Deneb.Message.Pubkey = *api.publicKey
+
+		// Serialize the bid data
+
+		builderBid := builderApiDeneb.BuilderBid{
+			Value:  bid.Deneb.Message.Value,
+			Header: bid.Deneb.Message.Header,
+			Pubkey: *api.publicKey,
+		}
+
+		signature, err := ssz.SignMessage(&builderBid, api.opts.EthNetDetails.DomainBuilder, api.blsSk)
+		if err != nil {
+			log.WithError(err).Error("failed to signature bid")
+			api.RespondError(w, http.StatusInternalServerError, "failed to signature bid")
+			return
+		}
+		signatureBytes := signature[:]
+
+		// Ensure the signature is the correct size
+		if len(signatureBytes) != 96 {
+			log.Error("signature size is incorrect")
+			api.RespondError(w, http.StatusInternalServerError, "signature size is incorrect")
+			return
+		}
+
+		// Assign the signature
+		copy(bid.Deneb.Signature[:], signatureBytes)
+	}
 
 	value, err := bid.Value()
 	if err != nil {
