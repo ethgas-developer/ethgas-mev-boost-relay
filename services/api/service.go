@@ -196,8 +196,9 @@ type ApiResponse struct {
 // }
 
 type PreconfBundles struct {
-	Bundles    []PreconfBundle `json:"bundles"`
-	EmptySpace string          `json:"empty_space,omitempty"`
+	Bundles      []PreconfBundle `json:"bundles"`
+	EmptySpace   string          `json:"empty_space,omitempty"`
+	ownerAddress string          `json:"owner_address,omitempty"`
 }
 
 // PreconfBundle represents a single preconfigured bundle.
@@ -1943,17 +1944,24 @@ func (api *RelayAPI) handleBuilderGetValidators(w http.ResponseWriter, req *http
 	}
 }
 
-func (api *RelayAPI) checkSubmissionFeeRecipient(w http.ResponseWriter, log *logrus.Entry, bidTrace *builderApiV1.BidTrace) (uint64, bool) {
+func (api *RelayAPI) checkSubmissionFeeRecipient(w http.ResponseWriter, log *logrus.Entry, bidTrace *builderApiV1.BidTrace, ownerAddress string) (uint64, bool) {
 	api.proposerDutiesLock.RLock()
 	slotDuty := api.proposerDutiesMap[bidTrace.Slot]
 	api.proposerDutiesLock.RUnlock()
+	expectedFeeRecipient := ""
+	if slotDuty != nil {
+		expectedFeeRecipient = slotDuty.Entry.Message.FeeRecipient.String()
+	}
+	if ownerAddress != "" {
+		expectedFeeRecipient = ownerAddress
+	}
 	if slotDuty == nil {
 		log.Warn("could not find slot duty")
 		api.RespondError(w, http.StatusBadRequest, "could not find slot duty")
 		return 0, false
-	} else if !strings.EqualFold(slotDuty.Entry.Message.FeeRecipient.String(), bidTrace.ProposerFeeRecipient.String()) {
+	} else if !strings.EqualFold(expectedFeeRecipient, bidTrace.ProposerFeeRecipient.String()) {
 		log.WithFields(logrus.Fields{
-			"expectedFeeRecipient": slotDuty.Entry.Message.FeeRecipient.String(),
+			"expectedFeeRecipient": expectedFeeRecipient,
 			"actualFeeRecipient":   bidTrace.ProposerFeeRecipient.String(),
 		}).Info("fee recipient does not match")
 		api.RespondError(w, http.StatusBadRequest, "fee recipient does not match")
@@ -2290,7 +2298,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	//after deadline: check builder id, is fullfilled preconf, is valid = false/true
 	//get header: 1. builder + true, 2. fallback builder + true, 3. builder + false 4. fallback builder + false 5. other builder
 	isValidPreconf := "" // empty string means valid
-
+	ownerAddress := ""
 	if msIntoSlot < int64(getExchangeFinalizedCutoffMs) {
 		api.log.Info("handleSubmitNewBlock sent too early, wait for exchange finalized")
 		isValidPreconf = "submission too early, before exchange finalization cutoff"
@@ -2365,6 +2373,8 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		missingTxs := []string{}
 		missingOrderBundle := []string{}
 		count := 0
+		ownerAddress = cachedPreconfs.ownerAddress
+
 		for _, preconf := range cachedPreconfs.Bundles {
 			// Skip transaction checking for MEV-type bundles
 			// const bundleType = {
@@ -2487,7 +2497,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 
 	log = log.WithField("builderIsHighPrio", builderEntry.status.IsHighPrio)
 
-	gasLimit, ok := api.checkSubmissionFeeRecipient(w, log, submission.BidTrace)
+	gasLimit, ok := api.checkSubmissionFeeRecipient(w, log, submission.BidTrace, ownerAddress)
 	if !ok {
 		return
 	}
