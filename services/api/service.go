@@ -99,7 +99,7 @@ var (
 	// API URL
 	exchangeAPIURL          = GetEnvStr("EXCHANGE_API_URL", "http://localhost:3210")
 	chainID                 = GetEnvStr("CHAIN_ID", "7e7e")
-	exchangeLoginPrivateKey = GetEnvStr("EXCHANGE_LOGIN_PRIVATE_KEY", "8ca6e6e33b2170de9e6ce76bbb5808f8d5ec3e112c2c72cd0b97614f00061f0e")
+	exchangeLoginPrivateKey = GetEnvStr("EXCHANGE_LOGIN_PRIVATE_KEY", "5eae315483f028b5cdd5d1090ff0c7618b18737ea9bf3c35047189db22835c48")
 	defaultBuilder          = GetEnvStr("DEFAULT_BUILDER_PUBKEY", "0xa1885d66bef164889a2e35845c3b626545d7b0e513efe335e97c3a45e534013fa3bc38c3b7e6143695aecc4872ac52c4")
 
 	// various timings
@@ -207,7 +207,7 @@ type PreconfBundle struct {
 	UUID            string      `json:"replacementUuid"`
 	AverageBidPrice float64     `json:"averageBidPrice"`
 	BundleType      int         `json:"bundleType,omitempty"`
-	Ordering        string      `json:"ordering,omitempty"`
+	Ordering        int         `json:"ordering,omitempty"`
 }
 type PreconfTx struct {
 	Tx        string `json:"tx"`        // Transaction string
@@ -2389,7 +2389,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 			// Check ordering
 			numOfTxsInBundle := len(preconf.Txs)
 
-			if preconf.Ordering == "1" {
+			if preconf.Ordering == 1 {
 				// "1" means the top
 				// Check if the first `numOfTxsInBundle` transactions in the block match the preconf transactions
 				for i, preconfTx := range preconf.Txs {
@@ -2398,7 +2398,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 						continue
 					}
 				}
-			} else if preconf.Ordering == "-1" {
+			} else if preconf.Ordering == -1 {
 				// "-1" means the bottom
 				// Check if the last `numOfTxsInBundle` transactions in the block match the preconf transactions
 				for i, preconfTx := range preconf.Txs {
