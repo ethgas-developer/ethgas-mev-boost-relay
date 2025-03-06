@@ -1,4 +1,4 @@
-module github.com/flashbots/mev-boost-relay
+module bitbucket.org/infinity-exchange/mev-boost-relay
 
 go 1.24.0
 
