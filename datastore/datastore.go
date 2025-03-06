@@ -14,8 +14,8 @@ import (
 	builderApi "github.com/attestantio/go-builder-client/api"
 	builderApiV1 "github.com/attestantio/go-builder-client/api/v1"
 	"github.com/bradfitz/gomemcache/memcache"
-	"github.com/go-redis/redis/v9"
 	"github.com/pkg/errors"
+	"github.com/redis/go-redis/v9"
 	"github.com/sirupsen/logrus"
 	uberatomic "go.uber.org/atomic"
 )
@@ -194,7 +194,7 @@ func (ds *Datastore) SaveValidatorRegistration(entry builderApiV1.SignedValidato
 
 	// then save in redis
 	pk := common.NewPubkeyHex(entry.Message.Pubkey.String())
-	err = ds.redis.SetValidatorRegistrationTimestampIfNewer(pk, uint64(entry.Message.Timestamp.Unix()))
+	err = ds.redis.SetValidatorRegistrationTimestampIfNewer(pk, uint64(entry.Message.Timestamp.Unix())) //nolint:gosec
 	if err != nil {
 		return errors.Wrap(err, "failed saving validator registration to redis")
 	}
