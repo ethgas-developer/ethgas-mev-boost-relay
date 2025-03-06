@@ -503,7 +503,7 @@ type SaveBidAndUpdateTopBidResponse struct {
 	TimeUpdateFloor  time.Duration
 }
 
-func (r *RedisCache) SaveBidAndUpdateTopBid(ctx context.Context, pipeliner redis.Pipeliner, trace *common.BidTraceV2WithBlobFields, payload *common.VersionedSubmitBlockRequest, getPayloadResponse *builderApi.VersionedSubmitBlindedBlockResponse, getHeaderResponse *builderSpec.VersionedSignedBuilderBid, reqReceivedAt time.Time, isCancellationEnabled bool, floorValue *big.Int) (state SaveBidAndUpdateTopBidResponse, err error) {
+func (r *RedisCache) SaveBidAndUpdateTopBid(ctx context.Context, pipeliner redis.Pipeliner, trace *common.BidTraceV2WithBlobFields, payload *common.VersionedSubmitBlockRequest, getPayloadResponse *builderApi.VersionedSubmitBlindedBlockResponse, getHeaderResponse *builderSpec.VersionedSignedBuilderBid, reqReceivedAt time.Time, isCancellationEnabled bool, floorValue *big.Int, isValidPreconf bool) (state SaveBidAndUpdateTopBidResponse, err error) {
 	var prevTime, nextTime time.Time
 	prevTime = time.Now()
 
@@ -571,6 +571,7 @@ func (r *RedisCache) SaveBidAndUpdateTopBid(ctx context.Context, pipeliner redis
 	// 2. Save latest bid for this builder
 	err = r.SaveBuilderBid(ctx, pipeliner, submission.BidTrace.Slot, submission.BidTrace.ParentHash.String(), submission.BidTrace.ProposerPubkey.String(), submission.BidTrace.BuilderPubkey.String(), reqReceivedAt, getHeaderResponse)
 	if err != nil {
+		// fmt.Printf("failed at SaveBuilderBid")
 		return state, err
 	}
 	builderBids.bidValues[submission.BidTrace.BuilderPubkey.String()] = submission.BidTrace.Value.ToBig()
@@ -593,12 +594,14 @@ func (r *RedisCache) SaveBidAndUpdateTopBid(ctx context.Context, pipeliner redis
 
 	// If top bid value hasn't change, abort now
 	_, state.TopBidValue = builderBids.getTopBid()
-	if state.TopBidValue.Cmp(state.PrevTopBidValue) == 0 {
-		return state, nil
-	}
+	// preconf txs should have 0 bid value if there have no public txs
+	// if state.TopBidValue.Cmp(state.PrevTopBidValue) == 0 {
+	// 	return state, nil
+	// }
 
 	state, err = r._updateTopBid(ctx, pipeliner, state, builderBids, submission.BidTrace.Slot, submission.BidTrace.ParentHash.String(), submission.BidTrace.ProposerPubkey.String(), floorValue)
 	if err != nil {
+		fmt.Printf("failed at _updateTopBid ")
 		return state, err
 	}
 	state.IsNewTopBid = submission.BidTrace.Value.ToBig().Cmp(state.TopBidValue) == 0
@@ -610,9 +613,12 @@ func (r *RedisCache) SaveBidAndUpdateTopBid(ctx context.Context, pipeliner redis
 	state.TimeUpdateTopBid = nextTime.Sub(prevTime)
 	prevTime = nextTime
 
-	if isCancellationEnabled || !isBidAboveFloor {
-		return state, nil
-	}
+	// is ok to below floor
+	// if isCancellationEnabled || !isBidAboveFloor {
+	// 	fmt.Printf("failed at isCancellationEnabled || !isBidAboveFloor ")
+
+	// 	return state, nil
+	// }
 
 	// Non-cancellable bid above floor should set new floor
 	keyBidSource := r.keyLatestBidByBuilder(submission.BidTrace.Slot, submission.BidTrace.ParentHash.String(), submission.BidTrace.ProposerPubkey.String(), submission.BidTrace.BuilderPubkey.String())
@@ -620,6 +626,7 @@ func (r *RedisCache) SaveBidAndUpdateTopBid(ctx context.Context, pipeliner redis
 	c := pipeliner.Copy(ctx, keyBidSource, keyFloorBid, 0, true)
 	_, err = pipeliner.Exec(ctx)
 	if err != nil {
+		// fmt.Printf("Non-cancellable bid above floor should set new floor ")
 		return state, err
 	}
 
@@ -640,6 +647,13 @@ func (r *RedisCache) SaveBidAndUpdateTopBid(ctx context.Context, pipeliner redis
 		return state, err
 	}
 
+	keyIsValidPreconf := fmt.Sprintf("%s:%d_%s_%s/%s:isValidPreconf", r.prefixBlockBuilderLatestBids, trace.Slot, trace.ParentHash, trace.ProposerPubkey, trace.BuilderPubkey)
+
+	// Set isValidPreconf value
+	err = pipeliner.Set(ctx, keyIsValidPreconf, strconv.FormatBool(isValidPreconf), expiryBidCache).Err()
+	if err != nil {
+		return state, err
+	}
 	// Execute setting the floor bid
 	_, err = pipeliner.Exec(ctx)
 
@@ -654,11 +668,13 @@ func (r *RedisCache) _updateTopBid(ctx context.Context, pipeliner redis.Pipeline
 	if builderBids == nil {
 		builderBids, err = NewBuilderBidsFromRedis(ctx, r, pipeliner, slot, parentHash, proposerPubkey)
 		if err != nil {
+			// fmt.Printf("failed at NewBuilderBidsFromRedis ")
 			return state, err
 		}
 	}
 
 	if len(builderBids.bidValues) == 0 {
+		// fmt.Printf("failed at len(builderBids.bidValues) == 0 ")
 		return state, nil
 	}
 
@@ -666,6 +682,7 @@ func (r *RedisCache) _updateTopBid(ctx context.Context, pipeliner redis.Pipeline
 	if floorValue == nil {
 		floorValue, err = r.GetFloorBidValue(ctx, pipeliner, slot, parentHash, proposerPubkey)
 		if err != nil {
+			// fmt.Printf("failed at GetFloorBidValue ")
 			return state, err
 		}
 	}
@@ -685,16 +702,20 @@ func (r *RedisCache) _updateTopBid(ctx context.Context, pipeliner redis.Pipeline
 	c := pipeliner.Copy(context.Background(), keyBidSource, keyTopBid, 0, true)
 	_, err = pipeliner.Exec(ctx)
 	if err != nil {
+		// fmt.Printf("failed at pipeliner.Exec(ctx) ")
 		return state, err
 	}
 	wasCopied, err := c.Result()
 	if err != nil {
+		// fmt.Printf("failed at c.Result() ")
 		return state, err
 	} else if wasCopied == 0 {
+		// fmt.Printf("wasCopied == 0 ")
 		return state, fmt.Errorf("could not copy top bid from %s to %s", keyBidSource, keyTopBid) //nolint:goerr113
 	}
 	err = pipeliner.Expire(context.Background(), keyTopBid, expiryBidCache).Err()
 	if err != nil {
+		// fmt.Printf("failed at pipeliner.Expire(context.Background(), keyTopBid, expiryBidCache).Err()")
 		return state, err
 	}
 
@@ -704,6 +725,7 @@ func (r *RedisCache) _updateTopBid(ctx context.Context, pipeliner redis.Pipeline
 	keyTopBidValue := r.keyTopBidValue(slot, parentHash, proposerPubkey)
 	err = pipeliner.Set(context.Background(), keyTopBidValue, state.TopBidValue.String(), expiryBidCache).Err()
 	if err != nil {
+		// fmt.Printf("failed at pipeliner.Set(context.Background(), keyTopBidValue, state.TopBidValue.String(), expiryBidCache).Err()")
 		return state, err
 	}
 
@@ -732,6 +754,16 @@ func (r *RedisCache) GetTopBidValue(ctx context.Context, pipeliner redis.Pipelin
 		return nil, fmt.Errorf("could not set top bid value from %s", topBidValueStr) //nolint:goerr113
 	}
 	return topBidValue, nil
+}
+
+func (r *RedisCache) GetBuilderLatestBid(slot uint64, parentHash, proposerPubkey, builderPubkey string) (*builderSpec.VersionedSignedBuilderBid, error) {
+	key := r.keyLatestBidByBuilder(slot, parentHash, proposerPubkey, builderPubkey)
+	resp := new(builderSpec.VersionedSignedBuilderBid)
+	err := r.GetObj(key, resp)
+	if errors.Is(err, redis.Nil) {
+		return nil, nil
+	}
+	return resp, err
 }
 
 // GetBuilderLatestValue gets the latest bid value for a given slot+parent+proposer combination for a specific builder pubkey.
@@ -799,6 +831,28 @@ func (r *RedisCache) SetFloorBidValue(slot uint64, parentHash, proposerPubkey, v
 	keyFloorBidValue := r.keyFloorBidValue(slot, parentHash, proposerPubkey)
 	err := r.client.Set(context.Background(), keyFloorBidValue, value, 0).Err()
 	return err
+}
+
+func (r *RedisCache) GetIsValidPreconf(slot uint64, parentHash, proposerPubkey, builderPubkey string) (bool, error) {
+	// Construct the key
+	key := fmt.Sprintf("%s:%d_%s_%s/%s:isValidPreconf", r.prefixBlockBuilderLatestBids, slot, parentHash, proposerPubkey, builderPubkey)
+
+	// Get the value from Redis
+	val, err := r.client.Get(context.Background(), key).Result()
+	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			return false, nil // Key doesn't exist
+		}
+		return false, err // Other errors
+	}
+
+	// Parse the value to boolean
+	isValidPreconf, err := strconv.ParseBool(val)
+	if err != nil {
+		return false, err
+	}
+
+	return isValidPreconf, nil
 }
 
 func (r *RedisCache) NewPipeline() redis.Pipeliner { //nolint:ireturn,nolintlint

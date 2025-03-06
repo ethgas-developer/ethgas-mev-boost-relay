@@ -6,12 +6,16 @@ import (
 	"compress/gzip"
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/ioutil"
+	"log"
 	"math/big"
 	"net/http"
 	_ "net/http/pprof"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -26,10 +30,15 @@ import (
 	"bitbucket.org/infinity-exchange/mev-boost-relay/metrics"
 	"github.com/NYTimes/gziphandler"
 	builderApi "github.com/attestantio/go-builder-client/api"
+	builderApiCapella "github.com/attestantio/go-builder-client/api/capella"
+	builderApiDeneb "github.com/attestantio/go-builder-client/api/deneb"
 	builderApiV1 "github.com/attestantio/go-builder-client/api/v1"
+
 	"github.com/attestantio/go-eth2-client/spec"
 	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/buger/jsonparser"
+	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/signer/core/apitypes"
 	"github.com/flashbots/go-boost-utils/bls"
 	"github.com/flashbots/go-boost-utils/ssz"
 	"github.com/flashbots/go-boost-utils/utils"
@@ -38,6 +47,7 @@ import (
 	"github.com/go-redis/redis/v9"
 	"github.com/gorilla/mux"
 	"github.com/holiman/uint256"
+	"github.com/itsahedge/go-cowswap/util/signature-scheme/eip712"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sirupsen/logrus"
@@ -86,11 +96,19 @@ var (
 	// number of goroutines to save active validator
 	numValidatorRegProcessors = cli.GetEnvInt("NUM_VALIDATOR_REG_PROCESSORS", 10)
 
+	// API URL
+	exchangeAPIURL          = GetEnvStr("EXCHANGE_API_URL", "http://localhost:3210")
+	chainID                 = GetEnvStr("CHAIN_ID", "7e7e")
+	exchangeLoginPrivateKey = GetEnvStr("EXCHANGE_LOGIN_PRIVATE_KEY", "5eae315483f028b5cdd5d1090ff0c7618b18737ea9bf3c35047189db22835c48")
+	defaultBuilder          = GetEnvStr("DEFAULT_BUILDER_PUBKEY", "0xa1885d66bef164889a2e35845c3b626545d7b0e513efe335e97c3a45e534013fa3bc38c3b7e6143695aecc4872ac52c4")
+
 	// various timings
-	timeoutGetPayloadRetryMs  = cli.GetEnvInt("GETPAYLOAD_RETRY_TIMEOUT_MS", 100)
-	getHeaderRequestCutoffMs  = cli.GetEnvInt("GETHEADER_REQUEST_CUTOFF_MS", 3000)
-	getPayloadRequestCutoffMs = cli.GetEnvInt("GETPAYLOAD_REQUEST_CUTOFF_MS", 4000)
-	getPayloadResponseDelayMs = cli.GetEnvInt("GETPAYLOAD_RESPONSE_DELAY_MS", 1000)
+	timeoutGetPayloadRetryMs     = cli.GetEnvInt("GETPAYLOAD_RETRY_TIMEOUT_MS", 100)
+	getExchangeFinalizedCutoffMs = cli.GetEnvInt("GETHEADER_EXCHANGE_FINALIZED_CUTOFF_MS", -2000)
+	getTargetedBuilderCutoffMs   = cli.GetEnvInt("GETHEADER_TARGETED_BUILDER_REQUEST_CUTOFF_MS", 0)
+	getHeaderRequestCutoffMs     = cli.GetEnvInt("GETHEADER_REQUEST_CUTOFF_MS", 3000)
+	getPayloadRequestCutoffMs    = cli.GetEnvInt("GETPAYLOAD_REQUEST_CUTOFF_MS", 4000)
+	getPayloadResponseDelayMs    = cli.GetEnvInt("GETPAYLOAD_RESPONSE_DELAY_MS", 1000)
 
 	// api settings
 	apiReadTimeoutMs       = cli.GetEnvInt("API_TIMEOUT_READ_MS", 1500)
@@ -113,6 +131,112 @@ var (
 		"mev-boost/v1.5.0 Go-http-client/1.1", // Prysm v4.0.1 (Shapella signing issue)
 	})
 )
+
+// Declare a global variable for ApiClient
+var client = &ApiClient{
+	APIURL: exchangeAPIURL,
+	// APIURL:  "http://localhost:3210",
+	ChainID: chainID,
+	Client: &http.Client{
+		Timeout: 10 * time.Second,
+	},
+}
+
+func GetEnvStr(key, defaultValue string) string {
+	if value, ok := os.LookupEnv(key); ok {
+		return value
+	}
+	return defaultValue
+}
+
+// ApiClient represents the client for interacting with the API
+type ApiClient struct {
+	APIURL       string
+	ChainID      string
+	Client       *http.Client
+	AccessToken  string
+	RefreshToken string // Keeping this as a field for storing the refresh token
+}
+
+// LoginResponse represents the login response structure
+type LoginResponse struct {
+	Status        string `json:"status"`
+	EIP712Message string `json:"eip712Message"`
+	NonceHash     string `json:"nonceHash"`
+}
+
+// VerifyResponse represents the verification response structure
+type VerifyResponse struct {
+	User        User        `json:"user"`
+	AccessToken AccessToken `json:"accessToken"`
+}
+
+// User represents the user details returned in the verification response
+type User struct {
+	UserID    uint64  `json:"userId"`
+	Address   string  `json:"address"`
+	UserType  uint32  `json:"userType"`
+	UserClass *uint32 `json:"userClass,omitempty"`
+}
+
+// AccessToken represents the access token structure
+type AccessToken struct {
+	Token string `json:"token"`
+}
+
+// ApiResponse represents the standard API response structure
+type ApiResponse struct {
+	Success bool            `json:"success"`
+	Data    json.RawMessage `json:"data"`
+}
+
+// Define the slotBundle type at the top of the file
+// type SlotBundleResponse struct {
+// 	SlotBundle PreconfBundles `json:"slotBundle"`
+// }
+
+type PreconfBundles struct {
+	Bundles      []PreconfBundle `json:"bundles"`
+	EmptySpace   string          `json:"empty_space,omitempty"`
+	ownerAddress string          `json:"owner_address,omitempty"`
+}
+
+// PreconfBundle represents a single preconfigured bundle.
+type PreconfBundle struct {
+	Txs             []PreconfTx `json:"txs"`
+	UUID            string      `json:"replacementUuid"`
+	AverageBidPrice float64     `json:"averageBidPrice"`
+	BundleType      int         `json:"bundleType,omitempty"`
+	Ordering        int         `json:"ordering,omitempty"`
+}
+type PreconfTx struct {
+	Tx        string `json:"tx"`        // Transaction string
+	TxHash    string `json:"txHash"`    // Transaction hash
+	CanRevert bool   `json:"canRevert"` // Indicates if the transaction can be reverted
+	// CreateDate uint64 `json:"createDate"` // Uncomment and use if needed
+}
+
+// // match this response
+// // https://bitbucket.org/infinity-exchange/infinity-core/src/eafb819faac26b8fe23e27f44c0be30a2ef5058b/scripts/preconfMultiTxAsyncServer.ts?at=enhancement%2F8_jan
+//
+//	type PreconfResponse struct {
+//		PreconfTxs        [][]byte `json:"preconf_txs"`
+//		PreconfConditions struct {
+//			OrderingMetaData struct {
+//				Index int `json:"index"`
+//			} `json:"ordering_meta_data"`
+//		} `json:"preconf_conditions"`
+//		SignedTxs   []string `json:"signedTxs"`
+//		AvgBidPrice uint64   `json:"avg_bid_price"`
+//	}
+type DataResponse struct {
+	Builder BuilderResponse `json:"builder"`
+}
+
+type BuilderResponse struct {
+	Builder         string `json:"builder"`
+	FallbackBuilder string `json:"fallbackBuilder"`
+}
 
 // RelayAPIOpts contains the options for a relay
 type RelayAPIOpts struct {
@@ -231,6 +355,13 @@ type RelayAPI struct {
 	blockBuildersCache map[string]*blockBuilderCacheEntry
 }
 
+// Add a cache map and a mutex for thread safety
+var (
+	preconfCache      = make(map[uint64]PreconfBundles)
+	preconfCacheMutex sync.RWMutex
+	currentSlot       uint64
+)
+
 // NewRelayAPI creates a new service. if builders is nil, allow any builder
 func NewRelayAPI(opts RelayAPIOpts) (api *RelayAPI, err error) {
 	if err := metrics.Setup(context.Background()); err != nil {
@@ -335,7 +466,7 @@ func NewRelayAPI(opts RelayAPIOpts) (api *RelayAPI, err error) {
 		api.log.Warn("env: ENABLE_IGNORABLE_VALIDATION_ERRORS - some validation errors will be ignored")
 		api.ffIgnorableValidationErrors = true
 	}
-
+	go InitLoginAndStartTokenRefresh()
 	return api, nil
 }
 
@@ -615,6 +746,7 @@ func (api *RelayAPI) simulateBlock(ctx context.Context, opts blockSimOptions) (b
 		log.Warn("block validation response is nil")
 		return nil, nil, nil
 	}
+	// fmt.Println("response.BlockValue:", response.BlockValue.ToBig().Int64())
 	return response.BlockValue, nil, nil
 }
 
@@ -1092,12 +1224,12 @@ func (api *RelayAPI) handleRegisterValidator(w http.ResponseWriter, req *http.Re
 			return
 		}
 
-		// Check if a real validator
-		isKnownValidator := api.datastore.IsKnownValidator(pkHex)
-		if !isKnownValidator {
-			handleError(regLog, http.StatusBadRequest, fmt.Sprintf("not a known validator: %s", pkHex))
-			return
-		}
+		// // Check if a real validator
+		// isKnownValidator := api.datastore.IsKnownValidator(pkHex)
+		// if !isKnownValidator {
+		// 	handleError(regLog, http.StatusBadRequest, fmt.Sprintf("not a known validator: %s", pkHex))
+		// 	return
+		// }
 
 		// Check for a previous registration timestamp
 		prevTimestamp, err := api.redis.GetValidatorRegistrationTimestamp(pkHex)
@@ -1159,6 +1291,7 @@ func (api *RelayAPI) handleRegisterValidator(w http.ResponseWriter, req *http.Re
 	w.WriteHeader(http.StatusOK)
 }
 
+// > validator get header suppose getting lastest one (also check the preconf list)
 func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 	vars := mux.Vars(req)
 	slotStr := vars["slot"]
@@ -1232,16 +1365,163 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	bid, err := api.redis.GetBestBid(slot, parentHashHex, proposerPubkeyHex)
+	// Only allow requests for the current slot after exchange finished trading
+	if msIntoSlot < int64(getExchangeFinalizedCutoffMs) {
+		log.Info("getHeader sent too early, wait for exchange finalized")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	builderResp, err := FetchBuilderPubKey(exchangeAPIURL, slot)
+	if err != nil {
+		log.WithError(err).Error("failed to get builder id from API")
+		builderResp = &BuilderResponse{
+			Builder:         defaultBuilder,
+			FallbackBuilder: defaultBuilder,
+		}
+	}
+	log.Info("builder id", builderResp.Builder)
+	// bid, err := api.redis.GetBestBid(slot, parentHashHex, proposerPubkeyHex)
+	bid, err := api.redis.GetBuilderLatestBid(slot, parentHashHex, proposerPubkeyHex, builderResp.Builder)
+
 	if err != nil {
 		log.WithError(err).Error("could not get bid")
 		api.RespondError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	if bid == nil || bid.IsEmpty() {
-		w.WriteHeader(http.StatusNoContent)
+	isBuilderValidPreconf, err := api.redis.GetIsValidPreconf(slot, parentHashHex, proposerPubkeyHex, builderResp.Builder)
+	log.Println("get header | is builder valid preconf: ", isBuilderValidPreconf)
+	if err != nil {
+		log.WithError(err).Error("[builder] could not GetIsValidPreconf")
+		api.RespondError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	// 1. use builder bid when isBuilderValidPreconf is true
+	if !isBuilderValidPreconf {
+		isFallbackBuilderValidPreconf, err := api.redis.GetIsValidPreconf(slot, parentHashHex, proposerPubkeyHex, builderResp.FallbackBuilder)
+		log.Println("get header | is fallback builder valid preconf: ", isFallbackBuilderValidPreconf)
+		if err != nil {
+			log.WithError(err).Error("[fallback builder] could not GetIsValidPreconf")
+			api.RespondError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+
+		fallbackBid, err := api.redis.GetBuilderLatestBid(slot, parentHashHex, proposerPubkeyHex, builderResp.FallbackBuilder)
+		if err != nil {
+			log.WithError(err).Error("could not get fallback bid")
+			api.RespondError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if fallbackBid == nil || fallbackBid.IsEmpty() {
+			log.Info("no fallback bid")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		if isFallbackBuilderValidPreconf {
+			//2. use fallback bid with valid = true
+			bid = fallbackBid
+		} else {
+			//both fallback bid and builder bid valid = false
+			//3. use bid if builder bid is not empty // no change
+			//4. use fallbackBid if bid is empty
+			if bid == nil || bid.IsEmpty() {
+				bid = fallbackBid
+			}
+		}
+	}
+
+	if bid == nil || bid.IsEmpty() {
+		//5. if still empty then use best bid (which not builder nor fallback builder)
+		bid, err = api.redis.GetBestBid(slot, parentHashHex, proposerPubkeyHex)
+		if err != nil {
+			log.WithError(err).Error("could not get best bid")
+			api.RespondError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		//6. if there have no any bid then return
+		if bid == nil || bid.IsEmpty() {
+			log.Info("no targeted bid, remain time: ", msIntoSlot)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+	}
+
+	// HARDCODE to modify the bid value to force validator select our block
+	if bid.Capella != nil {
+		// log.Info("set fake bid.Capella.Message.Value")
+		// log.Info("old bid.Capella.Message.Value: ", bid.Capella.Message.Value)
+		bid.Capella.Message.Value = uint256.MustFromDecimal("11000000000000000000000") // Set to desired value (11000 ETH)
+		// Serialize the bid data
+		// log.Info("new bid.Capella.Message.Value: ", bid.Capella.Message.Value)
+		// log.Info("old bid.Capella.Message.Pubkey: ", bid.Capella.Message.Pubkey)
+
+		bid.Capella.Message.Pubkey = *api.publicKey
+		// log.Info("new bid.Capella.Message.Pubkey: ", bid.Capella.Message.Pubkey)
+
+		builderBid := builderApiCapella.BuilderBid{
+			Value:  bid.Capella.Message.Value,
+			Header: bid.Capella.Message.Header,
+			Pubkey: *api.publicKey,
+		}
+
+		// print("RESIGN")
+		// log.Info(&builderBid)
+		// log.Info(&api.opts.EthNetDetails.DomainBuilder)
+		// log.Info(api.blsSk)
+		signature, err := ssz.SignMessage(&builderBid, api.opts.EthNetDetails.DomainBuilder, api.blsSk)
+
+		if err != nil {
+			log.WithError(err).Error("failed to signature bid")
+			api.RespondError(w, http.StatusInternalServerError, "failed to signature bid")
+			return
+		}
+		// Re-sign the payload with the new bid value
+		signatureBytes := signature[:]
+
+		// Ensure the signature is the correct size
+		if len(signatureBytes) != 96 {
+			log.Error("signature size is incorrect")
+			api.RespondError(w, http.StatusInternalServerError, "signature size is incorrect")
+			return
+		}
+		// log.Info("old bid.Capella.Signature: ", bid.Capella.Signature)
+
+		// Assign the signature
+		copy(bid.Capella.Signature[:], signatureBytes)
+		// log.Info("new bid.Capella.Signature: ", bid.Capella.Signature)
+
+	} else if bid.Deneb != nil {
+		// log.Info("set fake bid.Deneb.Message.Value")
+		bid.Deneb.Message.Value = uint256.NewInt(11000000000000000000) // Set to desired value (100 ETH)
+		bid.Deneb.Message.Pubkey = *api.publicKey
+
+		// Serialize the bid data
+
+		builderBid := builderApiDeneb.BuilderBid{
+			Value:  bid.Deneb.Message.Value,
+			Header: bid.Deneb.Message.Header,
+			Pubkey: *api.publicKey,
+		}
+
+		signature, err := ssz.SignMessage(&builderBid, api.opts.EthNetDetails.DomainBuilder, api.blsSk)
+		if err != nil {
+			log.WithError(err).Error("failed to signature bid")
+			api.RespondError(w, http.StatusInternalServerError, "failed to signature bid")
+			return
+		}
+		signatureBytes := signature[:]
+
+		// Ensure the signature is the correct size
+		if len(signatureBytes) != 96 {
+			log.Error("signature size is incorrect")
+			api.RespondError(w, http.StatusInternalServerError, "signature size is incorrect")
+			return
+		}
+
+		// Assign the signature
+		copy(bid.Deneb.Signature[:], signatureBytes)
 	}
 
 	value, err := bid.Value()
@@ -1255,11 +1535,20 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 		api.RespondError(w, http.StatusBadRequest, err.Error())
 	}
 
-	// Error on bid without value
-	if value.Cmp(uint256.NewInt(0)) == 0 {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
+	// preconf txs should have 0 bid value if there have no public txs
+	// // Error on bid without value
+	// if value.Cmp(uint256.NewInt(0)) == 0 {
+	// 	w.WriteHeader(http.StatusNoContent)
+	// 	return
+	// }
+	decodeTime := time.Now().UTC()
+
+	go func() {
+		err := api.db.InsertGetPayload(uint64(slot), proposerPubkeyHex, blockHash.String(), slotStartTimestamp, uint64(requestTime.UnixMilli()), uint64(decodeTime.UnixMilli()), uint64(msIntoSlot))
+		if err != nil {
+			log.WithError(err).Error("failed to insert get header into db")
+		}
+	}()
 
 	log.WithFields(logrus.Fields{
 		"value":     value.String(),
@@ -1299,7 +1588,7 @@ func (api *RelayAPI) handleGetPayload(w http.ResponseWriter, req *http.Request) 
 	})
 
 	// Log at start and end of request
-	log.Info("request initiated")
+	log.Info("handleGetPayload request initiated")
 	defer func() {
 		log.WithFields(logrus.Fields{
 			"timestampRequestFin": time.Now().UTC().UnixMilli(),
@@ -1662,17 +1951,24 @@ func (api *RelayAPI) handleBuilderGetValidators(w http.ResponseWriter, req *http
 	}
 }
 
-func (api *RelayAPI) checkSubmissionFeeRecipient(w http.ResponseWriter, log *logrus.Entry, bidTrace *builderApiV1.BidTrace) (uint64, bool) {
+func (api *RelayAPI) checkSubmissionFeeRecipient(w http.ResponseWriter, log *logrus.Entry, bidTrace *builderApiV1.BidTrace, ownerAddress string) (uint64, bool) {
 	api.proposerDutiesLock.RLock()
 	slotDuty := api.proposerDutiesMap[bidTrace.Slot]
 	api.proposerDutiesLock.RUnlock()
+	expectedFeeRecipient := ""
+	if slotDuty != nil {
+		expectedFeeRecipient = slotDuty.Entry.Message.FeeRecipient.String()
+	}
+	if ownerAddress != "" {
+		expectedFeeRecipient = ownerAddress
+	}
 	if slotDuty == nil {
 		log.Warn("could not find slot duty")
 		api.RespondError(w, http.StatusBadRequest, "could not find slot duty")
 		return 0, false
-	} else if !strings.EqualFold(slotDuty.Entry.Message.FeeRecipient.String(), bidTrace.ProposerFeeRecipient.String()) {
+	} else if !strings.EqualFold(expectedFeeRecipient, bidTrace.ProposerFeeRecipient.String()) {
 		log.WithFields(logrus.Fields{
-			"expectedFeeRecipient": slotDuty.Entry.Message.FeeRecipient.String(),
+			"expectedFeeRecipient": expectedFeeRecipient,
 			"actualFeeRecipient":   bidTrace.ProposerFeeRecipient.String(),
 		}).Info("fee recipient does not match")
 		api.RespondError(w, http.StatusBadRequest, "fee recipient does not match")
@@ -1844,6 +2140,7 @@ type redisUpdateBidOpts struct {
 	receivedAt           time.Time
 	floorBidValue        *big.Int
 	payload              *common.VersionedSubmitBlockRequest
+	isValidPreconf       bool
 }
 
 func (api *RelayAPI) updateRedisBid(opts redisUpdateBidOpts) (*datastore.SaveBidAndUpdateTopBidResponse, *builderApi.VersionedSubmitBlindedBlockResponse, bool) {
@@ -1881,7 +2178,7 @@ func (api *RelayAPI) updateRedisBid(opts redisUpdateBidOpts) (*datastore.SaveBid
 	//
 	// Save to Redis
 	//
-	updateBidResult, err := api.redis.SaveBidAndUpdateTopBid(context.Background(), opts.tx, &bidTrace, opts.payload, getPayloadResponse, getHeaderResponse, opts.receivedAt, opts.cancellationsEnabled, opts.floorBidValue)
+	updateBidResult, err := api.redis.SaveBidAndUpdateTopBid(context.Background(), opts.tx, &bidTrace, opts.payload, getPayloadResponse, getHeaderResponse, opts.receivedAt, opts.cancellationsEnabled, opts.floorBidValue, opts.isValidPreconf)
 	if err != nil {
 		opts.log.WithError(err).Error("could not save bid and update top bids")
 		api.RespondError(opts.w, http.StatusInternalServerError, "failed saving and updating bid")
@@ -1890,6 +2187,7 @@ func (api *RelayAPI) updateRedisBid(opts redisUpdateBidOpts) (*datastore.SaveBid
 	return &updateBidResult, getPayloadResponse, true
 }
 
+// check handleSubmitNewBlock
 func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Request) {
 	var pf common.Profile
 	var prevTime, nextTime time.Time
@@ -1898,9 +2196,10 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	receivedAt := time.Now().UTC()
 	prevTime = receivedAt
 
-	args := req.URL.Query()
-	isCancellationEnabled := args.Get("cancellations") == "1"
-
+	//always true to allow replace old preconf order
+	// args := req.URL.Query()
+	// isCancellationEnabled := args.Get("cancellations") == "1"
+	isCancellationEnabled := true
 	log := api.log.WithFields(logrus.Fields{
 		"method":                "submitNewBlock",
 		"contentLength":         req.ContentLength,
@@ -1997,6 +2296,180 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		api.RespondError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	slotStartTimestamp := api.genesisInfo.Data.GenesisTime + ((submission.BidTrace.Slot) * common.SecondsPerSlot)
+	msIntoSlot := receivedAt.UnixMilli() - int64((slotStartTimestamp * 1000))
+	api.log.Info("=====msIntoSlo")
+
+	api.log.Info(msIntoSlot)
+	//before deadline: no check, is valid = false
+	//after deadline: check builder id, is fullfilled preconf, is valid = false/true
+	//get header: 1. builder + true, 2. fallback builder + true, 3. builder + false 4. fallback builder + false 5. other builder
+	isValidPreconf := "" // empty string means valid
+	ownerAddress := ""
+	if msIntoSlot < int64(getExchangeFinalizedCutoffMs) {
+		api.log.Info("handleSubmitNewBlock sent too early, wait for exchange finalized")
+		isValidPreconf = "submission too early, before exchange finalization cutoff"
+	} else if msIntoSlot >= int64(getExchangeFinalizedCutoffMs) {
+		// Cache management code
+		preconfCacheMutex.Lock()
+		if submission.BidTrace.Slot != currentSlot {
+			preconfCache = make(map[uint64]PreconfBundles)
+			currentSlot = submission.BidTrace.Slot
+		}
+		preconfCacheMutex.Unlock()
+
+		// Check cache first
+		preconfCacheMutex.RLock()
+		cachedPreconfs, exists := preconfCache[submission.BidTrace.Slot]
+		preconfCacheMutex.RUnlock()
+
+		if !exists {
+			// url := fmt.Sprintf("%s/api/slot/bundles?slot=%d", client.APIURL, submission.BidTrace.Slot)
+			url := fmt.Sprintf("%s/api/v1/slot/bundles?slot=%d", client.APIURL, submission.BidTrace.Slot)
+			log.Printf(url)
+			req, err := http.NewRequest("GET", url, nil)
+			if err != nil {
+				log.Printf("cannot fetch preconf requests from preconf server, %v", err)
+				return
+			}
+			header := fmt.Sprintf("Bearer %s", client.AccessToken)
+			req.Header.Set("AUTHORIZATION", header)
+
+			resp, err := client.Client.Do(req)
+			if err != nil {
+				log.Printf("cannot fetch preconf requests from preconf server, %v", err)
+				return
+			}
+			defer resp.Body.Close()
+
+			var apiResponse ApiResponse
+			err = json.NewDecoder(resp.Body).Decode(&apiResponse)
+			if err != nil {
+				log.Printf("Failed to fetch preconf request: %v", err)
+				return
+			}
+
+			if !apiResponse.Success {
+				log.Printf("Failed to fetch inclusion preconf from server: %v", apiResponse)
+				return
+			}
+
+			var preconfBundles PreconfBundles
+			err = json.Unmarshal(apiResponse.Data, &preconfBundles)
+			if err != nil {
+				log.Printf("Failed to unmarshal preconf bundles: %v", err)
+				return
+			}
+
+			// Store in cache
+			preconfCacheMutex.Lock()
+			preconfCache[submission.BidTrace.Slot] = preconfBundles
+			preconfCacheMutex.Unlock()
+
+			cachedPreconfs = preconfBundles
+		}
+
+		// Transaction checking logic
+		// Convert all block transactions to lowercase for case-insensitive comparison
+		blockTxMap := make(map[string]struct{})
+		for _, tx := range submission.Transactions {
+			txLower := "0x" + strings.ToLower(hex.EncodeToString(tx))
+			blockTxMap[txLower] = struct{}{}
+		}
+
+		missingTxs := []string{}
+		missingOrderBundle := []string{}
+		count := 0
+		ownerAddress = cachedPreconfs.ownerAddress
+
+		for _, preconf := range cachedPreconfs.Bundles {
+			// Skip transaction checking for MEV-type bundles
+			// const bundleType = {
+			// 	STANDARD: 1,
+			// 	MEV: 2,
+			// 	BLOBS: 3, //TODO
+			// }
+			if preconf.BundleType == 2 { //mev type can skip
+				continue
+			}
+
+			// Check ordering
+			numOfTxsInBundle := len(preconf.Txs)
+
+			if preconf.Ordering == 1 {
+				// "1" means the top
+				// Check if the first `numOfTxsInBundle` transactions in the block match the preconf transactions
+				for i, preconfTx := range preconf.Txs {
+					if i >= len(submission.Transactions) || strings.ToLower(preconfTx.Tx) != "0x"+strings.ToLower(hex.EncodeToString(submission.Transactions[i])) {
+						missingOrderBundle = append(missingOrderBundle, preconf.UUID)
+						continue
+					}
+				}
+			} else if preconf.Ordering == -1 {
+				// "-1" means the bottom
+				// Check if the last `numOfTxsInBundle` transactions in the block match the preconf transactions
+				for i, preconfTx := range preconf.Txs {
+					blockTxIndex := len(submission.Transactions) - numOfTxsInBundle + i
+					if blockTxIndex < 0 || strings.ToLower(preconfTx.Tx) != "0x"+strings.ToLower(hex.EncodeToString(submission.Transactions[blockTxIndex])) {
+						missingOrderBundle = append(missingOrderBundle, preconf.UUID)
+						continue
+					}
+				}
+			} else {
+				// Existing transaction existence check
+				for _, preconfTx := range preconf.Txs {
+					txLower := strings.ToLower(preconfTx.Tx)
+					if _, exists := blockTxMap[txLower]; !exists {
+						missingTxs = append(missingTxs, preconfTx.Tx)
+					}
+				}
+			}
+		}
+		if len(missingOrderBundle) > 0 {
+			log.Printf("Total missing ordering bundle: %d",
+				len(missingOrderBundle))
+			log.Println("Missing preconf transaction hexes:", missingOrderBundle)
+			isValidPreconf = fmt.Sprintf("missing ordering bundle: %s", missingOrderBundle)
+		}
+
+		if len(missingTxs) > 0 {
+			log.Printf("Total missing transactions: %d, included preconf transaction: %d",
+				len(missingTxs), count-len(missingTxs))
+			log.Printf("Number of transactions: %d", len(submission.Transactions))
+			log.Println("Missing preconf transaction hexes:", missingTxs)
+			log.Println("transaction in this block:", blockTxMap)
+			reason := fmt.Sprintf("missing %d required preconf transactions", len(missingTxs))
+			if isValidPreconf != "" {
+				isValidPreconf += "; " + reason
+			} else {
+				isValidPreconf = reason
+			}
+
+		} else {
+			log.Printf("All preconf transactions are included in the block!")
+			// Remains empty string for valid case
+		}
+
+		//check remain empty space
+		//hardcode test:
+		// cachedPreconfs.EmptySpace = "30000000"
+		if cachedPreconfs.EmptySpace != "" {
+			requiredSpace, err := strconv.ParseUint(cachedPreconfs.EmptySpace, 10, 64)
+			if err == nil {
+				remainingGas := submission.BidTrace.GasLimit - submission.BidTrace.GasUsed
+				if remainingGas < requiredSpace {
+					reason := fmt.Sprintf("block doesn't have enough empty space (remaining gas %d < required %d)",
+						remainingGas, requiredSpace)
+					if isValidPreconf != "" {
+						isValidPreconf += "; " + reason
+					} else {
+						isValidPreconf = reason
+					}
+				}
+			}
+		}
+	}
+
 	log = log.WithFields(logrus.Fields{
 		"timestampAfterDecoding": time.Now().UTC().UnixMilli(),
 		"slot":                   submission.BidTrace.Slot,
@@ -2031,17 +2504,18 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 
 	log = log.WithField("builderIsHighPrio", builderEntry.status.IsHighPrio)
 
-	gasLimit, ok := api.checkSubmissionFeeRecipient(w, log, submission.BidTrace)
+	gasLimit, ok := api.checkSubmissionFeeRecipient(w, log, submission.BidTrace, ownerAddress)
 	if !ok {
 		return
 	}
 
-	// Don't accept blocks with 0 value
-	if submission.BidTrace.Value.ToBig().Cmp(ZeroU256.BigInt()) == 0 || len(submission.Transactions) == 0 {
-		log.Info("submitNewBlock failed: block with 0 value or no txs")
-		w.WriteHeader(http.StatusOK)
-		return
-	}
+	// preconf txs should have 0 bid value if there have no public txs
+	// // Don't accept blocks with 0 value
+	// if submission.BidTrace.Value.ToBig().Cmp(ZeroU256.BigInt()) == 0 || len(submission.Transactions) == 0 {
+	// 	log.Info("submitNewBlock failed: block with 0 value or no txs")
+	// 	w.WriteHeader(http.StatusOK)
+	// 	return
+	// }
 
 	// Sanity check the submission
 	err = SanityCheckBuilderBlockSubmission(payload)
@@ -2051,10 +2525,13 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		return
 	}
 
-	attrs, ok := api.checkSubmissionPayloadAttrs(w, log, submission)
-	if !ok {
-		return
-	}
+	//temp: disable payload checking for devnet
+	// attrs, ok := api.checkSubmissionPayloadAttrs(w, log, submission)
+
+	// if !ok {
+	// 	return
+	// }
+	attrs := api.payloadAttributes[getPayloadAttributesKey(submission.BidTrace.ParentHash.String(), submission.BidTrace.Slot)]
 
 	// Verify the signature
 	log = log.WithField("timestampBeforeSignatureCheck", time.Now().UTC().UnixMilli())
@@ -2088,6 +2565,8 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		simResultC:           simResultC,
 		submission:           submission,
 	}
+
+	//TODO remove floor bid checking
 	floorBidValue, ok := api.checkFloorBidValue(bfOpts)
 	if !ok {
 		return
@@ -2105,6 +2584,11 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		case <-time.After(10 * time.Second):
 			log.Warn("timed out waiting for simulation result")
 			simResult = &blockSimResult{false, nil, false, nil, nil}
+		}
+
+		if isValidPreconf != "" {
+			simResult.requestErr = fmt.Errorf("invalid preconf: %s", isValidPreconf)
+			log.Warn("Invalid preconf detected: " + isValidPreconf)
 		}
 
 		submissionEntry, err := api.db.SaveBuilderBlockSubmission(payload, simResult.requestErr, simResult.validationErr, receivedAt, eligibleAt, simResult.wasSimulated, savePayloadToDatabase, pf, simResult.optimisticSubmission, simResult.blockValue)
@@ -2233,6 +2717,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		receivedAt:           receivedAt,
 		floorBidValue:        floorBidValue,
 		payload:              payload,
+		isValidPreconf:       isValidPreconf == "",
 	}
 	updateBidResult, getPayloadResponse, ok := api.updateRedisBid(redisOpts)
 	if !ok {
@@ -2662,5 +3147,247 @@ func (api *RelayAPI) handleReadyz(w http.ResponseWriter, req *http.Request) {
 		api.RespondMsg(w, http.StatusOK, "ready")
 	} else {
 		api.RespondMsg(w, http.StatusServiceUnavailable, "not ready")
+	}
+}
+
+// FetchBuilderPubKey fetches the builder and fallbackBuilder from the /builder/pubkey/:slot endpoint
+func FetchBuilderPubKey(apiURL string, slot uint64) (*BuilderResponse, error) {
+	// Construct the URL for the API request
+	// url := fmt.Sprintf("%s/api/p/builder/pubkey/%d", apiURL, slot)
+	url := fmt.Sprintf("%s/api/v1/p/builder/%d", apiURL, slot)
+
+	// Send HTTP GET request
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch builder pubkey: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Check if the HTTP response status code is OK (200)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+
+	var apiResponse ApiResponse
+	err = json.NewDecoder(resp.Body).Decode(&apiResponse)
+	if err != nil {
+		log.Printf("Failed to decode API response: %v", err)
+		return nil, fmt.Errorf("failed to decode API response: %v", err)
+	}
+
+	if !apiResponse.Success {
+		log.Printf("API response indicates failure: %v", apiResponse)
+		return nil, fmt.Errorf("API response indicates failure: %v", apiResponse)
+	}
+
+	// Handle empty data case explicitly
+	if len(apiResponse.Data) == 0 {
+		return nil, fmt.Errorf("empty data in API response")
+	}
+
+	var builderResp DataResponse
+	err = json.Unmarshal(apiResponse.Data, &builderResp)
+	if err != nil {
+		log.Printf("Failed to unmarshal builder response: %v", err)
+		return nil, err
+	}
+
+	// Validate required fields
+	if builderResp.Builder.Builder == "" || builderResp.Builder.FallbackBuilder == "" {
+		return nil, fmt.Errorf("invalid builder response: missing required fields")
+	}
+
+	return &builderResp.Builder, nil
+}
+
+// Login sends a login request and completes the EIP712 signature process
+func (c *ApiClient) Login(privateKey string) (string, string, error) {
+	privateKeyBytes, err := hex.DecodeString(privateKey)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to decode private key: %w", err)
+	}
+	privateKeyECDSA, err := crypto.ToECDSA(privateKeyBytes)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to create ECDSA private key: %w", err)
+	}
+	address := crypto.PubkeyToAddress(privateKeyECDSA.PublicKey).Hex()
+
+	// loginURL := fmt.Sprintf("%s/api/user/login", c.APIURL)
+	loginURL := fmt.Sprintf("%s/api/v1/user/login", c.APIURL)
+
+	formData := url.Values{}
+	formData.Set("addr", address)
+	formData.Set("chainId", c.ChainID)
+
+	resp, err := c.Client.PostForm(loginURL, formData)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to send login request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := ioutil.ReadAll(resp.Body)
+		return "", "", fmt.Errorf("login failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var apiResponse ApiResponse
+	if err := json.NewDecoder(resp.Body).Decode(&apiResponse); err != nil {
+		return "", "", fmt.Errorf("failed to parse login response: %w", err)
+	}
+	if !apiResponse.Success {
+		fmt.Println("Failed response:", apiResponse)
+		return "", "", fmt.Errorf("login failed: response indicates failure")
+	}
+
+	var loginData LoginResponse
+	if err := json.Unmarshal(apiResponse.Data, &loginData); err != nil {
+		return "", "", fmt.Errorf("failed to parse login data: %w", err)
+	}
+
+	fmt.Println("EIP712Message:", loginData.EIP712Message)
+	fmt.Println("NonceHash:", loginData.NonceHash)
+	// Parse the EIP712Message JSON string into apitypes.TypedData
+	var typedData apitypes.TypedData
+	if err := json.Unmarshal([]byte(loginData.EIP712Message), &typedData); err != nil {
+		return "", "", fmt.Errorf("failed to unmarshal EIP712Message: %w", err)
+	}
+	// signature, err := SignEIP712Message(privateKeyECDSA, loginData.EIP712Message)
+	signature, err := eip712.SignTypedData(typedData, privateKeyECDSA)
+	var signatureHash = hex.EncodeToString(signature)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to sign EIP712 message: %w", err)
+	}
+	fmt.Println("Signature:", signatureHash)
+
+	// verifyURL := fmt.Sprintf("%s/api/user/login/verify", c.APIURL)
+	verifyURL := fmt.Sprintf("%s/api/v1/user/login/verify", c.APIURL)
+
+	verifyFormData := url.Values{}
+	verifyFormData.Set("addr", address)
+	verifyFormData.Set("signature", signatureHash)
+	verifyFormData.Set("nonceHash", loginData.NonceHash)
+
+	verifyResp, err := c.Client.PostForm(verifyURL, verifyFormData)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to send verification request: %w", err)
+	}
+	defer verifyResp.Body.Close()
+
+	if verifyResp.StatusCode != http.StatusOK {
+		body, _ := ioutil.ReadAll(verifyResp.Body)
+		return "", "", fmt.Errorf("verification failed with status %d: %s", verifyResp.StatusCode, string(body))
+	}
+
+	var verifyApiResponse ApiResponse
+	if err := json.NewDecoder(verifyResp.Body).Decode(&verifyApiResponse); err != nil {
+		return "", "", fmt.Errorf("failed to parse verification response: %w", err)
+	}
+	if !verifyApiResponse.Success {
+		return "", "", fmt.Errorf("verification failed: response indicates failure")
+	}
+
+	var verifyData VerifyResponse
+	if err := json.Unmarshal(verifyApiResponse.Data, &verifyData); err != nil {
+		return "", "", fmt.Errorf("failed to parse verify data: %w", err)
+	}
+
+	c.AccessToken = verifyData.AccessToken.Token
+	c.RefreshToken = c.extractRefreshToken(verifyResp)
+	return c.AccessToken, c.RefreshToken, nil
+}
+
+// RefreshAccessToken refreshes the access token using the refresh token
+func (c *ApiClient) RefreshAccessToken() error {
+	// refreshURL := fmt.Sprintf("%s/api/user/login/refresh", c.APIURL)
+	refreshURL := fmt.Sprintf("%s/api/v1/user/login/refresh", c.APIURL)
+
+	// Prepare the form data
+	formData := url.Values{}
+	formData.Set("refreshToken", c.RefreshToken)
+
+	// Send the refresh token request
+	resp, err := c.Client.PostForm(refreshURL, formData)
+	if err != nil {
+		return fmt.Errorf("failed to send refresh token request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := ioutil.ReadAll(resp.Body)
+		return fmt.Errorf("refresh token failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	// Parse the refresh response
+	var apiResponse ApiResponse
+	if err := json.NewDecoder(resp.Body).Decode(&apiResponse); err != nil {
+		return fmt.Errorf("failed to parse refresh token response: %w", err)
+	}
+	if !apiResponse.Success {
+		return fmt.Errorf("refresh token failed: response indicates failure")
+	}
+
+	// Extract the verify data
+	var verifyData VerifyResponse
+	if err := json.Unmarshal(apiResponse.Data, &verifyData); err != nil {
+		return fmt.Errorf("failed to parse verify data: %w", err)
+	}
+
+	// Save new access token
+	c.AccessToken = verifyData.AccessToken.Token
+	return nil
+}
+
+func (c *ApiClient) extractRefreshToken(resp *http.Response) string {
+	for _, cookie := range resp.Cookies() {
+		if cookie.Name == "x_auth_refresh_token" {
+			return cookie.Value
+		}
+	}
+	return ""
+}
+
+func InitLoginAndStartTokenRefresh() {
+	// Perform the initial login to get tokens
+	// TODO config
+
+	// privateKey := "8ca6e6e33b2170de9e6ce76bbb5808f8d5ec3e112c2c72cd0b97614f00061f0e"
+
+	accessToken, refreshToken, err := client.Login(exchangeLoginPrivateKey)
+	if err != nil || accessToken == "" || refreshToken == "" {
+		log.Printf("Failed to login during initialization: %v", err)
+		return
+	}
+
+	// Start a goroutine to refresh the tokens every 30 minutes
+	go client.startTokenRefreshLoop()
+	go client.startDailyLoginLoop(exchangeLoginPrivateKey)
+}
+
+// startTokenRefreshLoop refreshes access tokens every 30 minutes
+func (c *ApiClient) startTokenRefreshLoop() {
+	log.Println("Starting access token refresh loop...")
+	ticker := time.NewTicker(30 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		err := c.RefreshAccessToken()
+		if err != nil {
+			log.Printf("Failed to refresh access token: %v", err)
+		}
+	}
+}
+
+// startDailyLoginLoop logs in every 24 hours
+func (c *ApiClient) startDailyLoginLoop(privateKey string) {
+	log.Println("Starting daily login loop...")
+	ticker := time.NewTicker(24 * time.Hour)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		accessToken, refreshToken, err := c.Login(privateKey)
+		if err != nil || accessToken == "" || refreshToken == "" {
+			log.Printf("Failed to login during initialization: %v", err)
+			return
+		}
 	}
 }

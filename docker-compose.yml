@@ -38,3 +38,34 @@ services:
       - '8093:8080'
     environment:
       ADMINER_PLUGINS: tables-filter tinymce
+
+  ethgas-mev-boost-relay-api:
+    image: ethgas/mev-boost-relay
+    depends_on:
+      - db
+    ports:
+      - "9062:9062"
+    environment:
+      REDIS_URI: 172.31.19.75:6379
+      BEACON_URIS: http://172.31.19.75:5052
+      BLOCKSIM_URI: http://172.31.19.75:3333
+        #http://k8s-ethnode-flashbot-7da0a76828-344faac8c49505f1.elb.ap-east-1.amazonaws.com:8545/
+      LISTEN_ADDR: 0.0.0.0:9062
+      ENABLE_BUILDER_CANCELLATIONS: 1
+      EXCHANGE_API_URL: http://172.31.38.246:3210
+    command: >
+      api --network holesky --secret-key 0xe948199540b12455e1f287c1e2af19b1c501f7a6d165688748b9ee2b4ded06f7 --db postgres://postgres:postgres@172.31.19.75:5432/postgres?sslmode=disable
+
+  ethgas-mev-boost-relay-housekeeper:
+    image: ethgas/mev-boost-relay
+    depends_on:
+      - db
+    environment:
+      REDIS_URI: 172.31.19.75:6379
+      BEACON_URIS: http://172.31.19.75:5052
+      BLOCKSIM_URI: http://172.31.19.75:3333
+        #http://k8s-ethnode-flashbot-7da0a76828-344faac8c49505f1.elb.ap-east-1.amazonaws.com:8545/
+      LISTEN_ADDR: 0.0.0.0:9062
+      EXCHANGE_API_URL: http://172.31.38.246:3210
+    command: >
+      housekeeper --network holesky --db postgres://postgres:postgres@172.31.19.75:5432/postgres?sslmode=disable

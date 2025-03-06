@@ -43,7 +43,8 @@ func (b *BuilderBids) getTopBid() (string, *big.Int) {
 	topBidBuilderPubkey := ""
 	topBidValue := big.NewInt(0)
 	for builderPubkey, bidValue := range b.bidValues {
-		if bidValue.Cmp(topBidValue) > 0 {
+		// 0 is allowed
+		if bidValue.Cmp(topBidValue) >= 0 {
 			topBidValue = bidValue
 			topBidBuilderPubkey = builderPubkey
 		}
