@@ -17,7 +17,7 @@ import (
 	"github.com/attestantio/go-eth2-client/spec"
 	"github.com/attestantio/go-eth2-client/spec/capella"
 	"github.com/flashbots/go-utils/cli"
-	"github.com/go-redis/redis/v9"
+	"github.com/redis/go-redis/v9"
 )
 
 var (
@@ -85,6 +85,7 @@ type RedisCache struct {
 	prefixGetHeaderResponse           string
 	prefixExecPayloadCapella          string
 	prefixPayloadContentsDeneb        string
+	prefixPayloadContentsElectra      string
 	prefixBidTrace                    string
 	prefixBlockBuilderLatestBids      string // latest bid for a given slot
 	prefixBlockBuilderLatestBidsValue string // value of latest bid for a given slot
@@ -122,10 +123,11 @@ func NewRedisCache(prefix, redisURI, readonlyURI string) (*RedisCache, error) {
 		client:         client,
 		readonlyClient: roClient,
 
-		prefixGetHeaderResponse:    fmt.Sprintf("%s/%s:cache-gethead-response", redisPrefix, prefix),
-		prefixExecPayloadCapella:   fmt.Sprintf("%s/%s:cache-execpayload-capella", redisPrefix, prefix),
-		prefixPayloadContentsDeneb: fmt.Sprintf("%s/%s:cache-payloadcontents-deneb", redisPrefix, prefix),
-		prefixBidTrace:             fmt.Sprintf("%s/%s:cache-bid-trace", redisPrefix, prefix),
+		prefixGetHeaderResponse:      fmt.Sprintf("%s/%s:cache-gethead-response", redisPrefix, prefix),
+		prefixExecPayloadCapella:     fmt.Sprintf("%s/%s:cache-execpayload-capella", redisPrefix, prefix),
+		prefixPayloadContentsDeneb:   fmt.Sprintf("%s/%s:cache-payloadcontents-deneb", redisPrefix, prefix),
+		prefixPayloadContentsElectra: fmt.Sprintf("%s/%s:cache-payloadcontents-electra", redisPrefix, prefix),
+		prefixBidTrace:               fmt.Sprintf("%s/%s:cache-bid-trace", redisPrefix, prefix),
 
 		prefixBlockBuilderLatestBids:      fmt.Sprintf("%s/%s:block-builder-latest-bid", redisPrefix, prefix),       // hashmap for slot+parentHash+proposerPubkey with builderPubkey as field
 		prefixBlockBuilderLatestBidsValue: fmt.Sprintf("%s/%s:block-builder-latest-bid-value", redisPrefix, prefix), // hashmap for slot+parentHash+proposerPubkey with builderPubkey as field
@@ -155,6 +157,10 @@ func (r *RedisCache) keyExecPayloadCapella(slot uint64, proposerPubkey, blockHas
 
 func (r *RedisCache) keyPayloadContentsDeneb(slot uint64, proposerPubkey, blockHash string) string {
 	return fmt.Sprintf("%s:%d_%s_%s", r.prefixPayloadContentsDeneb, slot, proposerPubkey, blockHash)
+}
+
+func (r *RedisCache) keyPayloadContentsElectra(slot uint64, proposerPubkey, blockHash string) string {
+	return fmt.Sprintf("%s:%d_%s_%s", r.prefixPayloadContentsElectra, slot, proposerPubkey, blockHash)
 }
 
 func (r *RedisCache) keyCacheBidTrace(slot uint64, proposerPubkey, blockHash string) string {
@@ -363,12 +369,43 @@ func (r *RedisCache) GetBestBid(slot uint64, parentHash, proposerPubkey string) 
 }
 
 func (r *RedisCache) GetPayloadContents(slot uint64, proposerPubkey, blockHash string) (*builderApi.VersionedSubmitBlindedBlockResponse, error) {
-	resp, err := r.GetPayloadContentsDeneb(slot, proposerPubkey, blockHash)
+	resp, err := r.GetPayloadContentsElectra(slot, proposerPubkey, blockHash)
 	if errors.Is(err, redis.Nil) {
-		// can't find deneb payload, try find capella payload
-		return r.GetExecutionPayloadCapella(slot, proposerPubkey, blockHash)
+		resp, err = r.GetPayloadContentsDeneb(slot, proposerPubkey, blockHash)
+		if errors.Is(err, redis.Nil) {
+			return r.GetExecutionPayloadCapella(slot, proposerPubkey, blockHash)
+		}
 	}
 	return resp, err
+}
+
+func (r *RedisCache) SavePayloadContentsElectra(ctx context.Context, tx redis.Pipeliner, slot uint64, proposerPubkey, blockHash string, execPayload *builderApiDeneb.ExecutionPayloadAndBlobsBundle) (err error) {
+	key := r.keyPayloadContentsElectra(slot, proposerPubkey, blockHash)
+	b, err := execPayload.MarshalSSZ()
+	if err != nil {
+		return err
+	}
+	return tx.Set(ctx, key, b, expiryBidCache).Err()
+}
+
+func (r *RedisCache) GetPayloadContentsElectra(slot uint64, proposerPubkey, blockHash string) (*builderApi.VersionedSubmitBlindedBlockResponse, error) {
+	electraPayloadContents := new(builderApiDeneb.ExecutionPayloadAndBlobsBundle)
+
+	key := r.keyPayloadContentsElectra(slot, proposerPubkey, blockHash)
+	val, err := r.client.Get(context.Background(), key).Result()
+	if err != nil {
+		return nil, err
+	}
+
+	err = electraPayloadContents.UnmarshalSSZ([]byte(val))
+	if err != nil {
+		return nil, err
+	}
+
+	return &builderApi.VersionedSubmitBlindedBlockResponse{
+		Version: spec.DataVersionElectra,
+		Electra: electraPayloadContents,
+	}, nil
 }
 
 func (r *RedisCache) SavePayloadContentsDeneb(ctx context.Context, tx redis.Pipeliner, slot uint64, proposerPubkey, blockHash string, execPayload *builderApiDeneb.ExecutionPayloadAndBlobsBundle) (err error) {
@@ -559,6 +596,11 @@ func (r *RedisCache) SaveBidAndUpdateTopBid(ctx context.Context, pipeliner redis
 		if err != nil {
 			return state, err
 		}
+	case spec.DataVersionElectra:
+		err = r.SavePayloadContentsElectra(ctx, pipeliner, submission.BidTrace.Slot, submission.BidTrace.ProposerPubkey.String(), submission.BidTrace.BlockHash.String(), getPayloadResponse.Electra)
+		if err != nil {
+			return state, err
+		}
 	case spec.DataVersionUnknown, spec.DataVersionPhase0, spec.DataVersionAltair, spec.DataVersionBellatrix:
 		return state, fmt.Errorf("unsupported payload version: %s", payload.Version) //nolint:goerr113
 	}
@@ -571,7 +613,6 @@ func (r *RedisCache) SaveBidAndUpdateTopBid(ctx context.Context, pipeliner redis
 	// 2. Save latest bid for this builder
 	err = r.SaveBuilderBid(ctx, pipeliner, submission.BidTrace.Slot, submission.BidTrace.ParentHash.String(), submission.BidTrace.ProposerPubkey.String(), submission.BidTrace.BuilderPubkey.String(), reqReceivedAt, getHeaderResponse)
 	if err != nil {
-		// fmt.Printf("failed at SaveBuilderBid")
 		return state, err
 	}
 	builderBids.bidValues[submission.BidTrace.BuilderPubkey.String()] = submission.BidTrace.Value.ToBig()
@@ -592,7 +633,7 @@ func (r *RedisCache) SaveBidAndUpdateTopBid(ctx context.Context, pipeliner redis
 	state.TimeSaveTrace = nextTime.Sub(prevTime)
 	prevTime = nextTime
 
-	// If top bid value hasn't change, abort now
+	// If top bid value hasn't changed, abort now
 	_, state.TopBidValue = builderBids.getTopBid()
 	// preconf txs should have 0 bid value if there have no public txs
 	// if state.TopBidValue.Cmp(state.PrevTopBidValue) == 0 {
@@ -601,7 +642,6 @@ func (r *RedisCache) SaveBidAndUpdateTopBid(ctx context.Context, pipeliner redis
 
 	state, err = r._updateTopBid(ctx, pipeliner, state, builderBids, submission.BidTrace.Slot, submission.BidTrace.ParentHash.String(), submission.BidTrace.ProposerPubkey.String(), floorValue)
 	if err != nil {
-		fmt.Printf("failed at _updateTopBid ")
 		return state, err
 	}
 	state.IsNewTopBid = submission.BidTrace.Value.ToBig().Cmp(state.TopBidValue) == 0
@@ -626,7 +666,6 @@ func (r *RedisCache) SaveBidAndUpdateTopBid(ctx context.Context, pipeliner redis
 	c := pipeliner.Copy(ctx, keyBidSource, keyFloorBid, 0, true)
 	_, err = pipeliner.Exec(ctx)
 	if err != nil {
-		// fmt.Printf("Non-cancellable bid above floor should set new floor ")
 		return state, err
 	}
 
@@ -668,13 +707,11 @@ func (r *RedisCache) _updateTopBid(ctx context.Context, pipeliner redis.Pipeline
 	if builderBids == nil {
 		builderBids, err = NewBuilderBidsFromRedis(ctx, r, pipeliner, slot, parentHash, proposerPubkey)
 		if err != nil {
-			// fmt.Printf("failed at NewBuilderBidsFromRedis ")
 			return state, err
 		}
 	}
 
 	if len(builderBids.bidValues) == 0 {
-		// fmt.Printf("failed at len(builderBids.bidValues) == 0 ")
 		return state, nil
 	}
 
@@ -682,7 +719,6 @@ func (r *RedisCache) _updateTopBid(ctx context.Context, pipeliner redis.Pipeline
 	if floorValue == nil {
 		floorValue, err = r.GetFloorBidValue(ctx, pipeliner, slot, parentHash, proposerPubkey)
 		if err != nil {
-			// fmt.Printf("failed at GetFloorBidValue ")
 			return state, err
 		}
 	}
@@ -702,20 +738,16 @@ func (r *RedisCache) _updateTopBid(ctx context.Context, pipeliner redis.Pipeline
 	c := pipeliner.Copy(context.Background(), keyBidSource, keyTopBid, 0, true)
 	_, err = pipeliner.Exec(ctx)
 	if err != nil {
-		// fmt.Printf("failed at pipeliner.Exec(ctx) ")
 		return state, err
 	}
 	wasCopied, err := c.Result()
 	if err != nil {
-		// fmt.Printf("failed at c.Result() ")
 		return state, err
 	} else if wasCopied == 0 {
-		// fmt.Printf("wasCopied == 0 ")
 		return state, fmt.Errorf("could not copy top bid from %s to %s", keyBidSource, keyTopBid) //nolint:goerr113
 	}
 	err = pipeliner.Expire(context.Background(), keyTopBid, expiryBidCache).Err()
 	if err != nil {
-		// fmt.Printf("failed at pipeliner.Expire(context.Background(), keyTopBid, expiryBidCache).Err()")
 		return state, err
 	}
 
@@ -725,7 +757,6 @@ func (r *RedisCache) _updateTopBid(ctx context.Context, pipeliner redis.Pipeline
 	keyTopBidValue := r.keyTopBidValue(slot, parentHash, proposerPubkey)
 	err = pipeliner.Set(context.Background(), keyTopBidValue, state.TopBidValue.String(), expiryBidCache).Err()
 	if err != nil {
-		// fmt.Printf("failed at pipeliner.Set(context.Background(), keyTopBidValue, state.TopBidValue.String(), expiryBidCache).Err()")
 		return state, err
 	}
 
