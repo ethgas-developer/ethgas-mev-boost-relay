@@ -2038,7 +2038,7 @@ func (api *RelayAPI) handleBuilderGetValidators(w http.ResponseWriter, req *http
 	}
 }
 
-func (api *RelayAPI) checkSubmissionFeeRecipient(w http.ResponseWriter, log *logrus.Entry, bidTrace *builderApiV1.BidTrace, feeRecipient string) (uint64, bool) {
+func (api *RelayAPI) checkSubmissionFeeRecipient(w http.ResponseWriter, log *logrus.Entry, bidTrace *builderApiV1.BidTrace, feeRecipient string, builderPubkey string) (uint64, bool) {
 	api.proposerDutiesLock.RLock()
 	slotDuty := api.proposerDutiesMap[bidTrace.Slot]
 	api.proposerDutiesLock.RUnlock()
@@ -2053,7 +2053,8 @@ func (api *RelayAPI) checkSubmissionFeeRecipient(w http.ResponseWriter, log *log
 		log.Warn("could not find slot duty")
 		api.RespondError(w, http.StatusBadRequest, "could not find slot duty")
 		return 0, false
-	} else if !strings.EqualFold(expectedFeeRecipient, bidTrace.ProposerFeeRecipient.String()) {
+	} else if strings.EqualFold(builderPubkey, defaultBuilder) && !strings.EqualFold(expectedFeeRecipient, bidTrace.ProposerFeeRecipient.String()) {
+		//only fallback builder need to check fee recipient
 		log.WithFields(logrus.Fields{
 			"expectedFeeRecipient": expectedFeeRecipient,
 			"actualFeeRecipient":   bidTrace.ProposerFeeRecipient.String(),
@@ -2607,7 +2608,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 
 	log = log.WithField("builderIsHighPrio", builderEntry.status.IsHighPrio)
 
-	gasLimit, ok := api.checkSubmissionFeeRecipient(w, log, submission.BidTrace, feeRecipient)
+	gasLimit, ok := api.checkSubmissionFeeRecipient(w, log, submission.BidTrace, feeRecipient, builderPubkey.String())
 	if !ok {
 		return
 	}
