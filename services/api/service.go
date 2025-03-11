@@ -199,7 +199,7 @@ type ApiResponse struct {
 
 type PreconfBundles struct {
 	Bundles      []PreconfBundle `json:"bundles"`
-	EmptySpace   string          `json:"emptySpace,omitempty"`
+	EmptySpace   uint64          `json:"emptySpace,omitempty"`
 	feeRecipient string          `json:"feeRecipient,omitempty"`
 }
 
@@ -2046,22 +2046,33 @@ func (api *RelayAPI) checkSubmissionFeeRecipient(w http.ResponseWriter, log *log
 	expectedFeeRecipient := ""
 	if slotDuty != nil {
 		expectedFeeRecipient = slotDuty.Entry.Message.FeeRecipient.String()
-	}
-	if feeRecipient != "" {
-		expectedFeeRecipient = feeRecipient
-	}
-	if slotDuty == nil {
+	} else {
 		log.Warn("could not find slot duty")
 		api.RespondError(w, http.StatusBadRequest, "could not find slot duty")
 		return 0, false
-	} else if strings.EqualFold(builderPubkey, defaultBuilder) && !strings.EqualFold(expectedFeeRecipient, bidTrace.ProposerFeeRecipient.String()) {
-		//only fallback builder need to check fee recipient
-		log.WithFields(logrus.Fields{
-			"expectedFeeRecipient": expectedFeeRecipient,
-			"actualFeeRecipient":   bidTrace.ProposerFeeRecipient.String(),
-		}).Info("fee recipient does not match")
-		api.RespondError(w, http.StatusBadRequest, "fee recipient does not match")
-		return 0, false
+	}
+
+	if feeRecipient != "" {
+		expectedFeeRecipient = feeRecipient
+		if strings.EqualFold(builderPubkey, defaultBuilder) && !strings.EqualFold(expectedFeeRecipient, bidTrace.ProposerFeeRecipient.String()) {
+			//only fallback builder need to check fee recipient
+			log.WithFields(logrus.Fields{
+				"expectedFeeRecipient": expectedFeeRecipient,
+				"actualFeeRecipient":   bidTrace.ProposerFeeRecipient.String(),
+			}).Info("fee recipient does not match")
+			api.RespondError(w, http.StatusBadRequest, "fee recipient does not match")
+			return 0, false
+		}
+	} else {
+		if strings.EqualFold(builderPubkey, defaultBuilder) && !strings.EqualFold(expectedFeeRecipient, bidTrace.ProposerFeeRecipient.String()) && !strings.EqualFold(defaultFeeRecipient, bidTrace.ProposerFeeRecipient.String()) {
+			//only fallback builder need to check fee recipient
+			log.WithFields(logrus.Fields{
+				"expectedFeeRecipient": expectedFeeRecipient,
+				"actualFeeRecipient":   bidTrace.ProposerFeeRecipient.String(),
+			}).Info("fee recipient does not match")
+			api.RespondError(w, http.StatusBadRequest, "fee recipient does not match")
+			return 0, false
+		}
 	}
 	return slotDuty.Entry.Message.GasLimit, true
 }
@@ -2396,7 +2407,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	//after deadline: check builder id, is fullfilled preconf, is valid = false/true
 	//get header: 1. builder + true, 2. fallback builder + true, 3. builder + false 4. fallback builder + false 5. other builder
 	isValidPreconf := "" // empty string means valid
-	feeRecipient := defaultFeeRecipient
+	feeRecipient := ""
 	if msIntoSlot < int64(getExchangeFinalizedCutoffMs) {
 		api.log.Info("handleSubmitNewBlock sent too early, wait for exchange finalized")
 		isValidPreconf = "submission too early, before exchange finalization cutoff"
@@ -2546,18 +2557,16 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		//check remain empty space
 		//hardcode test:
 		// cachedPreconfs.EmptySpace = "30000000"
-		if cachedPreconfs.EmptySpace != "" {
-			requiredSpace, err := strconv.ParseUint(cachedPreconfs.EmptySpace, 10, 64)
-			if err == nil {
-				remainingGas := submission.BidTrace.GasLimit - submission.BidTrace.GasUsed
-				if remainingGas < requiredSpace {
-					reason := fmt.Sprintf("block doesn't have enough empty space (remaining gas %d < required %d)",
-						remainingGas, requiredSpace)
-					if isValidPreconf != "" {
-						isValidPreconf += "; " + reason
-					} else {
-						isValidPreconf = reason
-					}
+		if cachedPreconfs.EmptySpace > 0 { // Check if EmptySpace is greater than 0
+			requiredSpace := cachedPreconfs.EmptySpace // Directly use it as an int
+			remainingGas := submission.BidTrace.GasLimit - submission.BidTrace.GasUsed
+			if remainingGas < requiredSpace {
+				reason := fmt.Sprintf("block doesn't have enough empty space (remaining gas %d < required %d)",
+					remainingGas, requiredSpace)
+				if isValidPreconf != "" {
+					isValidPreconf += "; " + reason
+				} else {
+					isValidPreconf = reason
 				}
 			}
 		}
