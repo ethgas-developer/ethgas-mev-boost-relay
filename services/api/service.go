@@ -101,6 +101,7 @@ var (
 	chainID                 = GetEnvStr("CHAIN_ID", "7e7e")
 	exchangeLoginPrivateKey = GetEnvStr("EXCHANGE_LOGIN_PRIVATE_KEY", "5eae315483f028b5cdd5d1090ff0c7618b18737ea9bf3c35047189db22835c48")
 	defaultBuilder          = GetEnvStr("DEFAULT_BUILDER_PUBKEY", "0xa1885d66bef164889a2e35845c3b626545d7b0e513efe335e97c3a45e534013fa3bc38c3b7e6143695aecc4872ac52c4")
+	defaultFeeRecipient     = GetEnvStr("DEFAULT_FEE_RECIPIENT", "0x7566b700c0eaac88b521536f4e4e1b5b9afe6fe1")
 
 	// various timings
 	timeoutGetPayloadRetryMs     = cli.GetEnvInt("GETPAYLOAD_RETRY_TIMEOUT_MS", 100)
@@ -2395,7 +2396,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	//after deadline: check builder id, is fullfilled preconf, is valid = false/true
 	//get header: 1. builder + true, 2. fallback builder + true, 3. builder + false 4. fallback builder + false 5. other builder
 	isValidPreconf := "" // empty string means valid
-	feeRecipient := ""
+	feeRecipient := defaultFeeRecipient
 	if msIntoSlot < int64(getExchangeFinalizedCutoffMs) {
 		api.log.Info("handleSubmitNewBlock sent too early, wait for exchange finalized")
 		isValidPreconf = "submission too early, before exchange finalization cutoff"
@@ -2470,7 +2471,9 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		missingTxs := []string{}
 		missingOrderBundle := []string{}
 		count := 0
-		feeRecipient = cachedPreconfs.feeRecipient
+		if cachedPreconfs.feeRecipient != "" {
+			feeRecipient = cachedPreconfs.feeRecipient
+		}
 
 		for _, preconf := range cachedPreconfs.Bundles {
 			// Skip transaction checking for MEV-type bundles
