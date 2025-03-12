@@ -2560,6 +2560,10 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		if cachedPreconfs.EmptySpace > 0 { // Check if EmptySpace is greater than 0
 			requiredSpace := cachedPreconfs.EmptySpace // Directly use it as an int
 			remainingGas := submission.BidTrace.GasLimit - submission.BidTrace.GasUsed
+			//allow 21000 gas for transfer
+			if remainingGas < 21000 {
+				remainingGas = remainingGas - 21000
+			}
 			if remainingGas < requiredSpace {
 				reason := fmt.Sprintf("block doesn't have enough empty space (remaining gas %d < required %d)",
 					remainingGas, requiredSpace)
