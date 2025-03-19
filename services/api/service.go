@@ -3337,7 +3337,15 @@ func (c *ApiClient) Login(privateKey string) (string, string, error) {
 	formData.Set("addr", address)
 	formData.Set("chainId", c.ChainID)
 
-	resp, err := c.Client.PostForm(loginURL, formData)
+	// Create a new request with User-Agent
+	req, err := http.NewRequest("POST", loginURL, strings.NewReader(formData.Encode()))
+	if err != nil {
+		return "", "", fmt.Errorf("failed to create login request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("User-Agent", "Relay/1.0")
+
+	resp, err := c.Client.Do(req)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to send login request: %w", err)
 	}
@@ -3385,7 +3393,15 @@ func (c *ApiClient) Login(privateKey string) (string, string, error) {
 	verifyFormData.Set("signature", signatureHash)
 	verifyFormData.Set("nonceHash", loginData.NonceHash)
 
-	verifyResp, err := c.Client.PostForm(verifyURL, verifyFormData)
+	// Create a new request with User-Agent
+	verifyReq, err := http.NewRequest("POST", verifyURL, strings.NewReader(verifyFormData.Encode()))
+	if err != nil {
+		return "", "", fmt.Errorf("failed to create verification request: %w", err)
+	}
+	verifyReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	verifyReq.Header.Set("User-Agent", "Relay/1.0")
+
+	verifyResp, err := c.Client.Do(verifyReq)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to send verification request: %w", err)
 	}
@@ -3416,15 +3432,21 @@ func (c *ApiClient) Login(privateKey string) (string, string, error) {
 
 // RefreshAccessToken refreshes the access token using the refresh token
 func (c *ApiClient) RefreshAccessToken() error {
-	// refreshURL := fmt.Sprintf("%s/api/user/login/refresh", c.APIURL)
 	refreshURL := fmt.Sprintf("%s/api/v1/user/login/refresh", c.APIURL)
 
 	// Prepare the form data
 	formData := url.Values{}
 	formData.Set("refreshToken", c.RefreshToken)
 
-	// Send the refresh token request
-	resp, err := c.Client.PostForm(refreshURL, formData)
+	// Create a new request with User-Agent
+	req, err := http.NewRequest("POST", refreshURL, strings.NewReader(formData.Encode()))
+	if err != nil {
+		return fmt.Errorf("failed to create refresh token request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("User-Agent", "Relay/1.0")
+
+	resp, err := c.Client.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to send refresh token request: %w", err)
 	}
