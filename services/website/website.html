@@ -236,7 +236,7 @@
                         <th>Epoch</th>
                         <th>Slot</th>
                         <th>Block number</th>
-                        <th>
+                        <!-- <th>
                             Value (ETH{{.ValueOrderIcon}})
 
                             <a href="{{.ValueLink}}">
@@ -244,7 +244,7 @@
                                     <path stroke-linecap="round" stroke-linejoin="round" d="M3 7.5L7.5 3m0 0L12 7.5M7.5 3v13.5m13.5 0L16.5 21m0 0L12 16.5m4.5 4.5V7.5" />
                                 </svg>
                             </a>
-                        </th>
+                        </th> -->
                         <th>Num txs</th>
                         <th>Blobs</th>
                         <th>Block hash</th>
@@ -262,7 +262,7 @@
                             <a href="{{$linkDataAPI}}/relay/v1/data/bidtraces/proposer_payload_delivered?slot={{.Slot}}">{{.Slot | prettyInt}}</a>
                         </td>
                         <td>{{.BlockNumber | prettyInt}}</td>
-                        <td>{{.Value | weiToEth}}</td>
+                        <!-- <td>{{.Value | weiToEth}}</td> -->
                         <td>{{.NumTx }}</td>
                         <td>
                             <div title="Blob Gas Used: {{.BlobGasUsed}}">{{.NumBlobs }}</div>
