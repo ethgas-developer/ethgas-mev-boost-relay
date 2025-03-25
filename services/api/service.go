@@ -199,7 +199,7 @@ type ApiResponse struct {
 
 type PreconfBundles struct {
 	Bundles      []PreconfBundle `json:"bundles"`
-	EmptySpace   uint64          `json:"emptySpace,omitempty"`
+	EmptySpace   int             `json:"emptySpace,omitempty"`
 	feeRecipient string          `json:"feeRecipient,omitempty"`
 }
 
@@ -2558,8 +2558,14 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		//hardcode test:
 		// cachedPreconfs.EmptySpace = "30000000"
 		if cachedPreconfs.EmptySpace > 0 { // Check if EmptySpace is greater than 0
-			requiredSpace := cachedPreconfs.EmptySpace // Directly use it as an int
-			remainingGas := submission.BidTrace.GasLimit - submission.BidTrace.GasUsed
+			//empty space === -1 = full block empty submission.BidTrace.GasLimit
+			requiredSpace := uint64(0)
+			if cachedPreconfs.EmptySpace == -1 {
+				requiredSpace = uint64(submission.BidTrace.GasLimit)
+			} else {
+				requiredSpace = uint64(cachedPreconfs.EmptySpace)
+			}
+			remainingGas := uint64(submission.BidTrace.GasLimit) - uint64(submission.BidTrace.GasUsed)
 			//allow 21000 gas for transfer
 			if submission.BidTrace.GasUsed <= 21000 {
 				remainingGas += 21000
