@@ -139,7 +139,7 @@ var (
 
 // Add new constants for proxy mode
 var (
-	proxyRelayURL = "http://relay1.example.com"
+	proxyRelayURL = GetEnvStr("FALLBACK_RELAY", "https://boost-relay.flashbots.net/")
 	proxyTimeout  = 500 * time.Millisecond
 )
 
@@ -1378,6 +1378,7 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 		proxyURL := fmt.Sprintf("%s%s", proxyRelayURL, req.URL.Path)
 		resp, err := forwardRequest(req.Method, proxyURL, req)
 		if err != nil {
+			log.Printf("Error forwarding request: %v", err)
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
