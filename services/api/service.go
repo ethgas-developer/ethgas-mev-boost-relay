@@ -1568,7 +1568,7 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 
 	} else if bid.Deneb != nil {
 		// log.Info("set fake bid.Deneb.Message.Value")
-		bid.Deneb.Message.Value = uint256.NewInt(11000000000000000000) // Set to desired value (100 ETH)
+		bid.Deneb.Message.Value = uint256.MustFromDecimal("11000000000000000000000")
 		bid.Deneb.Message.Pubkey = *api.publicKey
 
 		// Serialize the bid data
@@ -1596,7 +1596,38 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 
 		// Assign the signature
 		copy(bid.Deneb.Signature[:], signatureBytes)
+	} else if bid.Electra != nil {
+		bid.Electra.Message.Value = uint256.MustFromDecimal("11000000000000000000000")
+		bid.Electra.Message.Pubkey = *api.publicKey
+
+		// Serialize the bid data
+
+		builderBid := builderApiDeneb.BuilderBid{
+			Value:  bid.Electra.Message.Value,
+			Header: bid.Electra.Message.Header,
+			Pubkey: *api.publicKey,
+		}
+
+		signature, err := ssz.SignMessage(&builderBid, api.opts.EthNetDetails.DomainBuilder, api.blsSk)
+		if err != nil {
+			log.WithError(err).Error("failed to signature bid")
+			api.RespondError(w, http.StatusInternalServerError, "failed to signature bid")
+			return
+		}
+		signatureBytes := signature[:]
+
+		// Ensure the signature is the correct size
+		if len(signatureBytes) != 96 {
+			log.Error("signature size is incorrect")
+			api.RespondError(w, http.StatusInternalServerError, "signature size is incorrect")
+			return
+		}
+
+		// Assign the signature
+		copy(bid.Deneb.Signature[:], signatureBytes)
+
 	}
+	//todo if pectra
 
 	value, err := bid.Value()
 	if err != nil {
