@@ -128,10 +128,19 @@ var (
 	// maximum payload bytes for a block submission to be fast-tracked (large payloads slow down other fast-tracked requests!)
 	fastTrackPayloadSizeLimit = cli.GetEnvInt("FAST_TRACK_PAYLOAD_SIZE_LIMIT", 230_000)
 
+	//proxy mode
+	proxyMode = os.Getenv("IS_PROXY_RELAY") == "true"
+
 	// user-agents which shouldn't receive bids
 	apiNoHeaderUserAgents = common.GetEnvStrSlice("NO_HEADER_USERAGENTS", []string{
 		"mev-boost/v1.5.0 Go-http-client/1.1", // Prysm v4.0.1 (Shapella signing issue)
 	})
+)
+
+// Add new constants for proxy mode
+var (
+	proxyRelayURL = "http://relay1.example.com"
+	proxyTimeout  = 500 * time.Millisecond
 )
 
 // Declare a global variable for ApiClient
@@ -231,9 +240,9 @@ type PreconfTx struct {
 //		SignedTxs   []string `json:"signedTxs"`
 //		AvgBidPrice uint64   `json:"avg_bid_price"`
 //	}
-type DataResponse struct {
-	Builder BuilderResponse `json:"builder"`
-}
+// type DataResponse struct {
+// 	Builder BuilderResponse `json:"builder"`
+// }
 
 type BuilderResponse struct {
 	Builder         string `json:"builder"`
@@ -470,6 +479,10 @@ func NewRelayAPI(opts RelayAPIOpts) (api *RelayAPI, err error) {
 		api.ffIgnorableValidationErrors = true
 	}
 	go InitLoginAndStartTokenRefresh()
+
+	// Start the exchange API health check
+	api.startExchangeAPIHealthCheck()
+	api.log.Info("NewRelayAPI Done")
 	return api, nil
 }
 
@@ -1361,6 +1374,19 @@ func (api *RelayAPI) handleRegisterValidator(w http.ResponseWriter, req *http.Re
 }
 
 func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
+	if proxyMode {
+		proxyURL := fmt.Sprintf("%s%s", proxyRelayURL, req.URL.Path)
+		resp, err := forwardRequest(req.Method, proxyURL, req)
+		if err != nil {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		copyHeaders(w.Header(), resp.Header)
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body)
+		resp.Body.Close()
+		return
+	}
 	vars := mux.Vars(req)
 	slotStr := vars["slot"]
 	parentHashHex := vars["parent_hash"]
@@ -1646,6 +1672,20 @@ func (api *RelayAPI) checkProposerSignature(block *common.VersionedSignedBlinded
 }
 
 func (api *RelayAPI) handleGetPayload(w http.ResponseWriter, req *http.Request) {
+	if proxyMode {
+		proxyURL := fmt.Sprintf("%s%s", proxyRelayURL, req.URL.Path)
+		resp, err := forwardRequest(req.Method, proxyURL, req)
+		if err != nil {
+			api.RespondError(w, http.StatusInternalServerError, "proxy request failed")
+			return
+		}
+		copyHeaders(w.Header(), resp.Header)
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body)
+		resp.Body.Close()
+		return
+	}
+
 	api.getPayloadCallsInFlight.Add(1)
 	defer api.getPayloadCallsInFlight.Done()
 
@@ -3309,7 +3349,7 @@ func FetchBuilderPubKey(apiURL string, slot uint64) (*BuilderResponse, error) {
 		return nil, fmt.Errorf("empty data in API response")
 	}
 
-	var builderResp DataResponse
+	var builderResp BuilderResponse
 	err = json.Unmarshal(apiResponse.Data, &builderResp)
 	if err != nil {
 		log.Printf("Failed to unmarshal builder response: %v", err)
@@ -3317,11 +3357,11 @@ func FetchBuilderPubKey(apiURL string, slot uint64) (*BuilderResponse, error) {
 	}
 
 	// Validate required fields
-	if builderResp.Builder.Builder == "" || builderResp.Builder.FallbackBuilder == "" {
+	if builderResp.Builder == "" || builderResp.FallbackBuilder == "" {
 		return nil, fmt.Errorf("invalid builder response: missing required fields")
 	}
 
-	return &builderResp.Builder, nil
+	return &builderResp, nil
 }
 
 // Login sends a login request and completes the EIP712 signature process
@@ -3536,4 +3576,103 @@ func (c *ApiClient) startDailyLoginLoop(privateKey string) {
 			return
 		}
 	}
+}
+
+// forwardRequest handles both GET and POST methods
+func forwardRequest(method, url string, originalReq *http.Request) (*http.Response, error) {
+	client := &http.Client{Timeout: proxyTimeout}
+
+	// For POST requests, we need to read and preserve the body
+	var body io.Reader
+	if method == http.MethodPost {
+		bodyBytes, err := io.ReadAll(originalReq.Body)
+		if err != nil {
+			return nil, err
+		}
+		originalReq.Body.Close()
+		body = bytes.NewReader(bodyBytes)
+	}
+
+	// Create new request with the appropriate method and body
+	proxyReq, err := http.NewRequest(method, url, body)
+	if err != nil {
+		return nil, err
+	}
+
+	// Copy headers from original request
+	copyHeaders(proxyReq.Header, originalReq.Header)
+
+	// Make the request
+	return client.Do(proxyReq)
+}
+
+// Keep copyHeaders helper
+func copyHeaders(dst, src http.Header) {
+	for k, vv := range src {
+		for _, v := range vv {
+			dst.Add(k, v)
+		}
+	}
+}
+
+var (
+	exchangeAPIDownCount int
+	exchangeAPILastCheck time.Time
+	exchangeAPIMutex     sync.Mutex
+	healthCheckRunning   bool
+)
+
+func (api *RelayAPI) startExchangeAPIHealthCheck() {
+	if healthCheckRunning {
+		return
+	}
+	healthCheckRunning = true
+
+	go func() {
+		ticker := time.NewTicker(12 * time.Second)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			go func() {
+				// Run health check in separate goroutine
+				healthy := api.checkExchangeAPIHealthAsync()
+
+				exchangeAPIMutex.Lock()
+				defer exchangeAPIMutex.Unlock()
+
+				if healthy {
+					exchangeAPIDownCount = 0
+					proxyMode = false
+				} else {
+					exchangeAPIDownCount++
+					if exchangeAPIDownCount >= 32 {
+						api.log.Printf("Switch to proxy mode")
+
+						proxyMode = true
+					}
+				}
+			}()
+		}
+	}()
+}
+
+// Add async health check helper
+func (api *RelayAPI) checkExchangeAPIHealthAsync() bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, exchangeAPIURL+"/api/v1/p/builders", nil)
+	if err != nil {
+		api.log.WithError(err).Error("failed to create health check request")
+		return false
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		api.log.WithError(err).Warn("exchange API health check failed")
+		return false
+	}
+	defer resp.Body.Close()
+
+	return resp.StatusCode == http.StatusOK
 }
