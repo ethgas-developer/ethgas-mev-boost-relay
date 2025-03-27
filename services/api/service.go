@@ -231,9 +231,9 @@ type PreconfTx struct {
 //		SignedTxs   []string `json:"signedTxs"`
 //		AvgBidPrice uint64   `json:"avg_bid_price"`
 //	}
-type DataResponse struct {
-	Builder BuilderResponse `json:"builder"`
-}
+// type DataResponse struct {
+// 	Builder BuilderResponse `json:"builder"`
+// }
 
 type BuilderResponse struct {
 	Builder         string `json:"builder"`
@@ -3309,7 +3309,7 @@ func FetchBuilderPubKey(apiURL string, slot uint64) (*BuilderResponse, error) {
 		return nil, fmt.Errorf("empty data in API response")
 	}
 
-	var builderResp DataResponse
+	var builderResp BuilderResponse
 	err = json.Unmarshal(apiResponse.Data, &builderResp)
 	if err != nil {
 		log.Printf("Failed to unmarshal builder response: %v", err)
@@ -3317,11 +3317,11 @@ func FetchBuilderPubKey(apiURL string, slot uint64) (*BuilderResponse, error) {
 	}
 
 	// Validate required fields
-	if builderResp.Builder.Builder == "" || builderResp.Builder.FallbackBuilder == "" {
+	if builderResp.Builder == "" || builderResp.FallbackBuilder == "" {
 		return nil, fmt.Errorf("invalid builder response: missing required fields")
 	}
 
-	return &builderResp.Builder, nil
+	return &builderResp, nil
 }
 
 // Login sends a login request and completes the EIP712 signature process
