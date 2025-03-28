@@ -3693,7 +3693,7 @@ func (api *RelayAPI) checkExchangeAPIHealthAsync() bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, exchangeAPIURL+"/api/v1/p/builders", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, exchangeAPIURL+"/api/v1/p/tokens", nil)
 	if err != nil {
 		api.log.WithError(err).Error("failed to create health check request")
 		return false
