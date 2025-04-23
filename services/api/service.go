@@ -1378,8 +1378,16 @@ func (api *RelayAPI) handleRegisterValidator(w http.ResponseWriter, req *http.Re
 }
 
 func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
+	reqClone, err := deepCloneRequest(req)
+	if err != nil {
+		api.RespondError(w, http.StatusInternalServerError, "failed to clone request")
+		return
+	}
+
 	if proxyMode {
 		proxyURL := fmt.Sprintf("%s%s", proxyRelayURL, req.URL.Path)
+		log.Printf("Proxy mode get header from: %s", proxyURL)
+
 		resp, err := forwardRequest(req.Method, proxyURL, req)
 		if err != nil {
 			log.Printf("Error forwarding request: %v", err)
@@ -1520,7 +1528,20 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 		}
 		if fallbackBid == nil || fallbackBid.IsEmpty() {
 			log.Info("no fallback bid")
-			w.WriteHeader(http.StatusNoContent)
+			// w.WriteHeader(http.StatusNoContent)
+			proxyURL := fmt.Sprintf("%s%s", proxyRelayURL, req.URL.Path)
+			log.Printf("Proxy mode get header from: %s", proxyURL)
+
+			resp, err := forwardRequest(req.Method, proxyURL, reqClone)
+			if err != nil {
+				log.Printf("Error forwarding request: %v", err)
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			copyHeaders(w.Header(), resp.Header)
+			w.WriteHeader(resp.StatusCode)
+			io.Copy(w, resp.Body)
+			resp.Body.Close()
 			return
 		}
 
@@ -1708,9 +1729,20 @@ func (api *RelayAPI) checkProposerSignature(block *common.VersionedSignedBlinded
 }
 
 func (api *RelayAPI) handleGetPayload(w http.ResponseWriter, req *http.Request) {
+	reqClone, err := deepCloneRequest(req)
+	if err != nil {
+		api.RespondError(w, http.StatusInternalServerError, "failed to clone request")
+		return
+	}
+
+	log.Printf("Initial reqClone: %+v", reqClone)
+	log.Printf("Initial reqClone.Body: %v", reqClone.Body)
+
 	if proxyMode {
 		proxyURL := fmt.Sprintf("%s%s", proxyRelayURL, req.URL.Path)
-		resp, err := forwardRequest(req.Method, proxyURL, req)
+		log.Printf("Proxy mode get payload from: %s", proxyURL)
+
+		resp, err := forwardRequest(req.Method, proxyURL, reqClone)
 		if err != nil {
 			api.RespondError(w, http.StatusInternalServerError, "proxy request failed")
 			return
@@ -1756,6 +1788,7 @@ func (api *RelayAPI) handleGetPayload(w http.ResponseWriter, req *http.Request) 
 	// Read the body first, so we can decode it later
 	limitReader := io.LimitReader(req.Body, int64(apiMaxPayloadBytes))
 	body, err := io.ReadAll(limitReader)
+
 	if err != nil {
 		if strings.Contains(err.Error(), "i/o timeout") {
 			log.WithError(err).Error("getPayload request failed to decode (i/o timeout)")
@@ -1958,7 +1991,22 @@ func (api *RelayAPI) handleGetPayload(w http.ResponseWriter, req *http.Request) 
 				bid, err := api.db.GetBlockSubmissionEntry(uint64(slot), proposerPubkey.String(), blockHash.String())
 				if errors.Is(err, sql.ErrNoRows) {
 					log.Warn("failed getting execution payload (2/2) - payload not found, block was never submitted to this relay")
-					api.RespondError(w, http.StatusBadRequest, "no execution payload for this request - block was never seen by this relay")
+					log.Warn("failed getting execution payload (2/2) - Probably it is proxy relay block, send it to proxy relay")
+					log.Printf("Before forwarding reqClone: %+v", reqClone)
+					log.Printf("Before forwarding reqClone.Body: %v", reqClone.Body)
+
+					proxyURL := fmt.Sprintf("%s%s", proxyRelayURL, req.URL.Path)
+					resp, err := forwardRequest(req.Method, proxyURL, reqClone)
+					if err != nil {
+						api.RespondError(w, http.StatusInternalServerError, "proxy request failed")
+						return
+					}
+					copyHeaders(w.Header(), resp.Header)
+					w.WriteHeader(resp.StatusCode)
+					io.Copy(w, resp.Body)
+					resp.Body.Close()
+					return
+					// api.RespondError(w, http.StatusBadRequest, "no execution payload for this request - block was never seen by this relay")
 				} else if err != nil {
 					log.WithError(err).Error("failed getting execution payload (2/2) - payload not found, and error on checking bids")
 				} else if bid.EligibleAt.Valid {
@@ -3711,4 +3759,42 @@ func (api *RelayAPI) checkExchangeAPIHealthAsync() bool {
 	defer resp.Body.Close()
 
 	return resp.StatusCode == http.StatusOK
+}
+
+func deepCloneRequest(req *http.Request) (*http.Request, error) {
+	// Read and buffer the request body
+	bodyBytes, err := io.ReadAll(req.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create a new request with the buffered body
+	newReq, err := http.NewRequest(req.Method, req.URL.String(), bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, err
+	}
+
+	// Copy headers
+	newReq.Header = req.Header.Clone()
+
+	// Copy other properties
+	newReq.Host = req.Host
+	newReq.RemoteAddr = req.RemoteAddr
+	newReq.RequestURI = req.RequestURI
+	newReq.TLS = req.TLS
+	newReq.ContentLength = req.ContentLength
+	newReq.TransferEncoding = req.TransferEncoding
+	newReq.Close = req.Close
+	newReq.Form = req.Form
+	newReq.PostForm = req.PostForm
+	newReq.MultipartForm = req.MultipartForm
+	newReq.Trailer = req.Trailer
+	newReq.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(bodyBytes)), nil
+	}
+
+	// Restore the original request body
+	req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+
+	return newReq, nil
 }
