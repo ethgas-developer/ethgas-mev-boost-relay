@@ -3389,7 +3389,7 @@ func FetchBuilderPubKey(apiURL string, slot uint64) (*BuilderResponse, error) {
 	}
 
 	// Validate required fields
-	if builderResp.Builder == "" || builderResp.FallbackBuilder == "" {
+	if builderResp.Builder == "" && builderResp.FallbackBuilder == "" {
 		return nil, fmt.Errorf("invalid builder response: missing required fields")
 	}
 
