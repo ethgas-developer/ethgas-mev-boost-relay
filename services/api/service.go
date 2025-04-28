@@ -34,6 +34,8 @@ import (
 	builderApi "github.com/attestantio/go-builder-client/api"
 	builderApiCapella "github.com/attestantio/go-builder-client/api/capella"
 	builderApiDeneb "github.com/attestantio/go-builder-client/api/deneb"
+	builderApiElectra "github.com/attestantio/go-builder-client/api/electra"
+
 	builderApiV1 "github.com/attestantio/go-builder-client/api/v1"
 	"github.com/attestantio/go-eth2-client/spec"
 	"github.com/attestantio/go-eth2-client/spec/phase0"
@@ -1543,6 +1545,7 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 			io.Copy(w, resp.Body)
 			resp.Body.Close()
 			return
+			// api.RespondError(w, http.StatusBadRequest, "no execution payload for this request - block was never seen by this relay")
 		}
 
 		if isFallbackBuilderValidPreconf {
@@ -1576,6 +1579,7 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 
 	// HARDCODE to modify the bid value to force validator select our block
 	if bid.Capella != nil {
+		api.log.Info("Modifying Capella bid")
 		// log.Info("set fake bid.Capella.Message.Value")
 		// log.Info("old bid.Capella.Message.Value: ", bid.Capella.Message.Value)
 		bid.Capella.Message.Value = uint256.MustFromDecimal("11000000000000000000000") // Set to desired value (11000 ETH)
@@ -1619,6 +1623,8 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 		// log.Info("new bid.Capella.Signature: ", bid.Capella.Signature)
 
 	} else if bid.Deneb != nil {
+		api.log.Info("Modifying Deneb bid")
+
 		// log.Info("set fake bid.Deneb.Message.Value")
 		bid.Deneb.Message.Value = uint256.MustFromDecimal("11000000000000000000000")
 		bid.Deneb.Message.Pubkey = *api.publicKey
@@ -1649,15 +1655,19 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 		// Assign the signature
 		copy(bid.Deneb.Signature[:], signatureBytes)
 	} else if bid.Electra != nil {
+		api.log.Info("Modifying Electra bid")
+
 		bid.Electra.Message.Value = uint256.MustFromDecimal("11000000000000000000000")
 		bid.Electra.Message.Pubkey = *api.publicKey
 
 		// Serialize the bid data
 
-		builderBid := builderApiDeneb.BuilderBid{
-			Value:  bid.Electra.Message.Value,
-			Header: bid.Electra.Message.Header,
-			Pubkey: *api.publicKey,
+		builderBid := builderApiElectra.BuilderBid{
+			Value:              bid.Electra.Message.Value,
+			Header:             bid.Electra.Message.Header,
+			ExecutionRequests:  bid.Electra.Message.ExecutionRequests,
+			BlobKZGCommitments: bid.Electra.Message.BlobKZGCommitments,
+			Pubkey:             *api.publicKey,
 		}
 
 		signature, err := ssz.SignMessage(&builderBid, api.opts.EthNetDetails.DomainBuilder, api.blsSk)
@@ -1676,10 +1686,9 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 		}
 
 		// Assign the signature
-		copy(bid.Deneb.Signature[:], signatureBytes)
+		copy(bid.Electra.Signature[:], signatureBytes)
 
 	}
-	//todo if pectra
 
 	value, err := bid.Value()
 	if err != nil {
@@ -2580,12 +2589,18 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 				return
 			}
 
+			// Log the raw data before unmarshaling
+			log.Printf("Raw preconf bundles data: %s", string(apiResponse.Data))
+
 			var preconfBundles PreconfBundles
 			err = json.Unmarshal(apiResponse.Data, &preconfBundles)
 			if err != nil {
-				log.Printf("Failed to unmarshal preconf bundles: %v", err)
+				log.Printf("Failed to unmarshal preconf bundles: %v, raw data: %s", err, string(apiResponse.Data))
 				return
 			}
+
+			// Log the successfully unmarshaled data
+			log.Printf("Successfully unmarshaled preconf bundles: %+v", preconfBundles)
 
 			// Store in cache
 			preconfCacheMutex.Lock()
@@ -3411,20 +3426,29 @@ func FetchBuilderPubKey(apiURL string, slot uint64) (*BuilderResponse, error) {
 	}
 	defer resp.Body.Close()
 
+	// Read the response body
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	// Log the raw response
+	log.Printf("Raw builder response for slot %d: %s", slot, string(body))
+
 	// Check if the HTTP response status code is OK (200)
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		return nil, fmt.Errorf("unexpected status code: %d, body: %s", resp.StatusCode, string(body))
 	}
 
 	var apiResponse ApiResponse
-	err = json.NewDecoder(resp.Body).Decode(&apiResponse)
+	err = json.Unmarshal(body, &apiResponse)
 	if err != nil {
-		log.Printf("Failed to decode API response: %v", err)
+		log.Printf("Failed to decode API response: %v, body: %s", err, string(body))
 		return nil, fmt.Errorf("failed to decode API response: %v", err)
 	}
 
 	if !apiResponse.Success {
-		log.Printf("API response indicates failure: %v", apiResponse)
+		log.Printf("API response indicates failure: %v, data: %s", apiResponse, string(apiResponse.Data))
 		return nil, fmt.Errorf("API response indicates failure: %v", apiResponse)
 	}
 
