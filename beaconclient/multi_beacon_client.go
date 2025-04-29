@@ -261,32 +261,10 @@ func (c *MultiBeaconClient) PublishBlock(block *common.VersionedSignedProposal) 
 		c.log.WithError(err).Warn("failed to publish block as block hash is missing")
 		return 0, err
 	}
-
-	// Get parent hash for additional context
-	parentHash, err := block.ParentHash()
-	if err != nil {
-		c.log.WithError(err).Warn("failed to get parent hash")
-	} else {
-		c.log.WithField("parentHash", parentHash.String()).Info("publishing block with parent hash")
-	}
-
 	log := c.log.WithFields(logrus.Fields{
-		"slot":       slot,
-		"blockHash":  blockHash.String(),
-		"parentHash": parentHash.String(),
+		"slot":      slot,
+		"blockHash": blockHash.String(),
 	})
-
-	// Check if any CL nodes are syncing
-	for _, client := range c.beaconInstances {
-		syncStatus, err := client.SyncStatus()
-		if err != nil {
-			log.WithError(err).Warn("failed to get sync status")
-			continue
-		}
-		if syncStatus.IsSyncing {
-			log.WithField("uri", client.GetURI()).Warn("CL node is still syncing")
-		}
-	}
 
 	clients := c.beaconInstancesByLastResponse()
 
