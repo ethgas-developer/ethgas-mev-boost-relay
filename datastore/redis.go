@@ -123,27 +123,27 @@ func NewRedisCache(prefix, redisURI, readonlyURI string) (*RedisCache, error) {
 		client:         client,
 		readonlyClient: roClient,
 
-		prefixGetHeaderResponse:      fmt.Sprintf("%s/%s:cache-gethead-response", redisPrefix, prefix),
-		prefixExecPayloadCapella:     fmt.Sprintf("%s/%s:cache-execpayload-capella", redisPrefix, prefix),
-		prefixPayloadContentsDeneb:   fmt.Sprintf("%s/%s:cache-payloadcontents-deneb", redisPrefix, prefix),
-		prefixPayloadContentsElectra: fmt.Sprintf("%s/%s:cache-payloadcontents-electra", redisPrefix, prefix),
-		prefixBidTrace:               fmt.Sprintf("%s/%s:cache-bid-trace", redisPrefix, prefix),
+		prefixGetHeaderResponse:      fmt.Sprintf("{%s/%s}:cache-gethead-response", redisPrefix, prefix),
+		prefixExecPayloadCapella:     fmt.Sprintf("{%s/%s}:cache-execpayload-capella", redisPrefix, prefix),
+		prefixPayloadContentsDeneb:   fmt.Sprintf("{%s/%s}:cache-payloadcontents-deneb", redisPrefix, prefix),
+		prefixPayloadContentsElectra: fmt.Sprintf("{%s/%s}:cache-payloadcontents-electra", redisPrefix, prefix),
+		prefixBidTrace:               fmt.Sprintf("{%s/%s}:cache-bid-trace", redisPrefix, prefix),
 
-		prefixBlockBuilderLatestBids:      fmt.Sprintf("%s/%s:block-builder-latest-bid", redisPrefix, prefix),       // hashmap for slot+parentHash+proposerPubkey with builderPubkey as field
-		prefixBlockBuilderLatestBidsValue: fmt.Sprintf("%s/%s:block-builder-latest-bid-value", redisPrefix, prefix), // hashmap for slot+parentHash+proposerPubkey with builderPubkey as field
-		prefixBlockBuilderLatestBidsTime:  fmt.Sprintf("%s/%s:block-builder-latest-bid-time", redisPrefix, prefix),  // hashmap for slot+parentHash+proposerPubkey with builderPubkey as field
-		prefixTopBidValue:                 fmt.Sprintf("%s/%s:top-bid-value", redisPrefix, prefix),                  // prefix:slot_parentHash_proposerPubkey
-		prefixFloorBid:                    fmt.Sprintf("%s/%s:bid-floor", redisPrefix, prefix),                      // prefix:slot_parentHash_proposerPubkey
-		prefixFloorBidValue:               fmt.Sprintf("%s/%s:bid-floor-value", redisPrefix, prefix),                // prefix:slot_parentHash_proposerPubkey
+		prefixBlockBuilderLatestBids:      fmt.Sprintf("{%s/%s}:block-builder-latest-bid", redisPrefix, prefix),       // hashmap for slot+parentHash+proposerPubkey with builderPubkey as field
+		prefixBlockBuilderLatestBidsValue: fmt.Sprintf("{%s/%s}:block-builder-latest-bid-value", redisPrefix, prefix), // hashmap for slot+parentHash+proposerPubkey with builderPubkey as field
+		prefixBlockBuilderLatestBidsTime:  fmt.Sprintf("{%s/%s}:block-builder-latest-bid-time", redisPrefix, prefix),  // hashmap for slot+parentHash+proposerPubkey with builderPubkey as field
+		prefixTopBidValue:                 fmt.Sprintf("{%s/%s}:top-bid-value", redisPrefix, prefix),                  // prefix:slot_parentHash_proposerPubkey
+		prefixFloorBid:                    fmt.Sprintf("{%s/%s}:bid-floor", redisPrefix, prefix),                      // prefix:slot_parentHash_proposerPubkey
+		prefixFloorBidValue:               fmt.Sprintf("{%s/%s}:bid-floor-value", redisPrefix, prefix),                // prefix:slot_parentHash_proposerPubkey
 
-		keyValidatorRegistrationTimestamp: fmt.Sprintf("%s/%s:validator-registration-timestamp", redisPrefix, prefix),
-		keyRelayConfig:                    fmt.Sprintf("%s/%s:relay-config", redisPrefix, prefix),
+		keyValidatorRegistrationTimestamp: fmt.Sprintf("{%s/%s}:validator-registration-timestamp", redisPrefix, prefix),
+		keyRelayConfig:                    fmt.Sprintf("{%s/%s}:relay-config", redisPrefix, prefix),
 
-		keyStats:              fmt.Sprintf("%s/%s:stats", redisPrefix, prefix),
-		keyProposerDuties:     fmt.Sprintf("%s/%s:proposer-duties", redisPrefix, prefix),
-		keyBlockBuilderStatus: fmt.Sprintf("%s/%s:block-builder-status", redisPrefix, prefix),
-		keyLastSlotDelivered:  fmt.Sprintf("%s/%s:last-slot-delivered", redisPrefix, prefix),
-		keyLastHashDelivered:  fmt.Sprintf("%s/%s:last-hash-delivered", redisPrefix, prefix),
+		keyStats:              fmt.Sprintf("{%s/%s}:stats", redisPrefix, prefix),
+		keyProposerDuties:     fmt.Sprintf("{%s/%s}:proposer-duties", redisPrefix, prefix),
+		keyBlockBuilderStatus: fmt.Sprintf("{%s/%s}:block-builder-status", redisPrefix, prefix),
+		keyLastSlotDelivered:  fmt.Sprintf("{%s/%s}:last-slot-delivered", redisPrefix, prefix),
+		keyLastHashDelivered:  fmt.Sprintf("{%s/%s}:last-hash-delivered", redisPrefix, prefix),
 	}, nil
 }
 
