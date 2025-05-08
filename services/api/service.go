@@ -985,10 +985,11 @@ func (api *RelayAPI) updateProposerDuties(headSlot uint64) {
 	}
 	defer api.isUpdatingProposerDuties.Store(false)
 
-	// Update once every 8 slots (or more, if a slot was missed)
-	if headSlot%8 != 0 && headSlot-api.proposerDutiesSlot < 8 {
-		return
-	}
+	// try update every slot
+	// // Update once every 8 slots (or more, if a slot was missed)
+	// if headSlot%8 != 0 && headSlot-api.proposerDutiesSlot < 32 {
+	// 	return
+	// }
 
 	api.UpdateProposerDutiesWithoutChecks(headSlot)
 }
