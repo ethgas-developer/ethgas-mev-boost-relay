@@ -211,7 +211,8 @@ type ApiResponse struct {
 type PreconfBundles struct {
 	Bundles      []PreconfBundle `json:"bundles"`
 	EmptySpace   int             `json:"emptySpace,omitempty"`
-	feeRecipient string          `json:"feeRecipient,omitempty"`
+	FeeRecipient string          `json:"feeRecipient,omitempty"`
+	IsSold       bool            `json:"isSold,omitempty"`
 }
 
 // PreconfBundle represents a single preconfigured bundle.
@@ -2186,6 +2187,7 @@ func (api *RelayAPI) checkSubmissionFeeRecipient(w http.ResponseWriter, log *log
 		return 0, false
 	}
 
+	//only fall back builder (our builder) need to check this.
 	if feeRecipient != "" {
 		expectedFeeRecipient = feeRecipient
 		if strings.EqualFold(builderPubkey, defaultBuilder) && !strings.EqualFold(expectedFeeRecipient, bidTrace.ProposerFeeRecipient.String()) {
@@ -2623,8 +2625,17 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		missingTxs := []string{}
 		missingOrderBundle := []string{}
 		count := 0
-		if cachedPreconfs.feeRecipient != "" {
-			feeRecipient = cachedPreconfs.feeRecipient
+		if cachedPreconfs.FeeRecipient != "" {
+			feeRecipient = cachedPreconfs.FeeRecipient
+		}
+		numOfTxBottomOfBottom := 0
+
+		for _, preconf := range cachedPreconfs.Bundles {
+			if preconf.Ordering == -2 {
+				// "-2" means the bottom of bottom
+				// store the len of the pre
+				numOfTxBottomOfBottom += len(preconf.Txs)
+			}
 		}
 
 		for _, preconf := range cachedPreconfs.Bundles {
@@ -2652,6 +2663,16 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 				}
 			} else if preconf.Ordering == -1 {
 				// "-1" means the bottom
+				// Check if the last `numOfTxsInBundle` transactions in the block match the preconf transactions
+				for i, preconfTx := range preconf.Txs {
+					blockTxIndex := len(submission.Transactions) - numOfTxsInBundle + i - numOfTxBottomOfBottom
+					if blockTxIndex < 0 || strings.ToLower(preconfTx.Tx) != "0x"+strings.ToLower(hex.EncodeToString(submission.Transactions[blockTxIndex])) {
+						missingOrderBundle = append(missingOrderBundle, preconf.UUID)
+						continue
+					}
+				}
+			} else if preconf.Ordering == -2 {
+				// "-2" means the bottom of bottom
 				// Check if the last `numOfTxsInBundle` transactions in the block match the preconf transactions
 				for i, preconfTx := range preconf.Txs {
 					blockTxIndex := len(submission.Transactions) - numOfTxsInBundle + i
@@ -2735,6 +2756,26 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		"payloadBytes":           len(requestPayloadBytes),
 		"isLargeRequest":         isLargeRequest,
 	})
+	if isValidPreconf != "" {
+		// mean there have reason that is invalid
+		// 1. get from redis to check if last submitted block is valid preconf for that builder
+		isBuilderValidPreconf, err := api.redis.GetIsValidPreconf(
+			submission.BidTrace.Slot,
+			submission.BidTrace.ParentHash.String(),
+			submission.BidTrace.ProposerPubkey.String(),
+			submission.BidTrace.BuilderPubkey.String(),
+		)
+		if err != nil && !errors.Is(err, redis.Nil) { // Only return error if it's not a "not found" error
+			api.RespondError(w, http.StatusInternalServerError, "failed to check last valid preconf")
+			return
+		}
+
+		// 2. if there have valid preconf, not allow to submit invalid preconf, directly return
+		if isBuilderValidPreconf {
+			api.RespondError(w, http.StatusBadRequest, "invalid preconf not allowed when valid preconf exists")
+			return
+		}
+	}
 	if payload.Version >= spec.DataVersionDeneb {
 		blobs, err := payload.Blobs()
 		if err != nil {
