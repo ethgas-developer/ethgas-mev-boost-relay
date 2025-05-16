@@ -1387,8 +1387,29 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 		api.RespondError(w, http.StatusInternalServerError, "failed to clone request")
 		return
 	}
+	vars := mux.Vars(req)
+	slotStr := vars["slot"]
+	parentHashHex := vars["parent_hash"]
+	proposerPubkeyHex := vars["pubkey"]
+	ua := req.UserAgent()
+	headSlot := api.headSlot.Load()
 
-	if proxyMode {
+	slot, err := strconv.ParseUint(slotStr, 10, 64)
+	if err != nil {
+		api.RespondError(w, http.StatusBadRequest, common.ErrInvalidSlot.Error())
+		return
+	}
+
+	// Check if cachedPreconfs isSold is false and determine if we should proxy
+	preconfCacheMutex.RLock()
+	cachedPreconfs, exists := preconfCache[slot]
+	preconfCacheMutex.RUnlock()
+	shouldProxy := (exists && !cachedPreconfs.IsSold) || proxyMode
+	if exists {
+		log.Printf("cachedPreconfs.IsSold: %v", cachedPreconfs.IsSold)
+	}
+
+	if shouldProxy {
 		proxyURL := fmt.Sprintf("%s%s", proxyRelayURL, req.URL.Path)
 		log.Printf("Proxy mode get header from: %s", proxyURL)
 
@@ -1402,18 +1423,6 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 		w.WriteHeader(resp.StatusCode)
 		io.Copy(w, resp.Body)
 		resp.Body.Close()
-		return
-	}
-	vars := mux.Vars(req)
-	slotStr := vars["slot"]
-	parentHashHex := vars["parent_hash"]
-	proposerPubkeyHex := vars["pubkey"]
-	ua := req.UserAgent()
-	headSlot := api.headSlot.Load()
-
-	slot, err := strconv.ParseUint(slotStr, 10, 64)
-	if err != nil {
-		api.RespondError(w, http.StatusBadRequest, common.ErrInvalidSlot.Error())
 		return
 	}
 
@@ -3790,7 +3799,9 @@ func (api *RelayAPI) startExchangeAPIHealthCheck() {
 
 				exchangeAPIMutex.Lock()
 				defer exchangeAPIMutex.Unlock()
-
+				if proxyMode {
+					api.log.Printf("Switch to proxy mode")
+				}
 				if healthy {
 					exchangeAPIDownCount = 0
 					proxyMode = false
