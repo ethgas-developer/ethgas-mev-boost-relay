@@ -2672,23 +2672,45 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 				}
 			} else if preconf.Ordering == -1 {
 				// "-1" means the bottom
-				// Check if the last `numOfTxsInBundle` transactions in the block match the preconf transactions
-				for i, preconfTx := range preconf.Txs {
-					blockTxIndex := len(submission.Transactions) - numOfTxsInBundle + i - numOfTxBottomOfBottom
-					if blockTxIndex < 0 || strings.ToLower(preconfTx.Tx) != "0x"+strings.ToLower(hex.EncodeToString(submission.Transactions[blockTxIndex])) {
-						missingOrderBundle = append(missingOrderBundle, preconf.UUID)
-						continue
+				// Check if the last `numOfTxsInBundle` or `numOfTxsInBundle + 1` transactions in the block match the preconf transactions
+				valid := false
+				for offset := 0; offset <= 1; offset++ {
+					allMatch := true
+					for i, preconfTx := range preconf.Txs {
+						blockTxIndex := len(submission.Transactions) - numOfTxsInBundle + i - numOfTxBottomOfBottom - offset
+						if blockTxIndex < 0 || strings.ToLower(preconfTx.Tx) != "0x"+strings.ToLower(hex.EncodeToString(submission.Transactions[blockTxIndex])) {
+							allMatch = false
+							break
+						}
 					}
+					if allMatch {
+						valid = true
+						break
+					}
+				}
+				if !valid {
+					missingOrderBundle = append(missingOrderBundle, preconf.UUID)
 				}
 			} else if preconf.Ordering == -2 {
 				// "-2" means the bottom of bottom
-				// Check if the last `numOfTxsInBundle` transactions in the block match the preconf transactions
-				for i, preconfTx := range preconf.Txs {
-					blockTxIndex := len(submission.Transactions) - numOfTxsInBundle + i
-					if blockTxIndex < 0 || strings.ToLower(preconfTx.Tx) != "0x"+strings.ToLower(hex.EncodeToString(submission.Transactions[blockTxIndex])) {
-						missingOrderBundle = append(missingOrderBundle, preconf.UUID)
-						continue
+				// Check if the last `numOfTxsInBundle` or `numOfTxsInBundle + 1` transactions in the block match the preconf transactions
+				valid := false
+				for offset := 0; offset <= 1; offset++ {
+					allMatch := true
+					for i, preconfTx := range preconf.Txs {
+						blockTxIndex := len(submission.Transactions) - numOfTxsInBundle + i - offset
+						if blockTxIndex < 0 || strings.ToLower(preconfTx.Tx) != "0x"+strings.ToLower(hex.EncodeToString(submission.Transactions[blockTxIndex])) {
+							allMatch = false
+							break
+						}
 					}
+					if allMatch {
+						valid = true
+						break
+					}
+				}
+				if !valid {
+					missingOrderBundle = append(missingOrderBundle, preconf.UUID)
 				}
 			} else {
 				// Existing transaction existence check
