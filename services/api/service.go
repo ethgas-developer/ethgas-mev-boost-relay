@@ -141,8 +141,9 @@ var (
 
 // Add new constants for proxy mode
 var (
-	proxyRelayURL = GetEnvStr("FALLBACK_RELAY", "https://boost-relay.flashbots.net/")
-	proxyTimeout  = 500 * time.Millisecond
+	executionEndpoint = GetEnvStr("RPC_URL", "http://localhost:8545")
+	proxyRelayURL     = GetEnvStr("FALLBACK_RELAY", "https://boost-relay.flashbots.net/")
+	proxyTimeout      = 500 * time.Millisecond
 )
 
 // Declare a global variable for ApiClient
@@ -377,6 +378,158 @@ var (
 	currentSlot       uint64
 )
 
+// Add these new structs and variables at the top of the file
+type CachedHeaderResponse struct {
+	Response   []byte
+	Headers    http.Header
+	StatusCode int
+	Timestamp  time.Time
+}
+
+var (
+	headerCache      = make(map[string]*CachedHeaderResponse)
+	headerCacheMutex sync.RWMutex
+)
+
+// Add these new types for RPC response
+type RPCResponse struct {
+	JSONRPC string `json:"jsonrpc"`
+	ID      int    `json:"id"`
+	Result  struct {
+		Hash   string `json:"hash"`
+		Number string `json:"number"`
+	} `json:"result"`
+}
+
+// Add this new function to handle the cron job
+func (api *RelayAPI) startHeaderCacheCron() {
+	ticker := time.NewTicker(1 * time.Second) // Adjust interval as needed
+	go func() {
+		for range ticker.C {
+			// Use recover to prevent panic from crashing the goroutine
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						api.log.Errorf("Recovered from panic in header cache update: %v", r)
+					}
+				}()
+				api.updateHeaderCache()
+			}()
+		}
+	}()
+}
+
+func (api *RelayAPI) updateHeaderCache() {
+	// Get current slot
+	slot := api.headSlot.Load() + 1
+
+	// Fetch from proxy for current and next slot
+	// Use recover for each slot update to prevent one failure from affecting others
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				api.log.Errorf("Recovered from panic while updating header cache for slot %d: %v", slot, r)
+			}
+		}()
+		// Ensure the there have proposer duties for the slot
+		api.proposerDutiesLock.RLock()
+		slotDuty := api.proposerDutiesMap[uint64(slot)]
+		api.proposerDutiesLock.RUnlock()
+		if slotDuty == nil {
+			api.log.Errorf("could not find slot duty")
+			return
+		}
+
+		// Get the proposer pubkey based on the validator index from the payload
+		proposerPubkey, found := api.datastore.GetKnownValidatorPubkeyByIndex(uint64(slotDuty.ValidatorIndex))
+		if !found {
+			api.log.Errorf("could not find proposer pubkey for index %d", slotDuty.ValidatorIndex)
+			return
+		}
+
+		// Step 1: Get the latest block hash from the execution layer
+		rpcClient := &http.Client{
+			Timeout: 5 * time.Second,
+		}
+
+		rpcReq := map[string]interface{}{
+			"jsonrpc": "2.0",
+			"method":  "eth_getBlockByNumber",
+			"params":  []interface{}{"latest", false},
+			"id":      1,
+		}
+
+		rpcReqBody, err := json.Marshal(rpcReq)
+		if err != nil {
+			api.log.WithError(err).Error("Failed to marshal RPC request")
+			return
+		}
+
+		rpcResp, err := rpcClient.Post(executionEndpoint, "application/json", bytes.NewBuffer(rpcReqBody))
+		if err != nil {
+			api.log.WithError(err).Error("Failed to fetch latest block hash")
+			return
+		}
+		defer rpcResp.Body.Close()
+
+		var rpcResult RPCResponse
+		if err := json.NewDecoder(rpcResp.Body).Decode(&rpcResult); err != nil {
+			api.log.WithError(err).Error("Failed to decode RPC response")
+			return
+		}
+
+		blockHash := rpcResult.Result.Hash
+		if blockHash == "" {
+			api.log.Error("Received empty block hash from RPC")
+			return
+		}
+
+		// Step 2: Construct the URL for each slot with the fetched block hash
+		url := fmt.Sprintf("%s/eth/v1/builder/header/%d/%s/%s",
+			proxyRelayURL, slot, blockHash, proposerPubkey)
+
+		// Log the URL being called
+		api.log.Infof("Fetching header from URL: %s", url)
+
+		// Make the request with timeout
+		client := &http.Client{
+			Timeout: 5 * time.Second,
+		}
+		resp, err := client.Get(url)
+		if err != nil {
+			api.log.WithError(err).Errorf("Failed to fetch header for slot %d", slot)
+			return
+		}
+
+		// Read the response
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			api.log.WithError(err).Errorf("Failed to read response for slot %d", slot)
+			return
+		}
+
+		// Log the response body
+		api.log.Infof("Received response for slot %d: %s", slot, string(body))
+
+		// Only cache successful responses
+		if resp.StatusCode == http.StatusOK {
+			headerCacheMutex.Lock()
+			headerCache[fmt.Sprintf("%d", slot)] = &CachedHeaderResponse{
+				Response:   body,
+				Headers:    resp.Header,
+				StatusCode: resp.StatusCode,
+				Timestamp:  time.Now(),
+			}
+			headerCacheMutex.Unlock()
+
+			api.log.Infof("Updated header cache for slot %d", slot)
+		} else {
+			api.log.Warnf("Received non-200 status code %d for slot %d", resp.StatusCode, slot)
+		}
+	}()
+}
+
 // NewRelayAPI creates a new service. if builders is nil, allow any builder
 func NewRelayAPI(opts RelayAPIOpts) (api *RelayAPI, err error) {
 	if err := metrics.Setup(context.Background()); err != nil {
@@ -486,6 +639,10 @@ func NewRelayAPI(opts RelayAPIOpts) (api *RelayAPI, err error) {
 	// Start the exchange API health check
 	api.startExchangeAPIHealthCheck()
 	api.log.Info("NewRelayAPI Done")
+
+	// Start the header cache cron job
+	api.startHeaderCacheCron()
+
 	return api, nil
 }
 
@@ -1410,22 +1567,37 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 	}
 
 	if shouldProxy {
-		proxyURL := fmt.Sprintf("%s%s", proxyRelayURL, req.URL.Path)
-		log.Printf("Proxy mode get header from: %s", proxyURL)
+		// Check cache first
+		headerCacheMutex.RLock()
+		cachedResp, exists := headerCache[slotStr]
+		headerCacheMutex.RUnlock()
 
-		resp, err := forwardRequest(req.Method, proxyURL, req)
-		if err != nil {
-			log.Printf("Error forwarding request: %v", err)
-			w.WriteHeader(http.StatusNoContent)
+		if exists {
+			// Serve from cache
+			copyHeaders(w.Header(), cachedResp.Headers)
+			w.WriteHeader(cachedResp.StatusCode)
+			w.Write(cachedResp.Response)
+			return
+		} else {
+
+			proxyURL := fmt.Sprintf("%s%s", proxyRelayURL, req.URL.Path)
+			log.Printf("Proxy mode get header from: %s", proxyURL)
+
+			resp, err := forwardRequest(req.Method, proxyURL, req)
+			if err != nil {
+				log.Printf("Error forwarding request: %v", err)
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			copyHeaders(w.Header(), resp.Header)
+			w.WriteHeader(resp.StatusCode)
+			io.Copy(w, resp.Body)
+			resp.Body.Close()
 			return
 		}
-		copyHeaders(w.Header(), resp.Header)
-		w.WriteHeader(resp.StatusCode)
-		io.Copy(w, resp.Body)
-		resp.Body.Close()
-		return
 	}
 
+	// If not in cache, proceed with existing logic
 	requestTime := time.Now().UTC()
 	slotStartTimestamp := api.genesisInfo.Data.GenesisTime + (slot * common.SecondsPerSlot)
 	msIntoSlot := requestTime.UnixMilli() - int64(slotStartTimestamp*1000) //nolint:gosec
@@ -1539,25 +1711,6 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 			api.RespondError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		if fallbackBid == nil || fallbackBid.IsEmpty() {
-			log.Info("no fallback bid")
-			// w.WriteHeader(http.StatusNoContent)
-			proxyURL := fmt.Sprintf("%s%s", proxyRelayURL, req.URL.Path)
-			log.Printf("Proxy mode get header from: %s", proxyURL)
-
-			resp, err := forwardRequest(req.Method, proxyURL, reqClone)
-			if err != nil {
-				log.Printf("Error forwarding request: %v", err)
-				w.WriteHeader(http.StatusNoContent)
-				return
-			}
-			copyHeaders(w.Header(), resp.Header)
-			w.WriteHeader(resp.StatusCode)
-			io.Copy(w, resp.Body)
-			resp.Body.Close()
-			return
-			// api.RespondError(w, http.StatusBadRequest, "no execution payload for this request - block was never seen by this relay")
-		}
 
 		if isFallbackBuilderValidPreconf {
 			//2. use fallback bid with valid = true
@@ -1582,9 +1735,27 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 		}
 		//6. if there have no any bid then return
 		if bid == nil || bid.IsEmpty() {
-			log.Info("no targeted bid, remain time: ", msIntoSlot)
-			w.WriteHeader(http.StatusNoContent)
+			log.Info("no fallback bid")
+			// w.WriteHeader(http.StatusNoContent)
+			proxyURL := fmt.Sprintf("%s%s", proxyRelayURL, req.URL.Path)
+			log.Printf("Proxy mode get header from: %s", proxyURL)
+
+			resp, err := forwardRequest(req.Method, proxyURL, reqClone)
+			if err != nil {
+				log.Printf("Error forwarding request: %v", err)
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			copyHeaders(w.Header(), resp.Header)
+			w.WriteHeader(resp.StatusCode)
+			io.Copy(w, resp.Body)
+			resp.Body.Close()
 			return
+			// api.RespondError(w, http.StatusBadRequest, "no execution payload for this request - block was never seen by this relay")
+
+			// log.Info("no targeted bid, remain time: ", msIntoSlot)
+			// w.WriteHeader(http.StatusNoContent)
+			// return
 		}
 	}
 
