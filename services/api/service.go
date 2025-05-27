@@ -1539,26 +1539,6 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 			api.RespondError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		if fallbackBid == nil || fallbackBid.IsEmpty() {
-			log.Info("no fallback bid")
-			// w.WriteHeader(http.StatusNoContent)
-			proxyURL := fmt.Sprintf("%s%s", proxyRelayURL, req.URL.Path)
-			log.Printf("Proxy mode get header from: %s", proxyURL)
-
-			resp, err := forwardRequest(req.Method, proxyURL, reqClone)
-			if err != nil {
-				log.Printf("Error forwarding request: %v", err)
-				w.WriteHeader(http.StatusNoContent)
-				return
-			}
-			copyHeaders(w.Header(), resp.Header)
-			w.WriteHeader(resp.StatusCode)
-			io.Copy(w, resp.Body)
-			resp.Body.Close()
-			return
-			// api.RespondError(w, http.StatusBadRequest, "no execution payload for this request - block was never seen by this relay")
-		}
-
 		if isFallbackBuilderValidPreconf {
 			//2. use fallback bid with valid = true
 			bid = fallbackBid
@@ -1583,7 +1563,21 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 		//6. if there have no any bid then return
 		if bid == nil || bid.IsEmpty() {
 			log.Info("no targeted bid, remain time: ", msIntoSlot)
-			w.WriteHeader(http.StatusNoContent)
+			// log.Info("no fallback bid")
+			// w.WriteHeader(http.StatusNoContent)
+			proxyURL := fmt.Sprintf("%s%s", proxyRelayURL, req.URL.Path)
+			log.Printf("Proxy mode get header from: %s", proxyURL)
+
+			resp, err := forwardRequest(req.Method, proxyURL, reqClone)
+			if err != nil {
+				log.Printf("Error forwarding request: %v", err)
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			copyHeaders(w.Header(), resp.Header)
+			w.WriteHeader(resp.StatusCode)
+			io.Copy(w, resp.Body)
+			resp.Body.Close()
 			return
 		}
 	}
