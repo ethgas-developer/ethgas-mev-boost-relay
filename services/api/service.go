@@ -377,6 +377,19 @@ var (
 	currentSlot       uint64
 )
 
+type LoginCache struct {
+	AccessToken  string
+	RefreshToken string
+	LastLogin    time.Time
+	mutex        sync.RWMutex
+}
+
+var (
+	loginCache = &LoginCache{}
+	maxRetries = 5
+	retryDelay = 5 * time.Second
+)
+
 // NewRelayAPI creates a new service. if builders is nil, allow any builder
 func NewRelayAPI(opts RelayAPIOpts) (api *RelayAPI, err error) {
 	if err := metrics.Setup(context.Background()); err != nil {
@@ -3539,9 +3552,42 @@ func FetchBuilderPubKey(apiURL string, slot uint64) (*BuilderResponse, error) {
 
 	return &builderResp, nil
 }
-
-// Login sends a login request and completes the EIP712 signature process
 func (c *ApiClient) Login(privateKey string) (string, string, error) {
+	// Check cache first
+	loginCache.mutex.RLock()
+	if loginCache.AccessToken != "" && loginCache.RefreshToken != "" {
+		// If cache is less than 23 hours old, use it
+		if time.Since(loginCache.LastLogin) < 23*time.Hour {
+			accessToken := loginCache.AccessToken
+			refreshToken := loginCache.RefreshToken
+			loginCache.mutex.RUnlock()
+			return accessToken, refreshToken, nil
+		}
+	}
+	loginCache.mutex.RUnlock()
+
+	// If cache miss or expired, try to login with retries
+	var lastErr error
+	for i := 0; i < maxRetries; i++ {
+		accessToken, refreshToken, err := c.tryLogin(privateKey)
+		if err == nil {
+			// Update cache on success
+			loginCache.mutex.Lock()
+			loginCache.AccessToken = accessToken
+			loginCache.RefreshToken = refreshToken
+			loginCache.LastLogin = time.Now()
+			loginCache.mutex.Unlock()
+			return accessToken, refreshToken, nil
+		}
+		lastErr = err
+		log.Printf("Login attempt %d failed: %v, retrying in %v...", i+1, err, retryDelay)
+		time.Sleep(retryDelay)
+	}
+	return "", "", fmt.Errorf("all login attempts failed: %v", lastErr)
+}
+
+// Split out the actual login attempt into a separate method
+func (c *ApiClient) tryLogin(privateKey string) (string, string, error) {
 	privateKeyBytes, err := hex.DecodeString(privateKey)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to decode private key: %w", err)
@@ -3552,14 +3598,12 @@ func (c *ApiClient) Login(privateKey string) (string, string, error) {
 	}
 	address := crypto.PubkeyToAddress(privateKeyECDSA.PublicKey).Hex()
 
-	// loginURL := fmt.Sprintf("%s/api/user/login", c.APIURL)
 	loginURL := fmt.Sprintf("%s/api/v1/user/login", c.APIURL)
 
 	formData := url.Values{}
 	formData.Set("addr", address)
 	formData.Set("chainId", c.ChainID)
 
-	// Create a new request with User-Agent
 	req, err := http.NewRequest("POST", loginURL, strings.NewReader(formData.Encode()))
 	if err != nil {
 		return "", "", fmt.Errorf("failed to create login request: %w", err)
@@ -3652,15 +3696,29 @@ func (c *ApiClient) Login(privateKey string) (string, string, error) {
 	return c.AccessToken, c.RefreshToken, nil
 }
 
-// RefreshAccessToken refreshes the access token using the refresh token
+// Update the RefreshAccessToken method to include retries
 func (c *ApiClient) RefreshAccessToken() error {
+	var lastErr error
+	for i := 0; i < maxRetries; i++ {
+		err := c.tryRefreshAccessToken()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		log.Printf("Token refresh attempt %d failed: %v, retrying in %v...", i+1, err, retryDelay)
+		time.Sleep(retryDelay)
+	}
+	return fmt.Errorf("all token refresh attempts failed: %v", lastErr)
+}
+
+// RefreshAccessToken refreshes the access token using the refresh token
+// Split out the actual refresh attempt into a separate method
+func (c *ApiClient) tryRefreshAccessToken() error {
 	refreshURL := fmt.Sprintf("%s/api/v1/user/login/refresh", c.APIURL)
 
-	// Prepare the form data
 	formData := url.Values{}
 	formData.Set("refreshToken", c.RefreshToken)
 
-	// Create a new request with User-Agent
 	req, err := http.NewRequest("POST", refreshURL, strings.NewReader(formData.Encode()))
 	if err != nil {
 		return fmt.Errorf("failed to create refresh token request: %w", err)
@@ -3739,7 +3797,7 @@ func (c *ApiClient) startTokenRefreshLoop() {
 	}
 }
 
-// startDailyLoginLoop logs in every 24 hours
+// Update the startDailyLoginLoop to handle failures better
 func (c *ApiClient) startDailyLoginLoop(privateKey string) {
 	log.Println("Starting daily login loop...")
 	ticker := time.NewTicker(24 * time.Hour)
@@ -3747,9 +3805,13 @@ func (c *ApiClient) startDailyLoginLoop(privateKey string) {
 
 	for range ticker.C {
 		accessToken, refreshToken, err := c.Login(privateKey)
-		if err != nil || accessToken == "" || refreshToken == "" {
-			log.Printf("Failed to login during initialization: %v", err)
-			return
+		if err != nil {
+			log.Printf("Failed to login during daily refresh: %v", err)
+			continue
+		}
+		if accessToken == "" || refreshToken == "" {
+			log.Printf("Received empty tokens during daily refresh")
+			continue
 		}
 	}
 }
