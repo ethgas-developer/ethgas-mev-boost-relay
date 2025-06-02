@@ -466,9 +466,10 @@ func (api *RelayAPI) updateHeaderCache() {
 		}
 
 		if slotDuty == nil {
-			api.log.Warnf("could not find slot duty, slot: %d", slot)
 			return
 		}
+
+		api.log.Infof("Found slot duty for slot %d", slot)
 
 		// Get the proposer pubkey based on the validator index from the payload
 		proposerPubkey, found := api.datastore.GetKnownValidatorPubkeyByIndex(uint64(slotDuty.ValidatorIndex))
