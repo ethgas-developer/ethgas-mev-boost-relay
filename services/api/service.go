@@ -403,7 +403,7 @@ type RPCResponse struct {
 
 // Add this new function to handle the cron job
 func (api *RelayAPI) startHeaderCacheCron() {
-	ticker := time.NewTicker(1 * time.Second) // Adjust interval as needed
+	ticker := time.NewTicker(500 * time.Millisecond)
 	go func() {
 		for range ticker.C {
 			// Use recover to prevent panic from crashing the goroutine
@@ -435,8 +435,25 @@ func (api *RelayAPI) updateHeaderCache() {
 		api.proposerDutiesLock.RLock()
 		slotDuty := api.proposerDutiesMap[uint64(slot)]
 		api.proposerDutiesLock.RUnlock()
+		requestTime := time.Now().UTC()
+		slotStartTimestamp := api.genesisInfo.Data.GenesisTime + (slot * common.SecondsPerSlot)
+		msIntoSlot := requestTime.UnixMilli() - int64(slotStartTimestamp*1000) //nolint:gosec
+
+		if msIntoSlot < int64(getExchangeFinalizedCutoffMs) {
+			api.log.Warnf("too early to get header, slot: %d", slot)
+
+			// Add sleep until msIntoSlot > -3
+			for msIntoSlot < -2500 {
+				time.Sleep(100 * time.Millisecond)
+				requestTime = time.Now().UTC()
+				msIntoSlot = requestTime.UnixMilli() - int64(slotStartTimestamp*1000)
+			}
+
+			return
+		}
+
 		if slotDuty == nil {
-			api.log.Errorf("could not find slot duty")
+			api.log.Warnf("could not find slot duty, slot: %d", slot)
 			return
 		}
 
@@ -523,7 +540,7 @@ func (api *RelayAPI) updateHeaderCache() {
 			}
 			headerCacheMutex.Unlock()
 
-			api.log.Infof("Updated header cache for slot %d", slot)
+			api.log.Infof("Updated header cache for slot %s", fmt.Sprintf("%d", slot))
 		} else {
 			api.log.Warnf("Received non-200 status code %d for slot %d", resp.StatusCode, slot)
 		}
@@ -1569,11 +1586,13 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 	if shouldProxy {
 		// Check cache first
 		headerCacheMutex.RLock()
-		cachedResp, exists := headerCache[slotStr]
+		cachedResp, exists := headerCache[fmt.Sprintf("%d", slot)]
 		headerCacheMutex.RUnlock()
-
+		log.Printf("slot: %s", slotStr)
 		if exists {
 			// Serve from cache
+			log.Printf("Proxy mode Serve from cache, slot: %s", slotStr)
+
 			copyHeaders(w.Header(), cachedResp.Headers)
 			w.WriteHeader(cachedResp.StatusCode)
 			w.Write(cachedResp.Response)
@@ -3997,7 +4016,7 @@ func (api *RelayAPI) startExchangeAPIHealthCheck() {
 				}
 				if healthy {
 					exchangeAPIDownCount = 0
-					proxyMode = false
+					// proxyMode = false
 				} else {
 					exchangeAPIDownCount++
 					if exchangeAPIDownCount >= 32 {
