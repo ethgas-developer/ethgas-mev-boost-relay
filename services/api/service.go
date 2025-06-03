@@ -453,7 +453,7 @@ func (api *RelayAPI) updateHeaderCache() {
 		msIntoSlot := requestTime.UnixMilli() - int64(slotStartTimestamp*1000) //nolint:gosec
 
 		if msIntoSlot < int64(getExchangeFinalizedCutoffMs) {
-			api.log.Warnf("too early to get header, slot: %d", slot)
+			// api.log.Warnf("too early to get header, slot: %d", slot)
 
 			// Add sleep until msIntoSlot > -3
 			for msIntoSlot < -2500 {
