@@ -1592,7 +1592,7 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 	preconfCacheMutex.RLock()
 	cachedPreconfs, exists := preconfCache[slot]
 	preconfCacheMutex.RUnlock()
-	shouldProxy := (exists && !cachedPreconfs.IsSold) || proxyMode
+	shouldProxy := proxyMode
 	if exists {
 		log.Printf("cachedPreconfs.IsSold: %v", cachedPreconfs.IsSold)
 	}
