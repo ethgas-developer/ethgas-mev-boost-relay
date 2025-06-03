@@ -1715,7 +1715,7 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 	log.Info("builder id", builderResp.Builder)
-	log.Info("delay 1000ms to add more value")
+	log.Info("delay to add more value ms: ", delayGetHeader)
 	time.Sleep(time.Duration(delayGetHeader) * time.Millisecond)
 
 	// bid, err := api.redis.GetBestBid(slot, parentHashHex, proposerPubkeyHex)
