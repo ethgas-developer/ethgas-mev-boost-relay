@@ -19,5 +19,7 @@ var Migrations = migrate.MemoryMigrationSource{
 		Migration010PayloadAddBlobFields,
 		Migration011AddSimulatedBlockValue,
 		Migration012CreateGetPayload,
+		Migration013CreateBlockPublish,
+		Migration014AddLocation,
 	},
 }
