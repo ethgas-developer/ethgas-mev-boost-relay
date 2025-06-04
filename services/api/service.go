@@ -2398,9 +2398,9 @@ func (api *RelayAPI) checkSubmissionFeeRecipient(w http.ResponseWriter, log *log
 	api.proposerDutiesLock.RLock()
 	slotDuty := api.proposerDutiesMap[bidTrace.Slot]
 	api.proposerDutiesLock.RUnlock()
-	expectedFeeRecipient := ""
+	// expectedFeeRecipient := ""
 	if slotDuty != nil {
-		expectedFeeRecipient = slotDuty.Entry.Message.FeeRecipient.String()
+		// expectedFeeRecipient = slotDuty.Entry.Message.FeeRecipient.String()
 	} else {
 		log.Warn("could not find slot duty")
 		api.RespondError(w, http.StatusBadRequest, "could not find slot duty")
@@ -2408,28 +2408,28 @@ func (api *RelayAPI) checkSubmissionFeeRecipient(w http.ResponseWriter, log *log
 	}
 
 	//only fall back builder (our builder) need to check this.
-	if feeRecipient != "" {
-		expectedFeeRecipient = feeRecipient
-		if strings.EqualFold(builderPubkey, defaultBuilder) && !strings.EqualFold(expectedFeeRecipient, bidTrace.ProposerFeeRecipient.String()) {
-			//only fallback builder need to check fee recipient
-			log.WithFields(logrus.Fields{
-				"expectedFeeRecipient": expectedFeeRecipient,
-				"actualFeeRecipient":   bidTrace.ProposerFeeRecipient.String(),
-			}).Info("fee recipient does not match")
-			api.RespondError(w, http.StatusBadRequest, "fee recipient does not match")
-			return 0, false
-		}
-	} else {
-		if strings.EqualFold(builderPubkey, defaultBuilder) && !strings.EqualFold(expectedFeeRecipient, bidTrace.ProposerFeeRecipient.String()) && !strings.EqualFold(defaultFeeRecipient, bidTrace.ProposerFeeRecipient.String()) {
-			//only fallback builder need to check fee recipient
-			log.WithFields(logrus.Fields{
-				"expectedFeeRecipient": expectedFeeRecipient,
-				"actualFeeRecipient":   bidTrace.ProposerFeeRecipient.String(),
-			}).Info("fee recipient does not match")
-			api.RespondError(w, http.StatusBadRequest, "fee recipient does not match")
-			return 0, false
-		}
-	}
+	// if feeRecipient != "" {
+	// 	expectedFeeRecipient = feeRecipient
+	// 	if strings.EqualFold(builderPubkey, defaultBuilder) && !strings.EqualFold(expectedFeeRecipient, bidTrace.ProposerFeeRecipient.String()) {
+	// 		//only fallback builder need to check fee recipient
+	// 		log.WithFields(logrus.Fields{
+	// 			"expectedFeeRecipient": expectedFeeRecipient,
+	// 			"actualFeeRecipient":   bidTrace.ProposerFeeRecipient.String(),
+	// 		}).Info("fee recipient does not match")
+	// 		api.RespondError(w, http.StatusBadRequest, "fee recipient does not match")
+	// 		return 0, false
+	// 	}
+	// } else {
+	// 	if strings.EqualFold(builderPubkey, defaultBuilder) && !strings.EqualFold(expectedFeeRecipient, bidTrace.ProposerFeeRecipient.String()) && !strings.EqualFold(defaultFeeRecipient, bidTrace.ProposerFeeRecipient.String()) {
+	// 		//only fallback builder need to check fee recipient
+	// 		log.WithFields(logrus.Fields{
+	// 			"expectedFeeRecipient": expectedFeeRecipient,
+	// 			"actualFeeRecipient":   bidTrace.ProposerFeeRecipient.String(),
+	// 		}).Info("fee recipient does not match")
+	// 		api.RespondError(w, http.StatusBadRequest, "fee recipient does not match")
+	// 		return 0, false
+	// 	}
+	// }
 	return slotDuty.Entry.Message.GasLimit, true
 }
 
