@@ -66,6 +66,12 @@ type DatabaseService struct {
 	nstmtInsertBlockBuilderSubmission *sqlx.NamedStmt
 }
 
+func GetEnvStr(key, defaultValue string) string {
+	if value, ok := os.LookupEnv(key); ok {
+		return value
+	}
+	return defaultValue
+}
 func NewDatabaseService(dsn string) (*DatabaseService, error) {
 	db, err := sqlx.Connect("postgres", dsn)
 	if err != nil {
@@ -252,13 +258,14 @@ func (s *DatabaseService) SaveBuilderBlockSubmission(payload *common.VersionedSu
 		RedisUpdateDuration:  profile.RedisUpdate,
 		TotalDuration:        profile.Total,
 		OptimisticSubmission: optimisticSubmission,
+		Locate:               NewNullString(GetEnvStr("LOCATE_STRING", "N/A")),
 	}
 	err = s.nstmtInsertBlockBuilderSubmission.QueryRow(blockSubmissionEntry).Scan(&blockSubmissionEntry.ID)
 	return blockSubmissionEntry, err
 }
 
 func (s *DatabaseService) GetBlockSubmissionEntry(slot uint64, proposerPubkey, blockHash string) (entry *BuilderBlockSubmissionEntry, err error) {
-	query := `SELECT id, inserted_at, received_at, eligible_at, execution_payload_id, sim_success, sim_error, signature, slot, parent_hash, block_hash, builder_pubkey, proposer_pubkey, proposer_fee_recipient, gas_used, gas_limit, num_tx, value, epoch, block_number, decode_duration, prechecks_duration, simulation_duration, redis_update_duration, total_duration, optimistic_submission 
+	query := `SELECT id, inserted_at, received_at, eligible_at, execution_payload_id, sim_success, sim_error, signature, slot, parent_hash, block_hash, builder_pubkey, proposer_pubkey, proposer_fee_recipient, gas_used, gas_limit, num_tx, value, epoch, block_number, decode_duration, prechecks_duration, simulation_duration, redis_update_duration, total_duration, optimistic_submission, locate
 	FROM ` + vars.TableBuilderBlockSubmission + `
 	WHERE slot=$1 AND proposer_pubkey=$2 AND block_hash=$3
 	ORDER BY builder_pubkey ASC
@@ -316,11 +323,12 @@ func (s *DatabaseService) SaveDeliveredPayload(bidTrace *common.BidTraceV2WithBl
 		ExcessBlobGas: bidTrace.ExcessBlobGas,
 
 		PublishMs: publishMs,
+		Locate:    NewNullString(GetEnvStr("LOCATE_STRING", "N/A")),
 	}
 
 	query := `INSERT INTO ` + vars.TableDeliveredPayload + `
-		(signed_at, signed_blinded_beacon_block, slot, epoch, builder_pubkey, proposer_pubkey, proposer_fee_recipient, parent_hash, block_hash, block_number, gas_used, gas_limit, num_tx, value, num_blobs, blob_gas_used, excess_blob_gas, publish_ms) VALUES
-		(:signed_at, :signed_blinded_beacon_block, :slot, :epoch, :builder_pubkey, :proposer_pubkey, :proposer_fee_recipient, :parent_hash, :block_hash, :block_number, :gas_used, :gas_limit, :num_tx, :value, :num_blobs, :blob_gas_used, :excess_blob_gas, :publish_ms)
+		(signed_at, signed_blinded_beacon_block, slot, epoch, builder_pubkey, proposer_pubkey, proposer_fee_recipient, parent_hash, block_hash, block_number, gas_used, gas_limit, num_tx, value, num_blobs, blob_gas_used, excess_blob_gas, publish_ms, locate) VALUES
+		(:signed_at, :signed_blinded_beacon_block, :slot, :epoch, :builder_pubkey, :proposer_pubkey, :proposer_fee_recipient, :parent_hash, :block_hash, :block_number, :gas_used, :gas_limit, :num_tx, :value, :num_blobs, :blob_gas_used, :excess_blob_gas, :publish_ms, :locate)
 		ON CONFLICT DO NOTHING`
 	_, err = s.DB.NamedExec(query, deliveredPayloadEntry)
 	return err
@@ -337,7 +345,7 @@ func (s *DatabaseService) GetRecentDeliveredPayloads(queryArgs GetPayloadsFilter
 		"builder_pubkey":  queryArgs.BuilderPubkey,
 	}
 
-	fields := "id, inserted_at, signed_at, slot, epoch, builder_pubkey, proposer_pubkey, proposer_fee_recipient, parent_hash, block_hash, block_number, num_tx, value, num_blobs, blob_gas_used, excess_blob_gas, gas_used, gas_limit, publish_ms"
+	fields := "id, inserted_at, signed_at, slot, epoch, builder_pubkey, proposer_pubkey, proposer_fee_recipient, parent_hash, block_hash, block_number, num_tx, value, num_blobs, blob_gas_used, excess_blob_gas, gas_used, gas_limit, publish_ms, locate"
 
 	whereConds := []string{}
 	if queryArgs.Slot > 0 {
@@ -391,7 +399,7 @@ func (s *DatabaseService) GetRecentDeliveredPayloads(queryArgs GetPayloadsFilter
 }
 
 func (s *DatabaseService) GetDeliveredPayloads(idFirst, idLast uint64) (entries []*DeliveredPayloadEntry, err error) {
-	query := `SELECT id, inserted_at, signed_at, slot, epoch, builder_pubkey, proposer_pubkey, proposer_fee_recipient, parent_hash, block_hash, block_number, num_tx, value, num_blobs, blob_gas_used, excess_blob_gas, gas_used, gas_limit, publish_ms
+	query := `SELECT id, inserted_at, signed_at, slot, epoch, builder_pubkey, proposer_pubkey, proposer_fee_recipient, parent_hash, block_hash, block_number, num_tx, value, num_blobs, blob_gas_used, excess_blob_gas, gas_used, gas_limit, publish_ms, locate
 	FROM ` + vars.TableDeliveredPayload + `
 	WHERE id >= $1 AND id <= $2
 	ORDER BY slot ASC`
@@ -415,7 +423,7 @@ func (s *DatabaseService) GetBuilderSubmissions(filters GetBuilderSubmissionsFil
 		"builder_pubkey": filters.BuilderPubkey,
 	}
 
-	fields := "id, inserted_at, received_at, eligible_at, slot, epoch, builder_pubkey, proposer_pubkey, proposer_fee_recipient, parent_hash, block_hash, block_number, num_tx, value, gas_used, gas_limit, optimistic_submission, block_value"
+	fields := "id, inserted_at, received_at, eligible_at, slot, epoch, builder_pubkey, proposer_pubkey, proposer_fee_recipient, parent_hash, block_hash, block_number, num_tx, value, gas_used, gas_limit, optimistic_submission, block_value, locate"
 	limit := "LIMIT :limit"
 
 	whereConds := []string{
@@ -463,7 +471,7 @@ func (s *DatabaseService) GetBuilderSubmissions(filters GetBuilderSubmissionsFil
 }
 
 func (s *DatabaseService) GetBuilderSubmissionsBySlots(slotFrom, slotTo uint64) (entries []*BuilderBlockSubmissionEntry, err error) {
-	query := `SELECT id, inserted_at, received_at, eligible_at, slot, epoch, builder_pubkey, proposer_pubkey, proposer_fee_recipient, parent_hash, block_hash, block_number, num_tx, value, gas_used, gas_limit
+	query := `SELECT id, inserted_at, received_at, eligible_at, slot, epoch, builder_pubkey, proposer_pubkey, proposer_fee_recipient, parent_hash, block_hash, block_number, num_tx, value, gas_used, gas_limit, locate
 	FROM ` + vars.TableBuilderBlockSubmission + `
 	WHERE sim_success = true AND slot >= $1 AND slot <= $2
 	ORDER BY slot ASC, inserted_at ASC`
@@ -620,7 +628,7 @@ func (s *DatabaseService) GetBuilderDemotion(trace *common.BidTraceV2WithBlobFie
 }
 
 func (s *DatabaseService) GetTooLateGetPayload(slot uint64) (entries []*TooLateGetPayloadEntry, err error) {
-	query := `SELECT id, inserted_at, slot, slot_start_timestamp, request_timestamp, decode_timestamp, proposer_pubkey, block_hash, ms_into_slot FROM ` + vars.TableTooLateGetPayload + ` WHERE slot = $1`
+	query := `SELECT id, inserted_at, slot, slot_start_timestamp, request_timestamp, decode_timestamp, proposer_pubkey, block_hash, ms_into_slot, locate FROM ` + vars.TableTooLateGetPayload + ` WHERE slot = $1`
 	err = s.DB.Select(&entries, query, slot)
 	return entries, err
 }
@@ -634,11 +642,12 @@ func (s *DatabaseService) InsertTooLateGetPayload(slot uint64, proposerPubkey, b
 		ProposerPubkey:     proposerPubkey,
 		BlockHash:          blockHash,
 		MsIntoSlot:         msIntoSlot,
+		Locate:             NewNullString(GetEnvStr("LOCATE_STRING", "N/A")),
 	}
 
 	query := `INSERT INTO ` + vars.TableTooLateGetPayload + `
-		(slot, slot_start_timestamp, request_timestamp, decode_timestamp, proposer_pubkey, block_hash, ms_into_slot) VALUES
-		(:slot, :slot_start_timestamp, :request_timestamp, :decode_timestamp, :proposer_pubkey, :block_hash, :ms_into_slot)
+		(slot, slot_start_timestamp, request_timestamp, decode_timestamp, proposer_pubkey, block_hash, ms_into_slot, locate) VALUES
+		(:slot, :slot_start_timestamp, :request_timestamp, :decode_timestamp, :proposer_pubkey, :block_hash, :ms_into_slot, :locate)
 		ON CONFLICT (slot, proposer_pubkey, block_hash) DO NOTHING;`
 	_, err := s.DB.NamedExec(query, entry)
 	return err
@@ -653,11 +662,12 @@ func (s *DatabaseService) InsertGetPayload(slot uint64, proposerPubkey, blockHas
 		ProposerPubkey:     proposerPubkey,
 		BlockHash:          blockHash,
 		MsIntoSlot:         msIntoSlot,
+		Locate:             NewNullString(GetEnvStr("LOCATE_STRING", "N/A")),
 	}
 
 	query := `INSERT INTO ` + vars.TableGetPayload + `
-		(slot, slot_start_timestamp, request_timestamp, decode_timestamp, proposer_pubkey, block_hash, ms_into_slot) VALUES
-		(:slot, :slot_start_timestamp, :request_timestamp, :decode_timestamp, :proposer_pubkey, :block_hash, :ms_into_slot)
+		(slot, slot_start_timestamp, request_timestamp, decode_timestamp, proposer_pubkey, block_hash, ms_into_slot, locate) VALUES
+		(:slot, :slot_start_timestamp, :request_timestamp, :decode_timestamp, :proposer_pubkey, :block_hash, :ms_into_slot, :locate)
 		ON CONFLICT (slot, proposer_pubkey, block_hash) DO NOTHING;`
 	_, err := s.DB.NamedExec(query, entry)
 	return err

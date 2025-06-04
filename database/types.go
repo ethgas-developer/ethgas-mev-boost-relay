@@ -177,6 +177,8 @@ type BuilderBlockSubmissionEntry struct {
 	RedisUpdateDuration  uint64 `db:"redis_update_duration"`
 	TotalDuration        uint64 `db:"total_duration"`
 	OptimisticSubmission bool   `db:"optimistic_submission"`
+
+	Locate sql.NullString `db:"locate"`
 }
 
 type DeliveredPayloadEntry struct {
@@ -207,7 +209,8 @@ type DeliveredPayloadEntry struct {
 	BlobGasUsed   uint64 `db:"blob_gas_used"`
 	ExcessBlobGas uint64 `db:"excess_blob_gas"`
 
-	PublishMs uint64 `db:"publish_ms"`
+	PublishMs uint64         `db:"publish_ms"`
+	Locate    sql.NullString `db:"locate"`
 }
 
 type BlockBuilderEntry struct {
@@ -266,7 +269,8 @@ type TooLateGetPayloadEntry struct {
 	RequestTimestamp   uint64 `db:"request_timestamp"`
 	DecodeTimestamp    uint64 `db:"decode_timestamp"`
 
-	ProposerPubkey string `db:"proposer_pubkey"`
-	BlockHash      string `db:"block_hash"`
-	MsIntoSlot     uint64 `db:"ms_into_slot"`
+	ProposerPubkey string         `db:"proposer_pubkey"`
+	BlockHash      string         `db:"block_hash"`
+	MsIntoSlot     uint64         `db:"ms_into_slot"`
+	Locate         sql.NullString `db:"locate"`
 }
