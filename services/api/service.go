@@ -2769,7 +2769,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		api.log.Info("handleSubmitNewBlock sent too early, wait for exchange finalized")
 		isValidPreconf = "submission too early, before exchange finalization cutoff"
 	} else if msIntoSlot >= int64(getExchangeFinalizedCutoffMs) {
-		if skipPreconfCheck {
+		if !skipPreconfCheck {
 			// Cache management code
 			preconfCacheMutex.Lock()
 			if submission.BidTrace.Slot != currentSlot {
