@@ -707,6 +707,7 @@ func (s *DatabaseService) InsertBlockPublish(slot int64, beaconIP string, slotSt
 		(slot, beacon_ip, slot_start_timestamp, publish_timestamp, finish_timestamp, block_hash, ms_into_slot, locate) VALUES
 		(:slot, :beacon_ip, :slot_start_timestamp, :publish_timestamp, :finish_timestamp, :block_hash, :ms_into_slot, :locate)
 		ON CONFLICT (slot, block_hash, locate, beacon_ip) DO NOTHING;`
+
 	_, err := s.DB.NamedExec(query, entry)
 	return err
 }

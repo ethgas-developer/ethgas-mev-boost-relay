@@ -305,15 +305,17 @@ func (c *ProdBeaconInstance) PublishBlock(block *common.VersionedSignedProposal,
 	publishingStartTime := time.Now().UTC()
 
 	encodeDurationMs := publishingStartTime.Sub(encodeStartTime).Milliseconds()
-	msIntoSlot := encodeDurationMs - int64(slotStartTimestamp*1000) //nolint:gosec
+	msIntoSlot := publishingStartTime.UnixMilli() - int64(slotStartTimestamp)*1000 //nolint:gosec
 
 	code, err = fetchBeacon(http.MethodPost, uri, payloadBytes, nil, c.publishingClient, headers, useSSZ)
 	publishDurationMs := time.Now().UTC().Sub(publishingStartTime).Milliseconds()
 	log.WithFields(logrus.Fields{
-		"slot":              slot,
-		"encodeDurationMs":  encodeDurationMs,
-		"publishDurationMs": publishDurationMs,
-		"payloadBytes":      len(payloadBytes),
+		"slot":               slot,
+		"encodeDurationMs":   encodeDurationMs,
+		"publishDurationMs":  publishDurationMs,
+		"payloadBytes":       len(payloadBytes),
+		"slotStartTimestamp": slotStartTimestamp,
+		"genesisTime":        c.genesisTime,
 	}).Info("finished publish block request")
 	finishingStartTime := time.Now().UTC()
 
