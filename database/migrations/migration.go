@@ -21,5 +21,6 @@ var Migrations = migrate.MemoryMigrationSource{
 		Migration012CreateGetPayload,
 		Migration013CreateBlockPublish,
 		Migration014AddLocation,
+		Migration015CreateBlockPublish,
 	},
 }

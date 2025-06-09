@@ -12,6 +12,13 @@ var Migration014AddLocation = &migrate.Migration{
 		ALTER TABLE ` + vars.TableGetPayload + ` ADD locate varchar(50);
 		ALTER TABLE ` + vars.TableTooLateGetPayload + ` ADD locate varchar(50);
 		ALTER TABLE ` + vars.TableDeliveredPayload + ` ADD locate varchar(50);
+
+		ALTER TABLE  ` + vars.TableDeliveredPayload + `
+		DROP CONSTRAINT ` + vars.TableDeliveredPayload + `_slot_proposer_pubkey_block_hash_key;
+
+		ALTER TABLE ` + vars.TableDeliveredPayload + `
+		ADD CONSTRAINT ` + vars.TableDeliveredPayload + `_slot_proposer_pubkey_block_hash_locate_key
+		UNIQUE (slot, proposer_pubkey, block_hash, locate);
 	`},
 	Down: []string{},
 

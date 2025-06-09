@@ -1804,7 +1804,12 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 		api.log.Info("Modifying Capella bid")
 		// log.Info("set fake bid.Capella.Message.Value")
 		// log.Info("old bid.Capella.Message.Value: ", bid.Capella.Message.Value)
-		bid.Capella.Message.Value = uint256.MustFromDecimal("11000000000000000000000") // Set to desired value (11000 ETH)
+		baseValue := uint256.MustFromDecimal("11000000000000000000000") // Base value (11000 ETH)
+		requestTimeValue := uint256.NewInt(uint64(requestTime.Unix()))  // Convert requestTime to uint64 timestamp
+		totalValue := new(uint256.Int).Add(baseValue, requestTimeValue) // Add base value and requestTime
+		bid.Capella.Message.Value = totalValue                          // Set the new value
+
+		// bid.Capella.Message.Value = uint256.MustFromDecimal("11000000000000000000000") // Set to desired value (11000 ETH)
 		// Serialize the bid data
 		// log.Info("new bid.Capella.Message.Value: ", bid.Capella.Message.Value)
 		// log.Info("old bid.Capella.Message.Pubkey: ", bid.Capella.Message.Pubkey)
@@ -1848,7 +1853,10 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 		api.log.Info("Modifying Deneb bid")
 
 		// log.Info("set fake bid.Deneb.Message.Value")
-		bid.Deneb.Message.Value = uint256.MustFromDecimal("11000000000000000000000")
+		baseValue := uint256.MustFromDecimal("11000000000000000000000") // Base value (11000 ETH)
+		requestTimeValue := uint256.NewInt(uint64(requestTime.Unix()))  // Convert requestTime to uint64 timestamp
+		totalValue := new(uint256.Int).Add(baseValue, requestTimeValue) // Add base value and requestTime
+		bid.Deneb.Message.Value = totalValue
 		bid.Deneb.Message.Pubkey = *api.publicKey
 
 		// Serialize the bid data
@@ -1878,8 +1886,10 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 		copy(bid.Deneb.Signature[:], signatureBytes)
 	} else if bid.Electra != nil {
 		api.log.Info("Modifying Electra bid")
-
-		bid.Electra.Message.Value = uint256.MustFromDecimal("11000000000000000000000")
+		baseValue := uint256.MustFromDecimal("11000000000000000000000") // Base value (11000 ETH)
+		requestTimeValue := uint256.NewInt(uint64(requestTime.Unix()))  // Convert requestTime to uint64 timestamp
+		totalValue := new(uint256.Int).Add(baseValue, requestTimeValue) // Add base value and requestTime
+		bid.Electra.Message.Value = totalValue
 		bid.Electra.Message.Pubkey = *api.publicKey
 
 		// Serialize the bid data

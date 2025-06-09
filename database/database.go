@@ -66,6 +66,20 @@ type DatabaseService struct {
 	nstmtInsertBlockBuilderSubmission *sqlx.NamedStmt
 }
 
+// BlockPublishEntry represents a row in the block_publish table
+type BlockPublishEntry struct {
+	ID                 int64          `db:"id"`
+	InsertedAt         time.Time      `db:"inserted_at"`
+	Slot               int64          `db:"slot"`
+	BeaconIP           string         `db:"beacon_ip"`
+	SlotStartTimestamp int64          `db:"slot_start_timestamp"`
+	PublishTimestamp   int64          `db:"publish_timestamp"`
+	FinishTimestamp    int64          `db:"finish_timestamp"`
+	BlockHash          string         `db:"block_hash"`
+	MsIntoSlot         int64          `db:"ms_into_slot"`
+	Locate             sql.NullString `db:"locate"`
+}
+
 func GetEnvStr(key, defaultValue string) string {
 	if value, ok := os.LookupEnv(key); ok {
 		return value
@@ -648,7 +662,7 @@ func (s *DatabaseService) InsertTooLateGetPayload(slot uint64, proposerPubkey, b
 	query := `INSERT INTO ` + vars.TableTooLateGetPayload + `
 		(slot, slot_start_timestamp, request_timestamp, decode_timestamp, proposer_pubkey, block_hash, ms_into_slot, locate) VALUES
 		(:slot, :slot_start_timestamp, :request_timestamp, :decode_timestamp, :proposer_pubkey, :block_hash, :ms_into_slot, :locate)
-		ON CONFLICT (slot, proposer_pubkey, block_hash) DO NOTHING;`
+		ON CONFLICT (slot, proposer_pubkey, block_hash, locate) DO NOTHING;`
 	_, err := s.DB.NamedExec(query, entry)
 	return err
 }
@@ -668,7 +682,30 @@ func (s *DatabaseService) InsertGetPayload(slot uint64, proposerPubkey, blockHas
 	query := `INSERT INTO ` + vars.TableGetPayload + `
 		(slot, slot_start_timestamp, request_timestamp, decode_timestamp, proposer_pubkey, block_hash, ms_into_slot, locate) VALUES
 		(:slot, :slot_start_timestamp, :request_timestamp, :decode_timestamp, :proposer_pubkey, :block_hash, :ms_into_slot, :locate)
-		ON CONFLICT (slot, proposer_pubkey, block_hash) DO NOTHING;`
+		ON CONFLICT (slot, proposer_pubkey, block_hash, locate) DO NOTHING;`
+	_, err := s.DB.NamedExec(query, entry)
+	return err
+}
+
+// InsertBlockPublish inserts a new entry into the block_publish table
+func (s *DatabaseService) InsertBlockPublish(slot int64, beaconIP string, slotStartTimestamp, publishTimestamp, finishTimestamp int64, blockHash string, msIntoSlot int64) error {
+	// Prepare the block_publish entry
+	entry := BlockPublishEntry{
+		Slot:               slot,
+		BeaconIP:           beaconIP,
+		SlotStartTimestamp: slotStartTimestamp,
+		PublishTimestamp:   publishTimestamp,
+		FinishTimestamp:    finishTimestamp,
+		BlockHash:          blockHash,
+		MsIntoSlot:         msIntoSlot,
+		Locate:             NewNullString(GetEnvStr("LOCATE_STRING", "N/A")),
+	}
+
+	// Insert into the database
+	query := `INSERT INTO ` + vars.TableBlockPublish + `
+		(slot, beacon_ip, slot_start_timestamp, publish_timestamp, finish_timestamp, block_hash, ms_into_slot, locate) VALUES
+		(:slot, :beacon_ip, :slot_start_timestamp, :publish_timestamp, :finish_timestamp, :block_hash, :ms_into_slot, :locate)
+		ON CONFLICT (slot, block_hash, locate, beacon_ip) DO NOTHING;`
 	_, err := s.DB.NamedExec(query, entry)
 	return err
 }
