@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"bitbucket.org/infinity-exchange/mev-boost-relay/common"
+	"bitbucket.org/infinity-exchange/mev-boost-relay/database"
 	"github.com/attestantio/go-eth2-client/spec/capella"
 	"github.com/r3labs/sse/v2"
 	"github.com/sirupsen/logrus"
@@ -18,6 +19,7 @@ type ProdBeaconInstance struct {
 	log              *logrus.Entry
 	beaconURI        string
 	beaconPublishURI string
+	db               database.IDatabaseService
 
 	// feature flags
 	ffUseV1PublishBlockEndpoint  bool
@@ -34,7 +36,7 @@ func NewProdBeaconInstance(log *logrus.Entry, beaconURI, beaconPublishURI string
 		"beaconPublishURI": beaconPublishURI,
 	})
 
-	client := &ProdBeaconInstance{_log, beaconURI, beaconPublishURI, false, false, &http.Client{}}
+	client := &ProdBeaconInstance{_log, beaconURI, beaconPublishURI, nil, false, false, &http.Client{}}
 
 	// feature flags
 	if os.Getenv("USE_V1_PUBLISH_BLOCK_ENDPOINT") != "" {
@@ -286,7 +288,10 @@ func (c *ProdBeaconInstance) PublishBlock(block *common.VersionedSignedProposal,
 	if err != nil {
 		return 0, fmt.Errorf("could not marshal request: %w", err)
 	}
+	slotStartTimestamp := api.genesisInfo.Data.GenesisTime + (uint64(slot) * common.SecondsPerSlot)
 	publishingStartTime := time.Now().UTC()
+	msIntoSlot := encodeDurationMs.UnixMilli() - int64(slotStartTimestamp*1000) //nolint:gosec
+
 	encodeDurationMs := publishingStartTime.Sub(encodeStartTime).Milliseconds()
 	code, err = fetchBeacon(http.MethodPost, uri, payloadBytes, nil, c.publishingClient, headers, useSSZ)
 	publishDurationMs := time.Now().UTC().Sub(publishingStartTime).Milliseconds()
@@ -296,6 +301,27 @@ func (c *ProdBeaconInstance) PublishBlock(block *common.VersionedSignedProposal,
 		"publishDurationMs": publishDurationMs,
 		"payloadBytes":      len(payloadBytes),
 	}).Info("finished publish block request")
+	finishingStartTime := time.Now().UTC()
+
+	// Asynchronously insert into the block_publish table
+	go func() {
+		if c.db == nil {
+			log.Error("database service is not set, cannot insert block publish entry")
+			return
+		}
+		if err := c.db.InsertBlockPublish(
+			uint64(slot),                    // slot
+			c.beaconPublishURI,              // beaconIP
+			slotStartTimestamp.UnixMilli(),  // slotStartTimestamp
+			publishingStartTime.UnixMilli(), // publishTimestamp
+			finishingStartTime.UnixMilli(),  // finishTimestamp
+			block.ExecutionBlockHash(),      // blockHash
+			msIntoSlot,                      // msIntoSlot
+		); err != nil {
+			log.WithError(err).Error("failed to insert block publish entry into db")
+		}
+	}()
+
 	return code, err
 }
 
@@ -376,4 +402,16 @@ func (c *ProdBeaconInstance) GetWithdrawals(slot uint64) (withdrawalsResp *GetWi
 	resp := new(GetWithdrawalsResponse)
 	_, err = fetchBeacon(http.MethodGet, uri, nil, resp, nil, http.Header{}, false)
 	return resp, err
+}
+
+func GetEnvStr(key, defaultValue string) string {
+	if value, ok := os.LookupEnv(key); ok {
+		return value
+	}
+	return defaultValue
+}
+
+// SetDB sets the database service for the ProdBeaconInstance
+func (c *ProdBeaconInstance) SetDB(db database.IDatabaseService) {
+	c.db = db
 }

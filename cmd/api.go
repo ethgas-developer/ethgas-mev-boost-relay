@@ -148,6 +148,13 @@ var apiCmd = &cobra.Command{
 			log.WithError(err).Fatalf("Failed to connect to Postgres database at %s%s", dbURL.Host, dbURL.Path)
 		}
 
+		// Set the database service for each ProdBeaconInstance
+		for _, instance := range beaconInstances {
+			if prodInstance, ok := instance.(*beaconclient.ProdBeaconInstance); ok {
+				prodInstance.SetDB(db) // Assuming `db` is available in this scope
+			}
+		}
+
 		log.Info("Setting up datastore...")
 		ds, err := datastore.NewDatastore(redis, mem, db)
 		if err != nil {
