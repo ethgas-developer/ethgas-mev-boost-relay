@@ -57,6 +57,7 @@ type IDatabaseService interface {
 	InsertTooLateGetPayload(slot uint64, proposerPubkey, blockHash string, slotStart, requestTime, decodeTime, msIntoSlot uint64) error
 
 	InsertGetPayload(slot uint64, proposerPubkey, blockHash string, slotStart, requestTime, decodeTime, msIntoSlot uint64) error
+	InsertBlockPublish(slot int64, beaconIP string, slotStartTimestamp, publishTimestamp, finishTimestamp int64, blockHash string, msIntoSlot int64) error
 }
 
 type DatabaseService struct {

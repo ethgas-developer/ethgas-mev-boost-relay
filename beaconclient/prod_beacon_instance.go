@@ -20,6 +20,7 @@ type ProdBeaconInstance struct {
 	beaconURI        string
 	beaconPublishURI string
 	db               database.IDatabaseService
+	genesisTime      uint64
 
 	// feature flags
 	ffUseV1PublishBlockEndpoint  bool
@@ -36,7 +37,19 @@ func NewProdBeaconInstance(log *logrus.Entry, beaconURI, beaconPublishURI string
 		"beaconPublishURI": beaconPublishURI,
 	})
 
-	client := &ProdBeaconInstance{_log, beaconURI, beaconPublishURI, nil, false, false, &http.Client{}}
+	client := &ProdBeaconInstance{
+		log:              _log,
+		beaconURI:        beaconURI,
+		beaconPublishURI: beaconPublishURI,
+		db:               nil,
+		publishingClient: &http.Client{},
+	}
+
+	// Fetch genesis info and store genesisTime
+	genesisResp, err := client.GetGenesis()
+	if err != nil {
+	}
+	client.genesisTime = genesisResp.Data.GenesisTime
 
 	// feature flags
 	if os.Getenv("USE_V1_PUBLISH_BLOCK_ENDPOINT") != "" {
@@ -288,11 +301,12 @@ func (c *ProdBeaconInstance) PublishBlock(block *common.VersionedSignedProposal,
 	if err != nil {
 		return 0, fmt.Errorf("could not marshal request: %w", err)
 	}
-	slotStartTimestamp := api.genesisInfo.Data.GenesisTime + (uint64(slot) * common.SecondsPerSlot)
+	slotStartTimestamp := c.genesisTime + (uint64(slot) * common.SecondsPerSlot)
 	publishingStartTime := time.Now().UTC()
-	msIntoSlot := encodeDurationMs.UnixMilli() - int64(slotStartTimestamp*1000) //nolint:gosec
 
 	encodeDurationMs := publishingStartTime.Sub(encodeStartTime).Milliseconds()
+	msIntoSlot := encodeDurationMs - int64(slotStartTimestamp*1000) //nolint:gosec
+
 	code, err = fetchBeacon(http.MethodPost, uri, payloadBytes, nil, c.publishingClient, headers, useSSZ)
 	publishDurationMs := time.Now().UTC().Sub(publishingStartTime).Milliseconds()
 	log.WithFields(logrus.Fields{
@@ -309,13 +323,18 @@ func (c *ProdBeaconInstance) PublishBlock(block *common.VersionedSignedProposal,
 			log.Error("database service is not set, cannot insert block publish entry")
 			return
 		}
+		blockHash, err := block.ExecutionBlockHash()
+		if err != nil {
+			log.WithError(err).Warn("failed to get block hash")
+		}
+
 		if err := c.db.InsertBlockPublish(
-			uint64(slot),                    // slot
+			int64(slot),                     // slot
 			c.beaconPublishURI,              // beaconIP
-			slotStartTimestamp.UnixMilli(),  // slotStartTimestamp
+			int64(slotStartTimestamp),       // slotStartTimestamp
 			publishingStartTime.UnixMilli(), // publishTimestamp
 			finishingStartTime.UnixMilli(),  // finishTimestamp
-			block.ExecutionBlockHash(),      // blockHash
+			blockHash.String(),              // blockHash
 			msIntoSlot,                      // msIntoSlot
 		); err != nil {
 			log.WithError(err).Error("failed to insert block publish entry into db")
