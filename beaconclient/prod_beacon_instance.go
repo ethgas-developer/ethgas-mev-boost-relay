@@ -328,6 +328,14 @@ func (c *ProdBeaconInstance) PublishBlock(block *common.VersionedSignedProposal,
 		blockHash, err := block.ExecutionBlockHash()
 		if err != nil {
 			log.WithError(err).Warn("failed to get block hash")
+			return
+		}
+
+		if c.genesisTime == 0 {
+			log.WithFields(logrus.Fields{
+				"beaconPublishURI": c.beaconPublishURI,
+			}).Error("Beacon client is not valid: invalid URI or connection failed")
+			return
 		}
 
 		if err := c.db.InsertBlockPublish(
