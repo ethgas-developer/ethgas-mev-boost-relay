@@ -506,6 +506,7 @@ func (r *RedisCache) SaveBuilderBid(ctx context.Context, pipeliner redis.Pipelin
 
 	// If last value is higher than this bid, no need to insert
 	if v.Cmp(valueBigInt) == 1 {
+		fmt.Printf("Skipping bid insertion: last value (%s) is higher than current bid value (%s)\n", v.String(), valueBigInt.String())
 		return
 	}
 	// save the actual bid
