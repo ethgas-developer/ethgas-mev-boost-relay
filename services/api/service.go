@@ -1805,8 +1805,8 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 		// log.Info("set fake bid.Capella.Message.Value")
 		// log.Info("old bid.Capella.Message.Value: ", bid.Capella.Message.Value)
 		baseValue := uint256.MustFromDecimal("11000000000000000000000") // Base value (11000 ETH)
-		requestTimeValue := uint256.NewInt(uint64(requestTime.Unix()))  // Convert requestTime to uint64 timestamp
-		totalValue := new(uint256.Int).Add(baseValue, requestTimeValue) // Add base value and requestTime
+		acualValue := bid.Capella.Message.Value
+		totalValue := new(uint256.Int).Add(baseValue, acualValue) // Add base value and requestTime
 		bid.Capella.Message.Value = totalValue                          // Set the new value
 
 		// bid.Capella.Message.Value = uint256.MustFromDecimal("11000000000000000000000") // Set to desired value (11000 ETH)
@@ -1854,8 +1854,8 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 
 		// log.Info("set fake bid.Deneb.Message.Value")
 		baseValue := uint256.MustFromDecimal("11000000000000000000000") // Base value (11000 ETH)
-		requestTimeValue := uint256.NewInt(uint64(requestTime.Unix()))  // Convert requestTime to uint64 timestamp
-		totalValue := new(uint256.Int).Add(baseValue, requestTimeValue) // Add base value and requestTime
+		acualValue := bid.Deneb.Message.Value 
+		totalValue := new(uint256.Int).Add(baseValue, acualValue) // Add base value and requestTime
 		bid.Deneb.Message.Value = totalValue
 		bid.Deneb.Message.Pubkey = *api.publicKey
 
@@ -1887,8 +1887,8 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 	} else if bid.Electra != nil {
 		api.log.Info("Modifying Electra bid")
 		baseValue := uint256.MustFromDecimal("11000000000000000000000") // Base value (11000 ETH)
-		requestTimeValue := uint256.NewInt(uint64(requestTime.Unix()))  // Convert requestTime to uint64 timestamp
-		totalValue := new(uint256.Int).Add(baseValue, requestTimeValue) // Add base value and requestTime
+		acualValue := bid.Electra.Message.Value
+		totalValue := new(uint256.Int).Add(baseValue, acualValue) // Add base value and requestTime
 		bid.Electra.Message.Value = totalValue
 		bid.Electra.Message.Pubkey = *api.publicKey
 
