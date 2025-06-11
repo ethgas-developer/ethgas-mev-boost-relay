@@ -498,12 +498,14 @@ func (r *RedisCache) SaveBuilderBid(ctx context.Context, pipeliner redis.Pipelin
 	if err != nil {
 		return err
 	}
-	v, err = GetBuilderLatestValue(slot, parentHash, proposerPubkey, builderPubkey)
+	v, err := r.GetBuilderLatestValue(slot, parentHash, proposerPubkey, builderPubkey)
 	if err != nil {
 		return err
 	}
+	valueBigInt := value.ToBig()
+
 	// If last value is higher than this bid, no need to insert
-	if v.Cmp(value) == 1 {
+	if v.Cmp(valueBigInt) == 1 {
 		return
 	}
 	// save the actual bid
