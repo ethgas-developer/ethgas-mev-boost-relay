@@ -666,11 +666,11 @@ func (r *RedisCache) SaveBidAndUpdateTopBid(ctx context.Context, pipeliner redis
 	prevTime = nextTime
 
 	// is ok to below floor
-	// if isCancellationEnabled || !isBidAboveFloor {
-	// 	fmt.Printf("failed at isCancellationEnabled || !isBidAboveFloor ")
+	if isCancellationEnabled || !isBidAboveFloor {
+		fmt.Printf("failed at isCancellationEnabled || !isBidAboveFloor ")
 
-	// 	return state, nil
-	// }
+		return state, nil
+	}
 
 	// Non-cancellable bid above floor should set new floor
 	keyBidSource := r.keyLatestBidByBuilder(submission.BidTrace.Slot, submission.BidTrace.ParentHash.String(), submission.BidTrace.ProposerPubkey.String(), submission.BidTrace.BuilderPubkey.String())

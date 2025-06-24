@@ -108,6 +108,7 @@ var (
 	// various timings
 	timeoutGetPayloadRetryMs     = cli.GetEnvInt("GETPAYLOAD_RETRY_TIMEOUT_MS", 100)
 	getExchangeFinalizedCutoffMs = cli.GetEnvInt("GETHEADER_EXCHANGE_FINALIZED_CUTOFF_MS", -2000)
+	getExchangeMarketCloseCutoffMs = cli.GetEnvInt("GETHEADER_EXCHANGE_MARKET_CLOSE_CUTOFF_MS", -4000)
 	getTargetedBuilderCutoffMs   = cli.GetEnvInt("GETHEADER_TARGETED_BUILDER_REQUEST_CUTOFF_MS", 0)
 	getHeaderRequestCutoffMs     = cli.GetEnvInt("GETHEADER_REQUEST_CUTOFF_MS", 3000)
 	getPayloadRequestCutoffMs    = cli.GetEnvInt("GETPAYLOAD_REQUEST_CUTOFF_MS", 4000)
@@ -252,8 +253,14 @@ type PreconfTx struct {
 // }
 
 type BuilderResponse struct {
-	Builder         string `json:"builder"`
+	Slot           uint64   `json:"slot"`
+	Builders         []string `json:"builders"`
 	FallbackBuilder string `json:"fallbackBuilder"`
+}
+
+type cacheBuilder struct {
+    value      *BuilderResponse
+    expiration time.Time
 }
 
 // RelayAPIOpts contains the options for a relay
@@ -372,6 +379,7 @@ type RelayAPI struct {
 	optimisticBlocksWG sync.WaitGroup
 	// Cache for builder statuses and collaterals.
 	blockBuildersCache map[string]*blockBuilderCacheEntry
+	builderCache sync.Map // Key: slot (uint64), Value: *cacheEntry
 }
 
 // Add a cache map and a mutex for thread safety
@@ -676,6 +684,7 @@ func NewRelayAPI(opts RelayAPIOpts) (api *RelayAPI, err error) {
 
 	// Start the header cache cron job
 	api.startHeaderCacheCron()
+    api.startCacheCleaner()
 
 	return api, nil
 }
@@ -1573,11 +1582,6 @@ func (api *RelayAPI) handleRegisterValidator(w http.ResponseWriter, req *http.Re
 }
 
 func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
-	reqClone, err := deepCloneRequest(req)
-	if err != nil {
-		api.RespondError(w, http.StatusInternalServerError, "failed to clone request")
-		return
-	}
 	vars := mux.Vars(req)
 	slotStr := vars["slot"]
 	parentHashHex := vars["parent_hash"]
@@ -1706,20 +1710,22 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	builderResp, err := FetchBuilderPubKey(exchangeAPIURL, slot)
-	if err != nil {
-		log.WithError(err).Error("failed to get builder id from API")
-		builderResp = &BuilderResponse{
-			Builder:         defaultBuilder,
-			FallbackBuilder: defaultBuilder,
-		}
-	}
-	log.Info("builder id", builderResp.Builder)
+	//Builder filter at submit block
+	// builderResp, err := FetchBuilderPubKey(exchangeAPIURL, slot)
+	// if err != nil {
+	// 	log.WithError(err).Error("failed to get builder id from API")
+	// 	builderResp = &BuilderResponse{
+	// 		Slot: slot,
+	// 		Builders: []string{defaultBuilder}, 
+	// 		FallbackBuilder: defaultBuilder,
+	// 	}
+	// }
+	// log.Info("builder id", builderResp.Builder)
 	log.Info("delay to add more value ms: ", delayGetHeader)
 	time.Sleep(time.Duration(delayGetHeader) * time.Millisecond)
 
-	// bid, err := api.redis.GetBestBid(slot, parentHashHex, proposerPubkeyHex)
-	bid, err := api.redis.GetBuilderLatestBid(slot, parentHashHex, proposerPubkeyHex, builderResp.Builder)
+	bid, err := api.redis.GetBestBid(slot, parentHashHex, proposerPubkeyHex)
+	// bid, err := api.redis.GetBuilderLatestBid(slot, parentHashHex, proposerPubkeyHex, builderResp.Builder)
 
 	if err != nil {
 		log.WithError(err).Error("could not get bid")
@@ -1727,36 +1733,99 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	isBuilderValidPreconf, err := api.redis.GetIsValidPreconf(slot, parentHashHex, proposerPubkeyHex, builderResp.Builder)
-	log.Println("get header | is builder valid preconf: ", isBuilderValidPreconf)
-	if err != nil {
-		log.WithError(err).Error("[builder] could not GetIsValidPreconf")
-		api.RespondError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	// 1. use builder bid when isBuilderValidPreconf is true
-	if !isBuilderValidPreconf {
-		isFallbackBuilderValidPreconf, err := api.redis.GetIsValidPreconf(slot, parentHashHex, proposerPubkeyHex, builderResp.FallbackBuilder)
-		log.Println("get header | is fallback builder valid preconf: ", isFallbackBuilderValidPreconf)
-		if err != nil {
-			log.WithError(err).Error("[fallback builder] could not GetIsValidPreconf")
-			api.RespondError(w, http.StatusBadRequest, err.Error())
-			return
-		}
+	// isBuilderValidPreconf, err := api.redis.GetIsValidPreconf(slot, parentHashHex, proposerPubkeyHex, builderResp.Builder)
+	// log.Println("get header | is builder valid preconf: ", isBuilderValidPreconf)
+	// if err != nil {
+	// 	log.WithError(err).Error("[builder] could not GetIsValidPreconf")
+	// 	api.RespondError(w, http.StatusBadRequest, err.Error())
+	// 	return
+	// }
+	// // 1. use builder bid when isBuilderValidPreconf is true
+	// if !isBuilderValidPreconf {
+	// 	isFallbackBuilderValidPreconf, err := api.redis.GetIsValidPreconf(slot, parentHashHex, proposerPubkeyHex, builderResp.FallbackBuilder)
+	// 	log.Println("get header | is fallback builder valid preconf: ", isFallbackBuilderValidPreconf)
+	// 	if err != nil {
+	// 		log.WithError(err).Error("[fallback builder] could not GetIsValidPreconf")
+	// 		api.RespondError(w, http.StatusBadRequest, err.Error())
+	// 		return
+	// 	}
 
-		fallbackBid, err := api.redis.GetBuilderLatestBid(slot, parentHashHex, proposerPubkeyHex, builderResp.FallbackBuilder)
-		if err != nil {
-			log.WithError(err).Error("could not get fallback bid")
-			api.RespondError(w, http.StatusBadRequest, err.Error())
+	// 	fallbackBid, err := api.redis.GetBuilderLatestBid(slot, parentHashHex, proposerPubkeyHex, builderResp.FallbackBuilder)
+	// 	if err != nil {
+	// 		log.WithError(err).Error("could not get fallback bid")
+	// 		api.RespondError(w, http.StatusBadRequest, err.Error())
+	// 		return
+	// 	}
+	// 	if fallbackBid == nil || fallbackBid.IsEmpty() {
+	// 		log.Info("no fallback bid")
+	// 		// w.WriteHeader(http.StatusNoContent)
+	// 		proxyURL := fmt.Sprintf("%s%s", proxyRelayURL, req.URL.Path)
+	// 		log.Printf("Proxy mode get header from: %s", proxyURL)
+
+	// 		resp, err := forwardRequest(req.Method, proxyURL, reqClone)
+	// 		if err != nil {
+	// 			log.Printf("Error forwarding request: %v", err)
+	// 			w.WriteHeader(http.StatusNoContent)
+	// 			return
+	// 		}
+	// 		copyHeaders(w.Header(), resp.Header)
+	// 		w.WriteHeader(resp.StatusCode)
+	// 		io.Copy(w, resp.Body)
+	// 		resp.Body.Close()
+	// 		return
+	// 		// api.RespondError(w, http.StatusBadRequest, "no execution payload for this request - block was never seen by this relay")
+	// 	}
+
+	// 	if isFallbackBuilderValidPreconf {
+	// 		//2. use fallback bid with valid = true
+	// 		bid = fallbackBid
+	// 	} else {
+	// 		//both fallback bid and builder bid valid = false
+	// 		//3. use bid if builder bid is not empty // no change
+	// 		//4. use fallbackBid if bid is empty
+	// 		if bid == nil || bid.IsEmpty() {
+	// 			bid = fallbackBid
+	// 		}
+	// 	}
+	// }
+
+	// if bid == nil || bid.IsEmpty() {
+	// 	//5. if still empty then use best bid (which not builder nor fallback builder)
+	// 	bid, err = api.redis.GetBestBid(slot, parentHashHex, proposerPubkeyHex)
+	// 	if err != nil {
+	// 		log.WithError(err).Error("could not get best bid")
+	// 		api.RespondError(w, http.StatusBadRequest, err.Error())
+	// 		return
+	// 	}
+	// 	//6. if there have no any bid then return
+	// 	if bid == nil || bid.IsEmpty() {
+	// 		log.Info("no targeted bid, remain time: ", msIntoSlot)
+	// 		w.WriteHeader(http.StatusNoContent)
+	// 		return
+	// 	}
+	// }
+
+	//No bid => proxy out
+	if bid == nil || bid.IsEmpty() {
+		// Check cache first
+		headerCacheMutex.RLock()
+		cachedResp, exists := headerCache[fmt.Sprintf("%d", slot)]
+		headerCacheMutex.RUnlock()
+		log.Printf("slot: %s", slotStr)
+		if exists {
+			// Serve from cache
+			log.Printf("Proxy mode Serve from cache, slot: %s", slotStr)
+
+			copyHeaders(w.Header(), cachedResp.Headers)
+			w.WriteHeader(cachedResp.StatusCode)
+			w.Write(cachedResp.Response)
 			return
-		}
-		if fallbackBid == nil || fallbackBid.IsEmpty() {
-			log.Info("no fallback bid")
-			// w.WriteHeader(http.StatusNoContent)
+		} else {
+
 			proxyURL := fmt.Sprintf("%s%s", proxyRelayURL, req.URL.Path)
 			log.Printf("Proxy mode get header from: %s", proxyURL)
 
-			resp, err := forwardRequest(req.Method, proxyURL, reqClone)
+			resp, err := forwardRequest(req.Method, proxyURL, req)
 			if err != nil {
 				log.Printf("Error forwarding request: %v", err)
 				w.WriteHeader(http.StatusNoContent)
@@ -1766,35 +1835,6 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 			w.WriteHeader(resp.StatusCode)
 			io.Copy(w, resp.Body)
 			resp.Body.Close()
-			return
-			// api.RespondError(w, http.StatusBadRequest, "no execution payload for this request - block was never seen by this relay")
-		}
-
-		if isFallbackBuilderValidPreconf {
-			//2. use fallback bid with valid = true
-			bid = fallbackBid
-		} else {
-			//both fallback bid and builder bid valid = false
-			//3. use bid if builder bid is not empty // no change
-			//4. use fallbackBid if bid is empty
-			if bid == nil || bid.IsEmpty() {
-				bid = fallbackBid
-			}
-		}
-	}
-
-	if bid == nil || bid.IsEmpty() {
-		//5. if still empty then use best bid (which not builder nor fallback builder)
-		bid, err = api.redis.GetBestBid(slot, parentHashHex, proposerPubkeyHex)
-		if err != nil {
-			log.WithError(err).Error("could not get best bid")
-			api.RespondError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		//6. if there have no any bid then return
-		if bid == nil || bid.IsEmpty() {
-			log.Info("no targeted bid, remain time: ", msIntoSlot)
-			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 	}
@@ -2665,10 +2705,9 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	receivedAt := time.Now().UTC()
 	prevTime = receivedAt
 
-	//always true to allow replace old preconf order
-	// args := req.URL.Query()
-	// isCancellationEnabled := args.Get("cancellations") == "1"
-	isCancellationEnabled := true
+	args := req.URL.Query()
+	isCancellationEnabled := args.Get("cancellations") == "1"
+
 	log := api.log.WithFields(logrus.Fields{
 		"method":                "submitNewBlock",
 		"contentLength":         req.ContentLength,
@@ -2725,8 +2764,14 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	payload := new(common.VersionedSubmitBlockRequest)
 
 	// Check for SSZ encoding
-	contentType := req.Header.Get("Content-Type")
-	if contentType == "application/octet-stream" {
+	contentType, _, err := getHeaderContentType(req.Header)
+	if err != nil {
+		api.log.WithError(err).Error("failed to parse proposer content type")
+		api.RespondError(w, http.StatusUnsupportedMediaType, err.Error())
+		return
+	}
+
+	if contentType == ApplicationOctetStream {
 		log = log.WithField("reqContentType", "ssz")
 		pf.ContentType = "ssz"
 		if err = payload.UnmarshalSSZ(requestPayloadBytes); err != nil {
@@ -2776,6 +2821,51 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	isValidPreconf := "" // empty string means valid
 	feeRecipient := ""
 	if msIntoSlot < int64(getExchangeFinalizedCutoffMs) {
+		api.log.Info("handleSubmitNewBlock sent too early, wait for exchange finalized")
+		isValidPreconf = "submission too early, before exchange finalization cutoff"
+		api.RespondError(w, http.StatusBadRequest, "Submission is too early, before the exchange finalization cutoff time (T-4)")
+		return
+	} else if msIntoSlot < int64(getExchangeFinalizedCutoffMs) && msIntoSlot >= int64(getExchangeMarketCloseCutoffMs){
+		slot := submission.BidTrace.Slot
+		if cacheBuilder, ok := api.builderCache.Load(slot); ok {
+			entry := cacheBuilder.(*cacheBuilder)
+			if time.Now().Before(entry.expiration) {
+				// Cache hit and not expired
+				builderResp = entry.value
+			} else {
+				// Cache expired, remove it
+				api.builderCache.Delete(slot)
+			}
+		}
+		
+		// If not in cache or expired, fetch the builder response
+		if builderResp == nil {
+			builderResp, err = FetchBuilderPubKey(exchangeAPIURL, slot)
+			if err != nil {
+				log.WithError(err).Error("failed to get builder id from API")
+				builderResp = &BuilderResponse{
+					Slot: slot,
+					Builders: []string{defaultBuilder}, 
+					FallbackBuilder: defaultBuilder,
+				}
+			}
+	
+		}
+	
+		builderPubkey := submission.BidTrace.BuilderPubkey.String()
+		if builderResp.isBuilder(builderPubkey) {
+			log.Info("Builder pubkey matches FallbackBuilder or one of the Builders")
+		} else {
+			log.Info("Builder pubkey does not match FallbackBuilder or any of the Builders")
+			api.RespondError(w, http.StatusBadRequest, "Block Owner haven't deletaged your builder pubkey")
+			return
+		}
+	
+		// Store when exchange finalized result in the cache with a 1-minute TTL
+		api.builderCache.Store(slot, &cacheEntry{
+			value:      builderResp,
+			expiration: time.Now().Add(1 * time.Minute),
+		})
 		api.log.Info("handleSubmitNewBlock sent too early, wait for exchange finalized")
 		isValidPreconf = "submission too early, before exchange finalization cutoff"
 	} else if msIntoSlot >= int64(getExchangeFinalizedCutoffMs) {
@@ -3174,7 +3264,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 
 	// Get the latest top bid value from Redis
 	bidIsTopBid := false
-	topBidValue, err := api.redis.GetTopBidValue(context.Background(), tx, submission.BidTrace.Slot, submission.BidTrace.ParentHash.String(), submission.BidTrace.ProposerPubkey.String())
+	topBidValue, err := api.redis.GetTopBidValue(context.Background(), tx, submission.BidTrace.Slot, submission.BidTrace.ParentHash.String(), (submission.BidTrace.ProposerPubkey.String()))
 	if err != nil {
 		log.WithError(err).Error("failed to get top bid value from redis")
 	} else {
@@ -4169,4 +4259,33 @@ func deepCloneRequest(req *http.Request) (*http.Request, error) {
 	req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 
 	return newReq, nil
+}
+
+func (api *RelayAPI) startCacheCleaner() {
+    go func() {
+        for {
+            time.Sleep(1 * time.Minute) // Run every minute
+            api.builderCache.Range(func(key, value interface{}) bool {
+                entry := value.(*cacheEntry)
+                if time.Now().After(entry.expiration) {
+                    api.builderCache.Delete(key)
+                }
+                return true
+            })
+        }
+    }()
+}
+
+func (br *BuilderResponse) isBuilder(pubkey string) bool {
+    // Check if the pubkey matches the FallbackBuilder
+    if pubkey == br.FallbackBuilder {
+        return true
+    }
+    // Check if the pubkey matches any of the builders in the Builders array
+    for _, builder := range br.Builders {
+        if pubkey == builder {
+            return true
+        }
+    }
+    return false
 }
