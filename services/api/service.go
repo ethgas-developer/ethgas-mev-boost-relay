@@ -2764,14 +2764,9 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	payload := new(common.VersionedSubmitBlockRequest)
 
 	// Check for SSZ encoding
-	contentType, _, err := getHeaderContentType(req.Header)
-	if err != nil {
-		api.log.WithError(err).Error("failed to parse proposer content type")
-		api.RespondError(w, http.StatusUnsupportedMediaType, err.Error())
-		return
-	}
-
-	if contentType == ApplicationOctetStream {
+	contentType := req.Header.Get("Content-Type")
+	
+	if contentType == "application/octet-stream" {
 		log = log.WithField("reqContentType", "ssz")
 		pf.ContentType = "ssz"
 		if err = payload.UnmarshalSSZ(requestPayloadBytes); err != nil {
@@ -2827,8 +2822,9 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		return
 	} else if msIntoSlot < int64(getExchangeFinalizedCutoffMs) && msIntoSlot >= int64(getExchangeMarketCloseCutoffMs){
 		slot := submission.BidTrace.Slot
-		if cacheBuilder, ok := api.builderCache.Load(slot); ok {
-			entry := cacheBuilder.(*cacheBuilder)
+		var builderResp *BuilderResponse
+		if cachedBuilder, ok := api.builderCache.Load(slot); ok {
+			entry := cachedBuilder.(*cacheBuilder)
 			if time.Now().Before(entry.expiration) {
 				// Cache hit and not expired
 				builderResp = entry.value
@@ -2862,7 +2858,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		}
 	
 		// Store when exchange finalized result in the cache with a 1-minute TTL
-		api.builderCache.Store(slot, &cacheEntry{
+		api.builderCache.Store(slot, &cacheBuilder{
 			value:      builderResp,
 			expiration: time.Now().Add(1 * time.Minute),
 		})
@@ -3852,7 +3848,7 @@ func FetchBuilderPubKey(apiURL string, slot uint64) (*BuilderResponse, error) {
 	}
 
 	// Validate required fields
-	if builderResp.Builder == "" && builderResp.FallbackBuilder == "" {
+	if len(builderResp.Builders) == 0 && builderResp.FallbackBuilder == "" {
 		return nil, fmt.Errorf("invalid builder response: missing required fields")
 	}
 
@@ -4266,7 +4262,7 @@ func (api *RelayAPI) startCacheCleaner() {
         for {
             time.Sleep(1 * time.Minute) // Run every minute
             api.builderCache.Range(func(key, value interface{}) bool {
-                entry := value.(*cacheEntry)
+                entry := value.(*cacheBuilder)
                 if time.Now().After(entry.expiration) {
                     api.builderCache.Delete(key)
                 }
