@@ -583,7 +583,7 @@ func (r *RedisCache) SaveBidAndUpdateTopBid(ctx context.Context, pipeliner redis
 	state.PrevTopBidValue = state.TopBidValue
 
 	// Abort now if non-cancellation bid is lower than floor value
-	isBidAboveFloor := submission.BidTrace.Value.ToBig().Cmp(floorValue) == 1
+	isBidAboveFloor := submission.BidTrace.Value.ToBig().Cmp(floorValue) >= 0
 	if !isCancellationEnabled && !isBidAboveFloor {
 		return state, nil
 	}

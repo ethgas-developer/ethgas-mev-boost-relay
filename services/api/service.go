@@ -2820,7 +2820,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		isValidPreconf = "submission too early, before exchange finalization cutoff"
 		api.RespondError(w, http.StatusBadRequest, "Submission is too early, before the exchange finalization cutoff time (T-4)")
 		return
-	} else if msIntoSlot < int64(getExchangeFinalizedCutoffMs) && msIntoSlot >= int64(getExchangeMarketCloseCutoffMs){
+	} else if msIntoSlot >= int64(getExchangeMarketCloseCutoffMs){
 		slot := submission.BidTrace.Slot
 		var builderResp *BuilderResponse
 		if cachedBuilder, ok := api.builderCache.Load(slot); ok {
@@ -2862,227 +2862,230 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 			value:      builderResp,
 			expiration: time.Now().Add(1 * time.Minute),
 		})
-		api.log.Info("handleSubmitNewBlock sent too early, wait for exchange finalized")
-		isValidPreconf = "submission too early, before exchange finalization cutoff"
-	} else if msIntoSlot >= int64(getExchangeFinalizedCutoffMs) {
-		if !skipPreconfCheck {
-			// Cache management code
-			preconfCacheMutex.Lock()
-			if submission.BidTrace.Slot != currentSlot {
-				preconfCache = make(map[uint64]PreconfBundles)
-				currentSlot = submission.BidTrace.Slot
-			}
-			preconfCacheMutex.Unlock()
-
-			// Check cache first
-			preconfCacheMutex.RLock()
-			cachedPreconfs, exists := preconfCache[submission.BidTrace.Slot]
-			preconfCacheMutex.RUnlock()
-
-			if !exists {
-				// url := fmt.Sprintf("%s/api/slot/bundles?slot=%d", client.APIURL, submission.BidTrace.Slot)
-				url := fmt.Sprintf("%s/api/v1/slot/bundles?slot=%d", client.APIURL, submission.BidTrace.Slot)
-				log.Printf(url)
-				req, err := http.NewRequest("GET", url, nil)
-				if err != nil {
-					log.Printf("cannot fetch preconf requests from preconf server, %v", err)
-					return
-				}
-				header := fmt.Sprintf("Bearer %s", client.AccessToken)
-				req.Header.Set("AUTHORIZATION", header)
-
-				resp, err := client.Client.Do(req)
-				if err != nil {
-					log.Printf("cannot fetch preconf requests from preconf server, %v", err)
-					return
-				}
-				defer resp.Body.Close()
-
-				var apiResponse ApiResponse
-				err = json.NewDecoder(resp.Body).Decode(&apiResponse)
-				if err != nil {
-					log.Printf("Failed to fetch preconf request: %v", err)
-					return
-				}
-
-				if !apiResponse.Success {
-					log.Printf("Failed to fetch inclusion preconf from server: %v", apiResponse)
-					return
-				}
-
-				// Log the raw data before unmarshaling
-				log.Printf("Raw preconf bundles data: %s", string(apiResponse.Data))
-
-				var preconfBundles PreconfBundles
-				err = json.Unmarshal(apiResponse.Data, &preconfBundles)
-				if err != nil {
-					log.Printf("Failed to unmarshal preconf bundles: %v, raw data: %s", err, string(apiResponse.Data))
-					return
-				}
-
-				// Log the successfully unmarshaled data
-				log.Printf("Successfully unmarshaled preconf bundles: %+v", preconfBundles)
-
-				// Store in cache
+		if msIntoSlot >= int64(getExchangeFinalizedCutoffMs) {
+			if !skipPreconfCheck {
+				// Cache management code
 				preconfCacheMutex.Lock()
-				preconfCache[submission.BidTrace.Slot] = preconfBundles
+				if submission.BidTrace.Slot != currentSlot {
+					preconfCache = make(map[uint64]PreconfBundles)
+					currentSlot = submission.BidTrace.Slot
+				}
 				preconfCacheMutex.Unlock()
-
-				cachedPreconfs = preconfBundles
-			}
-
-			// Transaction checking logic
-			// Convert all block transactions to lowercase for case-insensitive comparison
-			blockTxMap := make(map[string]struct{})
-			for _, tx := range submission.Transactions {
-				txLower := "0x" + strings.ToLower(hex.EncodeToString(tx))
-				blockTxMap[txLower] = struct{}{}
-			}
-
-			missingTxs := []string{}
-			missingOrderBundle := []string{}
-			count := 0
-			if cachedPreconfs.FeeRecipient != "" {
-				feeRecipient = cachedPreconfs.FeeRecipient
-			}
-			numOfTxBottomOfBottom := 0
-
-			for _, preconf := range cachedPreconfs.Bundles {
-				if preconf.Ordering == -2 {
-					// "-2" means the bottom of bottom
-					// store the len of the pre
-					numOfTxBottomOfBottom += len(preconf.Txs)
+	
+				// Check cache first
+				preconfCacheMutex.RLock()
+				cachedPreconfs, exists := preconfCache[submission.BidTrace.Slot]
+				preconfCacheMutex.RUnlock()
+	
+				if !exists {
+					// url := fmt.Sprintf("%s/api/slot/bundles?slot=%d", client.APIURL, submission.BidTrace.Slot)
+					url := fmt.Sprintf("%s/api/v1/slot/bundles?slot=%d", client.APIURL, submission.BidTrace.Slot)
+					log.Printf(url)
+					req, err := http.NewRequest("GET", url, nil)
+					if err != nil {
+						log.Printf("cannot fetch preconf requests from preconf server, %v", err)
+						return
+					}
+					header := fmt.Sprintf("Bearer %s", client.AccessToken)
+					req.Header.Set("AUTHORIZATION", header)
+	
+					resp, err := client.Client.Do(req)
+					if err != nil {
+						log.Printf("cannot fetch preconf requests from preconf server, %v", err)
+						return
+					}
+					defer resp.Body.Close()
+	
+					var apiResponse ApiResponse
+					err = json.NewDecoder(resp.Body).Decode(&apiResponse)
+					if err != nil {
+						log.Printf("Failed to fetch preconf request: %v", err)
+						return
+					}
+	
+					if !apiResponse.Success {
+						log.Printf("Failed to fetch inclusion preconf from server: %v", apiResponse)
+						return
+					}
+	
+					// Log the raw data before unmarshaling
+					log.Printf("Raw preconf bundles data: %s", string(apiResponse.Data))
+	
+					var preconfBundles PreconfBundles
+					err = json.Unmarshal(apiResponse.Data, &preconfBundles)
+					if err != nil {
+						log.Printf("Failed to unmarshal preconf bundles: %v, raw data: %s", err, string(apiResponse.Data))
+						return
+					}
+	
+					// Log the successfully unmarshaled data
+					log.Printf("Successfully unmarshaled preconf bundles: %+v", preconfBundles)
+	
+					// Store in cache
+					preconfCacheMutex.Lock()
+					preconfCache[submission.BidTrace.Slot] = preconfBundles
+					preconfCacheMutex.Unlock()
+	
+					cachedPreconfs = preconfBundles
 				}
-			}
-
-			for _, preconf := range cachedPreconfs.Bundles {
-				// Skip transaction checking for MEV-type bundles
-				// const bundleType = {
-				// 	STANDARD: 1,
-				// 	MEV: 2,
-				// 	BLOBS: 3, //TODO
-				// }
-				if preconf.BundleType == 2 { //mev type can skip
-					continue
+	
+				// Transaction checking logic
+				// Convert all block transactions to lowercase for case-insensitive comparison
+				blockTxMap := make(map[string]struct{})
+				for _, tx := range submission.Transactions {
+					txLower := "0x" + strings.ToLower(hex.EncodeToString(tx))
+					blockTxMap[txLower] = struct{}{}
 				}
-
-				// Check ordering
-				numOfTxsInBundle := len(preconf.Txs)
-
-				if preconf.Ordering == 1 {
-					// "1" means the top
-					// Check if the first `numOfTxsInBundle` transactions in the block match the preconf transactions
-					for i, preconfTx := range preconf.Txs {
-						if i >= len(submission.Transactions) || strings.ToLower(preconfTx.Tx) != "0x"+strings.ToLower(hex.EncodeToString(submission.Transactions[i])) {
+	
+				missingTxs := []string{}
+				missingOrderBundle := []string{}
+				count := 0
+				if cachedPreconfs.FeeRecipient != "" {
+					feeRecipient = cachedPreconfs.FeeRecipient
+				}
+				numOfTxBottomOfBottom := 0
+	
+				for _, preconf := range cachedPreconfs.Bundles {
+					if preconf.Ordering == -2 {
+						// "-2" means the bottom of bottom
+						// store the len of the pre
+						numOfTxBottomOfBottom += len(preconf.Txs)
+					}
+				}
+	
+				for _, preconf := range cachedPreconfs.Bundles {
+					// Skip transaction checking for MEV-type bundles
+					// const bundleType = {
+					// 	STANDARD: 1,
+					// 	MEV: 2,
+					// 	BLOBS: 3, //TODO
+					// }
+					if preconf.BundleType == 2 { //mev type can skip
+						continue
+					}
+	
+					// Check ordering
+					numOfTxsInBundle := len(preconf.Txs)
+	
+					if preconf.Ordering == 1 {
+						// "1" means the top
+						// Check if the first `numOfTxsInBundle` transactions in the block match the preconf transactions
+						for i, preconfTx := range preconf.Txs {
+							if i >= len(submission.Transactions) || strings.ToLower(preconfTx.Tx) != "0x"+strings.ToLower(hex.EncodeToString(submission.Transactions[i])) {
+								missingOrderBundle = append(missingOrderBundle, preconf.UUID)
+								continue
+							}
+						}
+					} else if preconf.Ordering == -1 {
+						// "-1" means the bottom
+						// Check if the last `numOfTxsInBundle` or `numOfTxsInBundle + 1` transactions in the block match the preconf transactions
+						valid := false
+						for offset := 0; offset <= 1; offset++ {
+							allMatch := true
+							for i, preconfTx := range preconf.Txs {
+								blockTxIndex := len(submission.Transactions) - numOfTxsInBundle + i - numOfTxBottomOfBottom - offset
+								if blockTxIndex < 0 || strings.ToLower(preconfTx.Tx) != "0x"+strings.ToLower(hex.EncodeToString(submission.Transactions[blockTxIndex])) {
+									allMatch = false
+									break
+								}
+							}
+							if allMatch {
+								valid = true
+								break
+							}
+						}
+						if !valid {
 							missingOrderBundle = append(missingOrderBundle, preconf.UUID)
-							continue
 						}
-					}
-				} else if preconf.Ordering == -1 {
-					// "-1" means the bottom
-					// Check if the last `numOfTxsInBundle` or `numOfTxsInBundle + 1` transactions in the block match the preconf transactions
-					valid := false
-					for offset := 0; offset <= 1; offset++ {
-						allMatch := true
-						for i, preconfTx := range preconf.Txs {
-							blockTxIndex := len(submission.Transactions) - numOfTxsInBundle + i - numOfTxBottomOfBottom - offset
-							if blockTxIndex < 0 || strings.ToLower(preconfTx.Tx) != "0x"+strings.ToLower(hex.EncodeToString(submission.Transactions[blockTxIndex])) {
-								allMatch = false
+					} else if preconf.Ordering == -2 {
+						// "-2" means the bottom of bottom
+						// Check if the last `numOfTxsInBundle` or `numOfTxsInBundle + 1` transactions in the block match the preconf transactions
+						valid := false
+						for offset := 0; offset <= 1; offset++ {
+							allMatch := true
+							for i, preconfTx := range preconf.Txs {
+								blockTxIndex := len(submission.Transactions) - numOfTxsInBundle + i - offset
+								if blockTxIndex < 0 || strings.ToLower(preconfTx.Tx) != "0x"+strings.ToLower(hex.EncodeToString(submission.Transactions[blockTxIndex])) {
+									allMatch = false
+									break
+								}
+							}
+							if allMatch {
+								valid = true
 								break
 							}
 						}
-						if allMatch {
-							valid = true
-							break
+						if !valid {
+							missingOrderBundle = append(missingOrderBundle, preconf.UUID)
 						}
-					}
-					if !valid {
-						missingOrderBundle = append(missingOrderBundle, preconf.UUID)
-					}
-				} else if preconf.Ordering == -2 {
-					// "-2" means the bottom of bottom
-					// Check if the last `numOfTxsInBundle` or `numOfTxsInBundle + 1` transactions in the block match the preconf transactions
-					valid := false
-					for offset := 0; offset <= 1; offset++ {
-						allMatch := true
-						for i, preconfTx := range preconf.Txs {
-							blockTxIndex := len(submission.Transactions) - numOfTxsInBundle + i - offset
-							if blockTxIndex < 0 || strings.ToLower(preconfTx.Tx) != "0x"+strings.ToLower(hex.EncodeToString(submission.Transactions[blockTxIndex])) {
-								allMatch = false
-								break
+					} else {
+						// Existing transaction existence check
+						for _, preconfTx := range preconf.Txs {
+							txLower := strings.ToLower(preconfTx.Tx)
+							if _, exists := blockTxMap[txLower]; !exists {
+								missingTxs = append(missingTxs, preconfTx.Tx)
 							}
 						}
-						if allMatch {
-							valid = true
-							break
-						}
-					}
-					if !valid {
-						missingOrderBundle = append(missingOrderBundle, preconf.UUID)
-					}
-				} else {
-					// Existing transaction existence check
-					for _, preconfTx := range preconf.Txs {
-						txLower := strings.ToLower(preconfTx.Tx)
-						if _, exists := blockTxMap[txLower]; !exists {
-							missingTxs = append(missingTxs, preconfTx.Tx)
-						}
 					}
 				}
-			}
-			if len(missingOrderBundle) > 0 {
-				log.Printf("Total missing ordering bundle: %d",
-					len(missingOrderBundle))
-				log.Println("Missing preconf transaction hexes:", missingOrderBundle)
-				isValidPreconf = fmt.Sprintf("missing ordering bundle: %s", missingOrderBundle)
-			}
-
-			if len(missingTxs) > 0 {
-				log.Printf("Total missing transactions: %d, included preconf transaction: %d",
-					len(missingTxs), count-len(missingTxs))
-				log.Printf("Number of transactions: %d", len(submission.Transactions))
-				log.Println("Missing preconf transaction hexes:", missingTxs)
-				log.Println("transaction in this block:", blockTxMap)
-				reason := fmt.Sprintf("missing %d required preconf transactions", len(missingTxs))
-				if isValidPreconf != "" {
-					isValidPreconf += "; " + reason
-				} else {
-					isValidPreconf = reason
+				if len(missingOrderBundle) > 0 {
+					log.Printf("Total missing ordering bundle: %d",
+						len(missingOrderBundle))
+					log.Println("Missing preconf transaction hexes:", missingOrderBundle)
+					isValidPreconf = fmt.Sprintf("missing ordering bundle: %s", missingOrderBundle)
 				}
-
-			} else {
-				log.Printf("All preconf transactions are included in the block!")
-				// Remains empty string for valid case
-			}
-
-			//check remain empty space
-			//hardcode test:
-			// cachedPreconfs.EmptySpace = "30000000"
-			if cachedPreconfs.EmptySpace > 0 { // Check if EmptySpace is greater than 0
-				//empty space === -1 = full block empty submission.BidTrace.GasLimit
-				requiredSpace := uint64(0)
-				if cachedPreconfs.EmptySpace == -1 {
-					requiredSpace = uint64(submission.BidTrace.GasLimit)
-				} else {
-					requiredSpace = uint64(cachedPreconfs.EmptySpace)
-				}
-				remainingGas := uint64(submission.BidTrace.GasLimit) - uint64(submission.BidTrace.GasUsed)
-				//allow 21000 gas for transfer
-				if submission.BidTrace.GasUsed <= 21000 {
-					remainingGas += 21000
-				}
-				if remainingGas < requiredSpace {
-					reason := fmt.Sprintf("block doesn't have enough empty space (remaining gas %d < required %d)",
-						remainingGas, requiredSpace)
+	
+				if len(missingTxs) > 0 {
+					log.Printf("Total missing transactions: %d, included preconf transaction: %d",
+						len(missingTxs), count-len(missingTxs))
+					log.Printf("Number of transactions: %d", len(submission.Transactions))
+					log.Println("Missing preconf transaction hexes:", missingTxs)
+					log.Println("transaction in this block:", blockTxMap)
+					reason := fmt.Sprintf("missing %d required preconf transactions", len(missingTxs))
 					if isValidPreconf != "" {
 						isValidPreconf += "; " + reason
 					} else {
 						isValidPreconf = reason
 					}
+	
+				} else {
+					log.Printf("All preconf transactions are included in the block!")
+					// Remains empty string for valid case
+				}
+	
+				//check remain empty space
+				//hardcode test:
+				// cachedPreconfs.EmptySpace = "30000000"
+				if cachedPreconfs.EmptySpace > 0 { // Check if EmptySpace is greater than 0
+					//empty space === -1 = full block empty submission.BidTrace.GasLimit
+					requiredSpace := uint64(0)
+					if cachedPreconfs.EmptySpace == -1 {
+						requiredSpace = uint64(submission.BidTrace.GasLimit)
+					} else {
+						requiredSpace = uint64(cachedPreconfs.EmptySpace)
+					}
+					remainingGas := uint64(submission.BidTrace.GasLimit) - uint64(submission.BidTrace.GasUsed)
+					//allow 21000 gas for transfer
+					if submission.BidTrace.GasUsed <= 21000 {
+						remainingGas += 21000
+					}
+					if remainingGas < requiredSpace {
+						reason := fmt.Sprintf("block doesn't have enough empty space (remaining gas %d < required %d)",
+							remainingGas, requiredSpace)
+						if isValidPreconf != "" {
+							isValidPreconf += "; " + reason
+						} else {
+							isValidPreconf = reason
+						}
+					}
 				}
 			}
+		} else {
+			api.log.Info("handleSubmitNewBlock sent too early, wait for exchange finalized")
+			isValidPreconf = "submission too early, before exchange finalization cutoff"
+	
 		}
-	}
+	}  
 
 	log = log.WithFields(logrus.Fields{
 		"timestampAfterDecoding": time.Now().UTC().UnixMilli(),
@@ -3264,7 +3267,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	if err != nil {
 		log.WithError(err).Error("failed to get top bid value from redis")
 	} else {
-		bidIsTopBid = submission.BidTrace.Value.ToBig().Cmp(topBidValue) == 1
+		bidIsTopBid = submission.BidTrace.Value.ToBig().Cmp(topBidValue) >= 0
 		log = log.WithFields(logrus.Fields{
 			"topBidValue":    topBidValue.String(),
 			"newBidIsTopBid": bidIsTopBid,
