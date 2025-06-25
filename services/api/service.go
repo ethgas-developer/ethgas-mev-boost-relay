@@ -258,6 +258,28 @@ type BuilderResponse struct {
 	FallbackBuilder string `json:"fallbackBuilder"`
 }
 
+func (br *BuilderResponse) UnmarshalJSON(data []byte) error {
+    type Alias BuilderResponse
+    aux := &struct {
+        Builder  string   `json:"builder"`
+        Builders []string `json:"builders"`
+        *Alias
+    }{
+        Alias: (*Alias)(br),
+    }
+    if err := json.Unmarshal(data, &aux); err != nil {
+        return err
+    }
+
+    if aux.Builder != "" {
+        br.Builders = []string{aux.Builder}
+    } else {
+        br.Builders = aux.Builders
+    }
+
+    return nil
+}
+
 type cacheBuilder struct {
     value      *BuilderResponse
     expiration time.Time
