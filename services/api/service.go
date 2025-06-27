@@ -106,13 +106,13 @@ var (
 	defaultFeeRecipient     = GetEnvStr("DEFAULT_FEE_RECIPIENT", "0x7566b700c0eaac88b521536f4e4e1b5b9afe6fe1")
 
 	// various timings
-	timeoutGetPayloadRetryMs     = cli.GetEnvInt("GETPAYLOAD_RETRY_TIMEOUT_MS", 100)
-	getExchangeFinalizedCutoffMs = cli.GetEnvInt("GETHEADER_EXCHANGE_FINALIZED_CUTOFF_MS", -2000)
+	timeoutGetPayloadRetryMs       = cli.GetEnvInt("GETPAYLOAD_RETRY_TIMEOUT_MS", 100)
+	getExchangeFinalizedCutoffMs   = cli.GetEnvInt("GETHEADER_EXCHANGE_FINALIZED_CUTOFF_MS", -2000)
 	getExchangeMarketCloseCutoffMs = cli.GetEnvInt("GETHEADER_EXCHANGE_MARKET_CLOSE_CUTOFF_MS", -4000)
-	getTargetedBuilderCutoffMs   = cli.GetEnvInt("GETHEADER_TARGETED_BUILDER_REQUEST_CUTOFF_MS", 0)
-	getHeaderRequestCutoffMs     = cli.GetEnvInt("GETHEADER_REQUEST_CUTOFF_MS", 3000)
-	getPayloadRequestCutoffMs    = cli.GetEnvInt("GETPAYLOAD_REQUEST_CUTOFF_MS", 4000)
-	getPayloadResponseDelayMs    = cli.GetEnvInt("GETPAYLOAD_RESPONSE_DELAY_MS", 1000)
+	getTargetedBuilderCutoffMs     = cli.GetEnvInt("GETHEADER_TARGETED_BUILDER_REQUEST_CUTOFF_MS", 0)
+	getHeaderRequestCutoffMs       = cli.GetEnvInt("GETHEADER_REQUEST_CUTOFF_MS", 3000)
+	getPayloadRequestCutoffMs      = cli.GetEnvInt("GETPAYLOAD_REQUEST_CUTOFF_MS", 4000)
+	getPayloadResponseDelayMs      = cli.GetEnvInt("GETPAYLOAD_RESPONSE_DELAY_MS", 1000)
 
 	// api settings
 	apiReadTimeoutMs       = cli.GetEnvInt("API_TIMEOUT_READ_MS", 3_000)
@@ -253,36 +253,36 @@ type PreconfTx struct {
 // }
 
 type BuilderResponse struct {
-	Slot           uint64   `json:"slot"`
-	Builders         []string `json:"builders"`
-	FallbackBuilder string `json:"fallbackBuilder"`
+	Slot            uint64   `json:"slot"`
+	Builders        []string `json:"builders"`
+	FallbackBuilder string   `json:"fallbackBuilder"`
 }
 
 func (br *BuilderResponse) UnmarshalJSON(data []byte) error {
-    type Alias BuilderResponse
-    aux := &struct {
-        Builder  string   `json:"builder"`
-        Builders []string `json:"builders"`
-        *Alias
-    }{
-        Alias: (*Alias)(br),
-    }
-    if err := json.Unmarshal(data, &aux); err != nil {
-        return err
-    }
+	type Alias BuilderResponse
+	aux := &struct {
+		Builder  string   `json:"builder"`
+		Builders []string `json:"builders"`
+		*Alias
+	}{
+		Alias: (*Alias)(br),
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
 
-    if aux.Builder != "" {
-        br.Builders = []string{aux.Builder}
-    } else {
-        br.Builders = aux.Builders
-    }
+	if aux.Builder != "" {
+		br.Builders = []string{aux.Builder}
+	} else {
+		br.Builders = aux.Builders
+	}
 
-    return nil
+	return nil
 }
 
 type cacheBuilder struct {
-    value      *BuilderResponse
-    expiration time.Time
+	value      *BuilderResponse
+	expiration time.Time
 }
 
 // RelayAPIOpts contains the options for a relay
@@ -401,7 +401,7 @@ type RelayAPI struct {
 	optimisticBlocksWG sync.WaitGroup
 	// Cache for builder statuses and collaterals.
 	blockBuildersCache map[string]*blockBuilderCacheEntry
-	builderCache sync.Map // Key: slot (uint64), Value: *cacheEntry
+	builderCache       sync.Map // Key: slot (uint64), Value: *cacheEntry
 }
 
 // Add a cache map and a mutex for thread safety
@@ -706,7 +706,7 @@ func NewRelayAPI(opts RelayAPIOpts) (api *RelayAPI, err error) {
 
 	// Start the header cache cron job
 	api.startHeaderCacheCron()
-    api.startCacheCleaner()
+	api.startCacheCleaner()
 
 	return api, nil
 }
@@ -1738,7 +1738,7 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 	// 	log.WithError(err).Error("failed to get builder id from API")
 	// 	builderResp = &BuilderResponse{
 	// 		Slot: slot,
-	// 		Builders: []string{defaultBuilder}, 
+	// 		Builders: []string{defaultBuilder},
 	// 		FallbackBuilder: defaultBuilder,
 	// 	}
 	// }
@@ -1869,7 +1869,7 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 		baseValue := uint256.MustFromDecimal("11000000000000000000000") // Base value (11000 ETH)
 		acualValue := bid.Capella.Message.Value
 		totalValue := new(uint256.Int).Add(baseValue, acualValue) // Add base value and requestTime
-		bid.Capella.Message.Value = totalValue                          // Set the new value
+		bid.Capella.Message.Value = totalValue                    // Set the new value
 
 		// bid.Capella.Message.Value = uint256.MustFromDecimal("11000000000000000000000") // Set to desired value (11000 ETH)
 		// Serialize the bid data
@@ -1916,7 +1916,7 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 
 		// log.Info("set fake bid.Deneb.Message.Value")
 		baseValue := uint256.MustFromDecimal("11000000000000000000000") // Base value (11000 ETH)
-		acualValue := bid.Deneb.Message.Value 
+		acualValue := bid.Deneb.Message.Value
 		totalValue := new(uint256.Int).Add(baseValue, acualValue) // Add base value and requestTime
 		bid.Deneb.Message.Value = totalValue
 		bid.Deneb.Message.Pubkey = *api.publicKey
@@ -2787,7 +2787,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 
 	// Check for SSZ encoding
 	contentType := req.Header.Get("Content-Type")
-	
+
 	if contentType == "application/octet-stream" {
 		log = log.WithField("reqContentType", "ssz")
 		pf.ContentType = "ssz"
@@ -2842,7 +2842,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		isValidPreconf = "submission too early, before exchange finalization cutoff"
 		api.RespondError(w, http.StatusBadRequest, "Submission is too early, before the exchange finalization cutoff time (T-4)")
 		return
-	} else if msIntoSlot >= int64(getExchangeMarketCloseCutoffMs){
+	} else if msIntoSlot >= int64(getExchangeMarketCloseCutoffMs) {
 		slot := submission.BidTrace.Slot
 		var builderResp *BuilderResponse
 		if cachedBuilder, ok := api.builderCache.Load(slot); ok {
@@ -2855,30 +2855,30 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 				api.builderCache.Delete(slot)
 			}
 		}
-		
+
 		// If not in cache or expired, fetch the builder response
 		if builderResp == nil {
 			builderResp, err = FetchBuilderPubKey(exchangeAPIURL, slot)
 			if err != nil {
 				log.WithError(err).Error("failed to get builder id from API")
 				builderResp = &BuilderResponse{
-					Slot: slot,
-					Builders: []string{defaultBuilder}, 
+					Slot:            slot,
+					Builders:        []string{defaultBuilder},
 					FallbackBuilder: defaultBuilder,
 				}
 			}
-	
+
 		}
-	
+
 		builderPubkey := submission.BidTrace.BuilderPubkey.String()
 		if builderResp.isBuilder(builderPubkey) {
 			log.Info("Builder pubkey matches FallbackBuilder or one of the Builders")
 		} else {
-			log.Info("Builder pubkey does not match FallbackBuilder or any of the Builders")
+			log.Info("Builder pubkey does not match FallbackBuilder or any of the Builders", " pubkey:", builderPubkey)
 			api.RespondError(w, http.StatusBadRequest, "Block Owner haven't deletaged your builder pubkey")
 			return
 		}
-	
+
 		// Store when exchange finalized result in the cache with a 1-minute TTL
 		api.builderCache.Store(slot, &cacheBuilder{
 			value:      builderResp,
@@ -2893,12 +2893,12 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 					currentSlot = submission.BidTrace.Slot
 				}
 				preconfCacheMutex.Unlock()
-	
+
 				// Check cache first
 				preconfCacheMutex.RLock()
 				cachedPreconfs, exists := preconfCache[submission.BidTrace.Slot]
 				preconfCacheMutex.RUnlock()
-	
+
 				if !exists {
 					// url := fmt.Sprintf("%s/api/slot/bundles?slot=%d", client.APIURL, submission.BidTrace.Slot)
 					url := fmt.Sprintf("%s/api/v1/slot/bundles?slot=%d", client.APIURL, submission.BidTrace.Slot)
@@ -2910,47 +2910,47 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 					}
 					header := fmt.Sprintf("Bearer %s", client.AccessToken)
 					req.Header.Set("AUTHORIZATION", header)
-	
+
 					resp, err := client.Client.Do(req)
 					if err != nil {
 						log.Printf("cannot fetch preconf requests from preconf server, %v", err)
 						return
 					}
 					defer resp.Body.Close()
-	
+
 					var apiResponse ApiResponse
 					err = json.NewDecoder(resp.Body).Decode(&apiResponse)
 					if err != nil {
 						log.Printf("Failed to fetch preconf request: %v", err)
 						return
 					}
-	
+
 					if !apiResponse.Success {
 						log.Printf("Failed to fetch inclusion preconf from server: %v", apiResponse)
 						return
 					}
-	
+
 					// Log the raw data before unmarshaling
 					log.Printf("Raw preconf bundles data: %s", string(apiResponse.Data))
-	
+
 					var preconfBundles PreconfBundles
 					err = json.Unmarshal(apiResponse.Data, &preconfBundles)
 					if err != nil {
 						log.Printf("Failed to unmarshal preconf bundles: %v, raw data: %s", err, string(apiResponse.Data))
 						return
 					}
-	
+
 					// Log the successfully unmarshaled data
 					log.Printf("Successfully unmarshaled preconf bundles: %+v", preconfBundles)
-	
+
 					// Store in cache
 					preconfCacheMutex.Lock()
 					preconfCache[submission.BidTrace.Slot] = preconfBundles
 					preconfCacheMutex.Unlock()
-	
+
 					cachedPreconfs = preconfBundles
 				}
-	
+
 				// Transaction checking logic
 				// Convert all block transactions to lowercase for case-insensitive comparison
 				blockTxMap := make(map[string]struct{})
@@ -2958,7 +2958,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 					txLower := "0x" + strings.ToLower(hex.EncodeToString(tx))
 					blockTxMap[txLower] = struct{}{}
 				}
-	
+
 				missingTxs := []string{}
 				missingOrderBundle := []string{}
 				count := 0
@@ -2966,7 +2966,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 					feeRecipient = cachedPreconfs.FeeRecipient
 				}
 				numOfTxBottomOfBottom := 0
-	
+
 				for _, preconf := range cachedPreconfs.Bundles {
 					if preconf.Ordering == -2 {
 						// "-2" means the bottom of bottom
@@ -2974,7 +2974,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 						numOfTxBottomOfBottom += len(preconf.Txs)
 					}
 				}
-	
+
 				for _, preconf := range cachedPreconfs.Bundles {
 					// Skip transaction checking for MEV-type bundles
 					// const bundleType = {
@@ -2985,10 +2985,10 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 					if preconf.BundleType == 2 { //mev type can skip
 						continue
 					}
-	
+
 					// Check ordering
 					numOfTxsInBundle := len(preconf.Txs)
-	
+
 					if preconf.Ordering == 1 {
 						// "1" means the top
 						// Check if the first `numOfTxsInBundle` transactions in the block match the preconf transactions
@@ -3056,7 +3056,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 					log.Println("Missing preconf transaction hexes:", missingOrderBundle)
 					isValidPreconf = fmt.Sprintf("missing ordering bundle: %s", missingOrderBundle)
 				}
-	
+
 				if len(missingTxs) > 0 {
 					log.Printf("Total missing transactions: %d, included preconf transaction: %d",
 						len(missingTxs), count-len(missingTxs))
@@ -3069,12 +3069,12 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 					} else {
 						isValidPreconf = reason
 					}
-	
+
 				} else {
 					log.Printf("All preconf transactions are included in the block!")
 					// Remains empty string for valid case
 				}
-	
+
 				//check remain empty space
 				//hardcode test:
 				// cachedPreconfs.EmptySpace = "30000000"
@@ -3105,9 +3105,9 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		} else {
 			api.log.Info("handleSubmitNewBlock sent too early, wait for exchange finalized")
 			isValidPreconf = "submission too early, before exchange finalization cutoff"
-	
+
 		}
-	}  
+	}
 
 	log = log.WithFields(logrus.Fields{
 		"timestampAfterDecoding": time.Now().UTC().UnixMilli(),
@@ -4283,30 +4283,30 @@ func deepCloneRequest(req *http.Request) (*http.Request, error) {
 }
 
 func (api *RelayAPI) startCacheCleaner() {
-    go func() {
-        for {
-            time.Sleep(1 * time.Minute) // Run every minute
-            api.builderCache.Range(func(key, value interface{}) bool {
-                entry := value.(*cacheBuilder)
-                if time.Now().After(entry.expiration) {
-                    api.builderCache.Delete(key)
-                }
-                return true
-            })
-        }
-    }()
+	go func() {
+		for {
+			time.Sleep(1 * time.Minute) // Run every minute
+			api.builderCache.Range(func(key, value interface{}) bool {
+				entry := value.(*cacheBuilder)
+				if time.Now().After(entry.expiration) {
+					api.builderCache.Delete(key)
+				}
+				return true
+			})
+		}
+	}()
 }
 
 func (br *BuilderResponse) isBuilder(pubkey string) bool {
-    // Check if the pubkey matches the FallbackBuilder
-    if pubkey == br.FallbackBuilder {
-        return true
-    }
-    // Check if the pubkey matches any of the builders in the Builders array
-    for _, builder := range br.Builders {
-        if pubkey == builder {
-            return true
-        }
-    }
-    return false
+	// Check if the pubkey matches the FallbackBuilder
+	if pubkey == br.FallbackBuilder {
+		return true
+	}
+	// Check if the pubkey matches any of the builders in the Builders array
+	for _, builder := range br.Builders {
+		if pubkey == builder {
+			return true
+		}
+	}
+	return false
 }
