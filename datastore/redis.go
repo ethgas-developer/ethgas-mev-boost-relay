@@ -493,22 +493,6 @@ func (r *RedisCache) GetBuilderLatestPayloadReceivedAt(ctx context.Context, pipe
 
 // SaveBuilderBid saves the latest bid by a specific builder. TODO: use transaction to make these writes atomic
 func (r *RedisCache) SaveBuilderBid(ctx context.Context, pipeliner redis.Pipeliner, slot uint64, parentHash, proposerPubkey, builderPubkey string, receivedAt time.Time, headerResp *builderSpec.VersionedSignedBuilderBid) (err error) {
-	
-	value, err := headerResp.Value()
-	if err != nil {
-		return err
-	}
-	v, err := r.GetBuilderLatestValue(slot, parentHash, proposerPubkey, builderPubkey)
-	if err != nil {
-		return err
-	}
-	valueBigInt := value.ToBig()
-
-	// If last value is higher than this bid, no need to insert
-	if v.Cmp(valueBigInt) == 1 {
-		fmt.Printf("Skipping bid insertion: last value (%s) is higher than current bid value (%s)\n", v.String(), valueBigInt.String())
-		return
-	}
 	// save the actual bid
 	keyLatestBid := r.keyLatestBidByBuilder(slot, parentHash, proposerPubkey, builderPubkey)
 	err = r.SetObjPipelined(ctx, pipeliner, keyLatestBid, headerResp, expiryBidCache)
@@ -529,6 +513,10 @@ func (r *RedisCache) SaveBuilderBid(ctx context.Context, pipeliner redis.Pipelin
 
 	// set the value last, because that's iterated over when updating the best bid, and the payload has to be available
 	keyLatestBidsValue := r.keyBlockBuilderLatestBidsValue(slot, parentHash, proposerPubkey)
+	value, err := headerResp.Value()
+	if err != nil {
+		return err
+	}
 	err = pipeliner.HSet(ctx, keyLatestBidsValue, builderPubkey, value.ToBig().String()).Err()
 	if err != nil {
 		return err
