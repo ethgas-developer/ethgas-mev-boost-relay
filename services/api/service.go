@@ -2638,29 +2638,28 @@ func (api *RelayAPI) checkFloorBidValue(opts bidFloorOpts) (*big.Int, bool) {
 		opts.log = opts.log.WithField("floorBidValue", floorBidValue.String())
 	}
 
-	// ALWAYS enable replace bid
 	// --------------------------------------------
 	// Skip submission if below the floor bid value
 	// --------------------------------------------
-	// isBidBelowFloor := floorBidValue != nil && opts.submission.BidTrace.Value.ToBig().Cmp(floorBidValue) == -1
-	// isBidAtOrBelowFloor := floorBidValue != nil && opts.submission.BidTrace.Value.ToBig().Cmp(floorBidValue) < 1
-	// if opts.cancellationsEnabled && isBidBelowFloor { // with cancellations: if below floor -> delete previous bid
-	// 	opts.simResultC <- &blockSimResult{false, nil, false, nil, nil}
-	// 	opts.log.Info("submission below floor bid value, with cancellation")
-	// 	err := api.redis.DelBuilderBid(context.Background(), opts.tx, opts.submission.BidTrace.Slot, opts.submission.BidTrace.ParentHash.String(), opts.submission.BidTrace.ProposerPubkey.String(), opts.submission.BidTrace.BuilderPubkey.String())
-	// 	if err != nil {
-	// 		opts.log.WithError(err).Error("failed processing cancellable bid below floor")
-	// 		api.RespondError(opts.w, http.StatusInternalServerError, "failed processing cancellable bid below floor")
-	// 		return nil, false
-	// 	}
-	// 	api.Respond(opts.w, http.StatusAccepted, "accepted bid below floor, skipped validation")
-	// 	return nil, false
-	// } else if !opts.cancellationsEnabled && isBidAtOrBelowFloor { // without cancellations: if at or below floor -> ignore
-	// 	opts.simResultC <- &blockSimResult{false, nil, false, nil, nil}
-	// 	opts.log.Info("submission at or below floor bid value, without cancellation")
-	// 	api.RespondMsg(opts.w, http.StatusAccepted, "accepted bid below floor, skipped validation")
-	// 	return nil, false
-	// }
+	isBidBelowFloor := floorBidValue != nil && opts.submission.BidTrace.Value.ToBig().Cmp(floorBidValue) == -1
+	isBidAtOrBelowFloor := floorBidValue != nil && opts.submission.BidTrace.Value.ToBig().Cmp(floorBidValue) < 1
+	if opts.cancellationsEnabled && isBidBelowFloor { // with cancellations: if below floor -> delete previous bid
+		opts.simResultC <- &blockSimResult{false, nil, false, nil, nil}
+		opts.log.Info("submission below floor bid value, with cancellation")
+		err := api.redis.DelBuilderBid(context.Background(), opts.tx, opts.submission.BidTrace.Slot, opts.submission.BidTrace.ParentHash.String(), opts.submission.BidTrace.ProposerPubkey.String(), opts.submission.BidTrace.BuilderPubkey.String())
+		if err != nil {
+			opts.log.WithError(err).Error("failed processing cancellable bid below floor")
+			api.RespondError(opts.w, http.StatusInternalServerError, "failed processing cancellable bid below floor")
+			return nil, false
+		}
+		api.Respond(opts.w, http.StatusAccepted, "accepted bid below floor, skipped validation")
+		return nil, false
+	} else if !opts.cancellationsEnabled && isBidAtOrBelowFloor { // without cancellations: if at or below floor -> ignore
+		opts.simResultC <- &blockSimResult{false, nil, false, nil, nil}
+		opts.log.Info("submission at or below floor bid value, without cancellation")
+		api.RespondMsg(opts.w, http.StatusAccepted, "accepted bid below floor, skipped validation")
+		return nil, false
+	}
 	return floorBidValue, true
 }
 
