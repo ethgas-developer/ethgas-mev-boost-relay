@@ -1742,10 +1742,13 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 	// 		FallbackBuilder: defaultBuilder,
 	// 	}
 	// }
-	// log.Info("builder id", builderResp.Builder)
-	log.Info("delay to add more value ms: ", delayGetHeader)
-	time.Sleep(time.Duration(delayGetHeader) * time.Millisecond)
 
+	// log.Info("builder id", builderResp.Builder)
+	if msIntoSlot < 1000 {
+		//only delay when ms in slot < 1sec
+		log.Info("delay to add more value ms: ", delayGetHeader)
+		time.Sleep(time.Duration(delayGetHeader) * time.Millisecond)
+	}
 	bid, err := api.redis.GetBestBid(slot, parentHashHex, proposerPubkeyHex)
 	// bid, err := api.redis.GetBuilderLatestBid(slot, parentHashHex, proposerPubkeyHex, builderResp.Builder)
 
