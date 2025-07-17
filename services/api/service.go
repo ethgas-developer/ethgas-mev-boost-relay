@@ -4211,7 +4211,7 @@ func (api *RelayAPI) startExchangeAPIHealthCheck() {
 				}
 				if healthy {
 					exchangeAPIDownCount = 0
-					// proxyMode = false
+					proxyMode = false
 				} else {
 					exchangeAPIDownCount++
 					if exchangeAPIDownCount >= 32 {
