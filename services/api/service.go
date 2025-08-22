@@ -701,7 +701,7 @@ func NewRelayAPI(opts RelayAPIOpts) (api *RelayAPI, err error) {
 	go InitLoginAndStartTokenRefresh()
 
 	// Start the exchange API health check
-	api.startExchangeAPIHealthCheck()
+	// api.startExchangeAPIHealthCheck()
 	api.log.Info("NewRelayAPI Done")
 
 	// Start the header cache cron job
@@ -1621,43 +1621,43 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 	preconfCacheMutex.RLock()
 	cachedPreconfs, exists := preconfCache[slot]
 	preconfCacheMutex.RUnlock()
-	shouldProxy := proxyMode
+	// shouldProxy := proxyMode
 	if exists {
 		log.Printf("cachedPreconfs.IsSold: %v", cachedPreconfs.IsSold)
 	}
 
-	if shouldProxy {
-		// Check cache first
-		headerCacheMutex.RLock()
-		cachedResp, exists := headerCache[fmt.Sprintf("%d", slot)]
-		headerCacheMutex.RUnlock()
-		log.Printf("slot: %s", slotStr)
-		if exists {
-			// Serve from cache
-			log.Printf("Proxy mode Serve from cache, slot: %s", slotStr)
+	// if shouldProxy {
+	// 	// Check cache first
+	// 	headerCacheMutex.RLock()
+	// 	cachedResp, exists := headerCache[fmt.Sprintf("%d", slot)]
+	// 	headerCacheMutex.RUnlock()
+	// 	log.Printf("slot: %s", slotStr)
+	// 	if exists {
+	// 		// Serve from cache
+	// 		log.Printf("Proxy mode Serve from cache, slot: %s", slotStr)
 
-			copyHeaders(w.Header(), cachedResp.Headers)
-			w.WriteHeader(cachedResp.StatusCode)
-			w.Write(cachedResp.Response)
-			return
-		} else {
+	// 		copyHeaders(w.Header(), cachedResp.Headers)
+	// 		w.WriteHeader(cachedResp.StatusCode)
+	// 		w.Write(cachedResp.Response)
+	// 		return
+	// 	} else {
 
-			proxyURL := fmt.Sprintf("%s%s", proxyRelayURL, req.URL.Path)
-			log.Printf("Proxy mode get header from: %s", proxyURL)
+	// 		proxyURL := fmt.Sprintf("%s%s", proxyRelayURL, req.URL.Path)
+	// 		log.Printf("Proxy mode get header from: %s", proxyURL)
 
-			resp, err := forwardRequest(req.Method, proxyURL, req)
-			if err != nil {
-				log.Printf("Error forwarding request: %v", err)
-				w.WriteHeader(http.StatusNoContent)
-				return
-			}
-			copyHeaders(w.Header(), resp.Header)
-			w.WriteHeader(resp.StatusCode)
-			io.Copy(w, resp.Body)
-			resp.Body.Close()
-			return
-		}
-	}
+	// 		resp, err := forwardRequest(req.Method, proxyURL, req)
+	// 		if err != nil {
+	// 			log.Printf("Error forwarding request: %v", err)
+	// 			w.WriteHeader(http.StatusNoContent)
+	// 			return
+	// 		}
+	// 		copyHeaders(w.Header(), resp.Header)
+	// 		w.WriteHeader(resp.StatusCode)
+	// 		io.Copy(w, resp.Body)
+	// 		resp.Body.Close()
+	// 		return
+	// 	}
+	// }
 
 	// If not in cache, proceed with existing logic
 	requestTime := time.Now().UTC()
@@ -2044,21 +2044,21 @@ func (api *RelayAPI) handleGetPayload(w http.ResponseWriter, req *http.Request) 
 	log.Printf("Initial reqClone: %+v", reqClone)
 	log.Printf("Initial reqClone.Body: %v", reqClone.Body)
 
-	if proxyMode {
-		proxyURL := fmt.Sprintf("%s%s", proxyRelayURL, req.URL.Path)
-		log.Printf("Proxy mode get payload from: %s", proxyURL)
+	// if proxyMode {
+	// 	proxyURL := fmt.Sprintf("%s%s", proxyRelayURL, req.URL.Path)
+	// 	log.Printf("Proxy mode get payload from: %s", proxyURL)
 
-		resp, err := forwardRequest(req.Method, proxyURL, reqClone)
-		if err != nil {
-			api.RespondError(w, http.StatusInternalServerError, "proxy request failed")
-			return
-		}
-		copyHeaders(w.Header(), resp.Header)
-		w.WriteHeader(resp.StatusCode)
-		io.Copy(w, resp.Body)
-		resp.Body.Close()
-		return
-	}
+	// 	resp, err := forwardRequest(req.Method, proxyURL, reqClone)
+	// 	if err != nil {
+	// 		api.RespondError(w, http.StatusInternalServerError, "proxy request failed")
+	// 		return
+	// 	}
+	// 	copyHeaders(w.Header(), resp.Header)
+	// 	w.WriteHeader(resp.StatusCode)
+	// 	io.Copy(w, resp.Body)
+	// 	resp.Body.Close()
+	// 	return
+	// }
 
 	api.getPayloadCallsInFlight.Add(1)
 	defer api.getPayloadCallsInFlight.Done()
@@ -2865,7 +2865,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 				log.WithError(err).Error("failed to get builder id from API")
 				builderResp = &BuilderResponse{
 					Slot:            slot,
-					Builders:        []string{defaultBuilder},
+					Builders:        []string{},
 					FallbackBuilder: defaultBuilder,
 				}
 			}
@@ -2873,7 +2873,10 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		}
 
 		builderPubkey := submission.BidTrace.BuilderPubkey.String()
-		if builderResp.isBuilder(builderPubkey) {
+		// If Builders array is empty, allow all builders
+		if len(builderResp.Builders) == 0 {
+			log.Printf("Array list is empty, indicate market is not open or exchange issue, allow all builder")
+		} else if builderResp.isBuilder(builderPubkey) {
 			log.Info("Builder pubkey matches FallbackBuilder or one of the Builders")
 		} else {
 			log.Info("Builder pubkey does not match FallbackBuilder or any of the Builders", " pubkey:", builderPubkey)
