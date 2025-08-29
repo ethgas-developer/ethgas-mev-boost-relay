@@ -228,10 +228,15 @@ func (p PubkeyHex) String() string {
 	return string(p)
 }
 
+type Preferences struct {
+	Filtering *string `json:"filtering,omitempty"`
+}
+
 type BuilderGetValidatorsResponseEntry struct {
 	Slot           uint64                                    `json:"slot,string"`
 	ValidatorIndex uint64                                    `json:"validator_index,string"`
 	Entry          *builderApiV1.SignedValidatorRegistration `json:"entry"`
+	Preferences    *Preferences                              `json:"preferences,omitempty"`
 }
 
 type BidTraceV2 struct {

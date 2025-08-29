@@ -1225,6 +1225,17 @@ func (api *RelayAPI) UpdateProposerDutiesWithoutChecks(headSlot uint64) {
 		return
 	}
 
+	for index := range duties {
+		feeRecipient := duties[index].Entry.Message.FeeRecipient.String()
+		if strings.EqualFold(feeRecipient, "0xbe6932de5de6e7f8fae2d9f013321aec36997a30") {
+			// Add preferences to the entry
+			filtering := "ofac"
+			duties[index].Preferences = &common.Preferences{
+				Filtering: &filtering,
+			}
+		}
+	}
+
 	// Prepare raw bytes for HTTP response
 	respBytes, err := json.Marshal(duties)
 	if err != nil {
@@ -2627,6 +2638,8 @@ func (api *RelayAPI) checkFloorBidValue(opts bidFloorOpts) (*big.Int, bool) {
 	slotLastPayloadDelivered, err := api.redis.GetLastSlotDelivered(context.Background(), opts.tx)
 	if err != nil && !errors.Is(err, redis.Nil) {
 		opts.log.WithError(err).Error("failed to get delivered payload slot from redis")
+	} else if opts.submission.BidTrace.Slot == slotLastPayloadDelivered {
+		opts.log.Info("allow submission but payload for this slot was already delivered")
 	} else if opts.submission.BidTrace.Slot <= slotLastPayloadDelivered {
 		opts.log.Info("rejecting submission because payload for this slot was already delivered")
 		api.RespondError(opts.w, http.StatusBadRequest, "payload for this slot was already delivered")
