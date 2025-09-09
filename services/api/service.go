@@ -61,6 +61,7 @@ import (
 
 const (
 	ErrBlockAlreadyKnown  = "simulation failed: block already known"
+	ErrBlockIsTooOld      = "simulation failed: block is too old, outside validation window"
 	ErrBlockRequiresReorg = "simulation failed: block requires a reorg"
 	ErrMissingTrieNode    = "missing trie node"
 )
@@ -972,38 +973,38 @@ func (api *RelayAPI) startValidatorRegistrationDBProcessor() {
 
 // simulateBlock sends a request for a block simulation to blockSimRateLimiter.
 func (api *RelayAPI) simulateBlock(ctx context.Context, opts blockSimOptions) (blockValue *uint256.Int, requestErr, validationErr error) {
-	// t := time.Now()
-	// response, requestErr, validationErr := api.blockSimRateLimiter.Send(ctx, opts.req, opts.isHighPrio, opts.fastTrack)
-	// log := opts.log.WithFields(logrus.Fields{
-	// 	"durationMs": time.Since(t).Milliseconds(),
-	// 	"numWaiting": api.blockSimRateLimiter.CurrentCounter(),
-	// })
-	// if validationErr != nil {
-	// 	if api.ffIgnorableValidationErrors {
-	// 		// Operators chooses to ignore certain validation errors
-	// 		ignoreError := validationErr.Error() == ErrBlockAlreadyKnown || validationErr.Error() == ErrBlockRequiresReorg || strings.Contains(validationErr.Error(), ErrMissingTrieNode)
-	// 		if ignoreError {
-	// 			log.WithError(validationErr).Warn("block validation failed with ignorable error")
-	// 			return nil, nil, nil
-	// 		}
-	// 	}
-	// 	log.WithError(validationErr).Warn("block validation failed")
-	// 	return nil, nil, validationErr
-	// }
-	// if requestErr != nil {
-	// 	log.WithError(requestErr).Warn("block validation failed: request error")
-	// 	return nil, requestErr, nil
-	// }
+	t := time.Now()
+	response, requestErr, validationErr := api.blockSimRateLimiter.Send(ctx, opts.req, opts.isHighPrio, opts.fastTrack)
+	log := opts.log.WithFields(logrus.Fields{
+		"durationMs": time.Since(t).Milliseconds(),
+		"numWaiting": api.blockSimRateLimiter.CurrentCounter(),
+	})
+	if validationErr != nil {
+		if api.ffIgnorableValidationErrors {
+			// Operators chooses to ignore certain validation errors
+			ignoreError := validationErr.Error() == ErrBlockIsTooOld || validationErr.Error() == ErrBlockAlreadyKnown || validationErr.Error() == ErrBlockRequiresReorg || strings.Contains(validationErr.Error(), ErrMissingTrieNode)
+			if ignoreError {
+				log.WithError(validationErr).Warn("block validation failed with ignorable error")
+				return nil, nil, nil
+			}
+		}
+		log.WithError(validationErr).Warn("block validation failed")
+		return nil, nil, validationErr
+	}
+	if requestErr != nil {
+		log.WithError(requestErr).Warn("block validation failed: request error")
+		return nil, requestErr, nil
+	}
 
-	// log.Info("block validation successful")
-	// if response == nil {
-	// 	log.Warn("block validation response is nil")
-	// 	return nil, nil, nil
-	// }
-	// return response.BlockValue, nil, nil
+	log.Info("block validation successful")
+	if response == nil {
+		log.Warn("block validation response is nil")
+		return nil, nil, nil
+	}
+	return response.BlockValue, nil, nil
 
-	blockValue = uint256.NewInt(9000000000000000000)
-	return blockValue, nil, nil
+	// blockValue = uint256.NewInt(9000000000000000000)
+	// return blockValue, nil, nil
 
 }
 
@@ -3346,28 +3347,32 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		builderEntry.collateral.Cmp(submission.BidTrace.Value.ToBig()) >= 0 &&
 		submission.BidTrace.Slot == api.optimisticSlot.Load()
 	pf.Optimistic = optimistic
-	if optimistic {
-		go api.processOptimisticBlock(opts, simResultC)
-	} else {
-		// Simulate block (synchronously).
-		blockValue, requestErr, validationErr := api.simulateBlock(context.Background(), opts) // success/error logging happens inside
-		simResultC <- &blockSimResult{requestErr == nil, blockValue, false, requestErr, validationErr}
-		validationDurationMs := time.Since(timeBeforeValidation).Milliseconds()
-		log = log.WithFields(logrus.Fields{
-			"timestampAfterValidation": time.Now().UTC().UnixMilli(),
-			"validationDurationMs":     validationDurationMs,
-		})
-		if requestErr != nil { // Request error
-			if os.IsTimeout(requestErr) {
-				api.RespondError(w, http.StatusGatewayTimeout, "validation request timeout")
-			} else {
-				api.RespondError(w, http.StatusBadRequest, requestErr.Error())
-			}
-			return
+	slotLastPayloadDelivered, err := api.redis.GetLastSlotDelivered(context.Background(), tx)
+	//no need simulate if the block is already delivered
+	if (err != nil && !errors.Is(err, redis.Nil)) || submission.BidTrace.Slot != slotLastPayloadDelivered {
+		if optimistic {
+			go api.processOptimisticBlock(opts, simResultC)
 		} else {
-			if validationErr != nil {
-				api.RespondError(w, http.StatusBadRequest, validationErr.Error())
+			// Simulate block (synchronously).
+			blockValue, requestErr, validationErr := api.simulateBlock(context.Background(), opts) // success/error logging happens inside
+			simResultC <- &blockSimResult{requestErr == nil, blockValue, false, requestErr, validationErr}
+			validationDurationMs := time.Since(timeBeforeValidation).Milliseconds()
+			log = log.WithFields(logrus.Fields{
+				"timestampAfterValidation": time.Now().UTC().UnixMilli(),
+				"validationDurationMs":     validationDurationMs,
+			})
+			if requestErr != nil { // Request error
+				if os.IsTimeout(requestErr) {
+					api.RespondError(w, http.StatusGatewayTimeout, "validation request timeout")
+				} else {
+					api.RespondError(w, http.StatusBadRequest, requestErr.Error())
+				}
 				return
+			} else {
+				if validationErr != nil {
+					api.RespondError(w, http.StatusBadRequest, validationErr.Error())
+					return
+				}
 			}
 		}
 	}

@@ -8,13 +8,17 @@
 package housekeeper
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	_ "net/http/pprof"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	"encoding/json"
 
 	"bitbucket.org/infinity-exchange/mev-boost-relay/beaconclient"
 	"bitbucket.org/infinity-exchange/mev-boost-relay/common"
@@ -25,6 +29,17 @@ import (
 	"github.com/sirupsen/logrus"
 	uberatomic "go.uber.org/atomic"
 )
+
+var (
+	exchangeAPIURL = GetEnvStr("EXCHANGE_API_URL", "http://localhost:3210")
+)
+
+func GetEnvStr(key, defaultValue string) string {
+	if value, ok := os.LookupEnv(key); ok {
+		return value
+	}
+	return defaultValue
+}
 
 type HousekeeperOpts struct {
 	Log          *logrus.Entry
@@ -54,6 +69,8 @@ type Housekeeper struct {
 	headSlot uberatomic.Uint64
 
 	proposersAlreadySaved map[uint64]string // to avoid repeating redis writes
+
+	httpClient *http.Client
 }
 
 var ErrServerAlreadyStarted = errors.New("server was already started")
@@ -68,6 +85,7 @@ func NewHousekeeper(opts *HousekeeperOpts) *Housekeeper {
 		pprofAPI:              opts.PprofAPI,
 		pprofListenAddress:    opts.PprofListenAddress,
 		proposersAlreadySaved: make(map[uint64]string),
+		httpClient:            &http.Client{Timeout: 10 * time.Second},
 	}
 
 	return server
@@ -207,6 +225,19 @@ func (hk *Housekeeper) UpdateProposerDutiesWithoutChecks(headSlot uint64) {
 		return
 	}
 
+	// Only check OFAC for pubkeys that actually have a registration
+	regPubkeys := make([]string, 0, len(validatorRegistrationEntries))
+	for _, regEntry := range validatorRegistrationEntries {
+		regPubkeys = append(regPubkeys, regEntry.Pubkey)
+	}
+
+	// get Ofac list here
+	ofacList := hk.checkValidatorsIsOfac(regPubkeys)
+	ofacSet := make(map[string]struct{}, len(ofacList))
+	for _, pk := range ofacList {
+		ofacSet[pk] = struct{}{}
+	}
+
 	// Convert db entries to signed validator registration type
 	signedValidatorRegistrations := make(map[string]*builderApiV1.SignedValidatorRegistration)
 	for _, regEntry := range validatorRegistrationEntries {
@@ -222,11 +253,19 @@ func (hk *Housekeeper) UpdateProposerDutiesWithoutChecks(headSlot uint64) {
 	proposerDuties := []common.BuilderGetValidatorsResponseEntry{}
 	for _, duty := range entries {
 		reg := signedValidatorRegistrations[duty.Pubkey]
+		var entryPreferences *common.Preferences
+		if _, isOfac := ofacSet[strings.ToLower(duty.Pubkey)]; isOfac {
+			log.Debug("Validator is OFAC")
+
+			filtering := "ofac"
+			entryPreferences = &common.Preferences{Filtering: &filtering}
+		}
 		if reg != nil {
 			proposerDuties = append(proposerDuties, common.BuilderGetValidatorsResponseEntry{
 				Slot:           duty.Slot,
 				ValidatorIndex: duty.ValidatorIndex,
 				Entry:          reg,
+				Preferences:    entryPreferences,
 			})
 		}
 	}
@@ -267,4 +306,81 @@ func (hk *Housekeeper) updateValidatorRegistrationsInRedis() {
 		}
 	}
 	hk.log.Infof("updating %d validator registrations in Redis done - %f sec", len(regs), time.Since(timeStarted).Seconds())
+}
+
+func (hk *Housekeeper) checkValidatorsIsOfac(pubkeys []string) []string {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Lowercase and dedup input
+	seen := make(map[string]struct{}, len(pubkeys))
+	lower := make([]string, 0, len(pubkeys))
+	for _, pk := range pubkeys {
+		pkl := strings.ToLower(pk)
+		if _, ok := seen[pkl]; !ok {
+			seen[pkl] = struct{}{}
+			lower = append(lower, pkl)
+		}
+	}
+
+	type ofacData struct {
+		OfacValidators []string `json:"ofacValidator"`
+	}
+	type apiResponse struct {
+		Success bool     `json:"success"`
+		Data    ofacData `json:"data"`
+	}
+
+	const batchSize = 16
+	ofacSet := make(map[string]struct{})
+
+	for i := 0; i < len(lower); i += batchSize {
+		end := i + batchSize
+		if end > len(lower) {
+			end = len(lower)
+		}
+		batch := lower[i:end]
+
+		url := exchangeAPIURL + "/api/v1/p/validator/checkIsOfac?publicKeys=" + strings.Join(batch, ",")
+		hk.log.Infof("checking %d validator registrations for OFAC...", len(batch))
+		hk.log.Info(url)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+		if err != nil {
+			hk.log.WithError(err).Error("failed to create checkValidatorsIsOfac request")
+			continue
+		}
+
+		resp, err := hk.httpClient.Do(req)
+		if err != nil {
+			hk.log.WithError(err).Warn("exchange checkValidatorsIsOfac failed")
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			hk.log.Warnf("checkValidatorsIsOfac returned non-200 status: %d", resp.StatusCode)
+			resp.Body.Close()
+			continue
+		}
+		var result apiResponse
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			hk.log.WithError(err).Error("failed to decode checkValidatorsIsOfac response")
+			resp.Body.Close()
+			continue
+		}
+		resp.Body.Close()
+
+		for _, pk := range result.Data.OfacValidators {
+			ofacSet[strings.ToLower(pk)] = struct{}{}
+		}
+		hk.log.Infof("OFAC response retrieved: %+v", result.Data)
+		hk.log.Infof("OFAC list retrieved: %v", result.Data.OfacValidators)
+	}
+
+	// Convert set to slice
+	out := make([]string, 0, len(ofacSet))
+
+	for pk := range ofacSet {
+		hk.log.Infof("OFAC validator: %s", pk)
+		out = append(out, pk)
+	}
+	return out
 }
