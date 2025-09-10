@@ -31,7 +31,8 @@ import (
 )
 
 var (
-	exchangeAPIURL = GetEnvStr("EXCHANGE_API_URL", "http://localhost:3210")
+	exchangeAPIURL       = GetEnvStr("EXCHANGE_API_URL", "http://localhost:3210")
+	isOfacCheckingEnable = os.Getenv("OFAC_CHECKING") == "1"
 )
 
 func GetEnvStr(key, defaultValue string) string {
@@ -309,78 +310,81 @@ func (hk *Housekeeper) updateValidatorRegistrationsInRedis() {
 }
 
 func (hk *Housekeeper) checkValidatorsIsOfac(pubkeys []string) []string {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	if isOfacCheckingEnable {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 
-	// Lowercase and dedup input
-	seen := make(map[string]struct{}, len(pubkeys))
-	lower := make([]string, 0, len(pubkeys))
-	for _, pk := range pubkeys {
-		pkl := strings.ToLower(pk)
-		if _, ok := seen[pkl]; !ok {
-			seen[pkl] = struct{}{}
-			lower = append(lower, pkl)
-		}
-	}
-
-	type ofacData struct {
-		OfacValidators []string `json:"ofacValidator"`
-	}
-	type apiResponse struct {
-		Success bool     `json:"success"`
-		Data    ofacData `json:"data"`
-	}
-
-	const batchSize = 16
-	ofacSet := make(map[string]struct{})
-
-	for i := 0; i < len(lower); i += batchSize {
-		end := i + batchSize
-		if end > len(lower) {
-			end = len(lower)
-		}
-		batch := lower[i:end]
-
-		url := exchangeAPIURL + "/api/v1/p/validator/checkIsOfac?publicKeys=" + strings.Join(batch, ",")
-		hk.log.Infof("checking %d validator registrations for OFAC...", len(batch))
-		hk.log.Info(url)
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
-		if err != nil {
-			hk.log.WithError(err).Error("failed to create checkValidatorsIsOfac request")
-			continue
+		// Lowercase and dedup input
+		seen := make(map[string]struct{}, len(pubkeys))
+		lower := make([]string, 0, len(pubkeys))
+		for _, pk := range pubkeys {
+			pkl := strings.ToLower(pk)
+			if _, ok := seen[pkl]; !ok {
+				seen[pkl] = struct{}{}
+				lower = append(lower, pkl)
+			}
 		}
 
-		resp, err := hk.httpClient.Do(req)
-		if err != nil {
-			hk.log.WithError(err).Warn("exchange checkValidatorsIsOfac failed")
-			continue
+		type ofacData struct {
+			OfacValidators []string `json:"ofacValidator"`
 		}
-		if resp.StatusCode != http.StatusOK {
-			hk.log.Warnf("checkValidatorsIsOfac returned non-200 status: %d", resp.StatusCode)
+		type apiResponse struct {
+			Success bool     `json:"success"`
+			Data    ofacData `json:"data"`
+		}
+
+		const batchSize = 16
+		ofacSet := make(map[string]struct{})
+
+		for i := 0; i < len(lower); i += batchSize {
+			end := i + batchSize
+			if end > len(lower) {
+				end = len(lower)
+			}
+			batch := lower[i:end]
+
+			url := exchangeAPIURL + "/api/v1/p/validator/checkIsOfac?publicKeys=" + strings.Join(batch, ",")
+			hk.log.Infof("checking %d validator registrations for OFAC...", len(batch))
+			hk.log.Info(url)
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+			if err != nil {
+				hk.log.WithError(err).Error("failed to create checkValidatorsIsOfac request")
+				continue
+			}
+
+			resp, err := hk.httpClient.Do(req)
+			if err != nil {
+				hk.log.WithError(err).Warn("exchange checkValidatorsIsOfac failed")
+				continue
+			}
+			if resp.StatusCode != http.StatusOK {
+				hk.log.Warnf("checkValidatorsIsOfac returned non-200 status: %d", resp.StatusCode)
+				resp.Body.Close()
+				continue
+			}
+			var result apiResponse
+			if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+				hk.log.WithError(err).Error("failed to decode checkValidatorsIsOfac response")
+				resp.Body.Close()
+				continue
+			}
 			resp.Body.Close()
-			continue
-		}
-		var result apiResponse
-		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-			hk.log.WithError(err).Error("failed to decode checkValidatorsIsOfac response")
-			resp.Body.Close()
-			continue
-		}
-		resp.Body.Close()
 
-		for _, pk := range result.Data.OfacValidators {
-			ofacSet[strings.ToLower(pk)] = struct{}{}
+			for _, pk := range result.Data.OfacValidators {
+				ofacSet[strings.ToLower(pk)] = struct{}{}
+			}
+			hk.log.Infof("OFAC response retrieved: %+v", result.Data)
+			hk.log.Infof("OFAC list retrieved: %v", result.Data.OfacValidators)
 		}
-		hk.log.Infof("OFAC response retrieved: %+v", result.Data)
-		hk.log.Infof("OFAC list retrieved: %v", result.Data.OfacValidators)
+
+		// Convert set to slice
+		out := make([]string, 0, len(ofacSet))
+
+		for pk := range ofacSet {
+			hk.log.Infof("OFAC validator: %s", pk)
+			out = append(out, pk)
+		}
+		return out
 	}
-
-	// Convert set to slice
-	out := make([]string, 0, len(ofacSet))
-
-	for pk := range ofacSet {
-		hk.log.Infof("OFAC validator: %s", pk)
-		out = append(out, pk)
-	}
-	return out
+	return make([]string, 0)
 }

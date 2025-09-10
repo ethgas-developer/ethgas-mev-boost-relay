@@ -61,7 +61,7 @@ import (
 
 const (
 	ErrBlockAlreadyKnown  = "simulation failed: block already known"
-	ErrBlockIsTooOld      = "simulation failed: block is too old, outside validation window"
+	ErrBlockIsTooOld      = "block is too old"
 	ErrBlockRequiresReorg = "simulation failed: block requires a reorg"
 	ErrMissingTrieNode    = "missing trie node"
 )
@@ -982,7 +982,7 @@ func (api *RelayAPI) simulateBlock(ctx context.Context, opts blockSimOptions) (b
 	if validationErr != nil {
 		if api.ffIgnorableValidationErrors {
 			// Operators chooses to ignore certain validation errors
-			ignoreError := validationErr.Error() == ErrBlockIsTooOld || validationErr.Error() == ErrBlockAlreadyKnown || validationErr.Error() == ErrBlockRequiresReorg || strings.Contains(validationErr.Error(), ErrMissingTrieNode)
+			ignoreError := strings.Contains(validationErr.Error(), ErrBlockIsTooOld) || validationErr.Error() == ErrBlockAlreadyKnown || validationErr.Error() == ErrBlockRequiresReorg || strings.Contains(validationErr.Error(), ErrMissingTrieNode)
 			if ignoreError {
 				log.WithError(validationErr).Warn("block validation failed with ignorable error")
 				return nil, nil, nil
