@@ -60,10 +60,11 @@ import (
 )
 
 const (
-	ErrBlockAlreadyKnown  = "simulation failed: block already known"
-	ErrBlockIsTooOld      = "block is too old"
-	ErrBlockRequiresReorg = "simulation failed: block requires a reorg"
-	ErrMissingTrieNode    = "missing trie node"
+	ErrBlockAlreadyKnown   = "simulation failed: block already known"
+	ErrBlockIsTooOld       = "block is too old"
+	ErrBlockParentNotFound = "parent block not found"
+	ErrBlockRequiresReorg  = "simulation failed: block requires a reorg"
+	ErrMissingTrieNode     = "missing trie node"
 )
 
 var (
@@ -982,7 +983,7 @@ func (api *RelayAPI) simulateBlock(ctx context.Context, opts blockSimOptions) (b
 	if validationErr != nil {
 		if api.ffIgnorableValidationErrors {
 			// Operators chooses to ignore certain validation errors
-			ignoreError := strings.Contains(validationErr.Error(), ErrBlockIsTooOld) || validationErr.Error() == ErrBlockAlreadyKnown || validationErr.Error() == ErrBlockRequiresReorg || strings.Contains(validationErr.Error(), ErrMissingTrieNode)
+			ignoreError := isIgnorableError(validationErr)
 			if ignoreError {
 				log.WithError(validationErr).Warn("block validation failed with ignorable error")
 				return nil, nil, nil
@@ -1006,6 +1007,18 @@ func (api *RelayAPI) simulateBlock(ctx context.Context, opts blockSimOptions) (b
 	// blockValue = uint256.NewInt(9000000000000000000)
 	// return blockValue, nil, nil
 
+}
+
+func isIgnorableError(err error) bool {
+	errStr := err.Error()
+
+	if errStr == ErrBlockAlreadyKnown || errStr == ErrBlockRequiresReorg {
+		return true
+	}
+
+	return strings.Contains(errStr, ErrBlockParentNotFound) ||
+		strings.Contains(errStr, ErrBlockIsTooOld) ||
+		strings.Contains(errStr, ErrMissingTrieNode)
 }
 
 func (api *RelayAPI) demoteBuilder(pubkey string, req *common.VersionedSubmitBlockRequest, simError error) {
