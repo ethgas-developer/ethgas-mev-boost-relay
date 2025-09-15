@@ -65,6 +65,7 @@ const (
 	ErrBlockParentNotFound = "parent block not found"
 	ErrBlockRequiresReorg  = "simulation failed: block requires a reorg"
 	ErrMissingTrieNode     = "missing trie node"
+	ErrClientTimeout       = "Client.Timeout exceeded while awaiting headers"
 )
 
 var (
@@ -994,6 +995,15 @@ func (api *RelayAPI) simulateBlock(ctx context.Context, opts blockSimOptions) (b
 	}
 	if requestErr != nil {
 		log.WithError(requestErr).Warn("block validation failed: request error")
+		if api.ffIgnorableValidationErrors {
+			// Operators chooses to ignore certain validation errors
+			ignoreError := isIgnorableError(requestErr)
+			if ignoreError {
+				log.WithError(requestErr).Warn("block validation failed with ignorable error")
+				return nil, nil, nil
+			}
+		}
+
 		return nil, requestErr, nil
 	}
 
@@ -1018,7 +1028,8 @@ func isIgnorableError(err error) bool {
 
 	return strings.Contains(errStr, ErrBlockParentNotFound) ||
 		strings.Contains(errStr, ErrBlockIsTooOld) ||
-		strings.Contains(errStr, ErrMissingTrieNode)
+		strings.Contains(errStr, ErrMissingTrieNode) ||
+		strings.Contains(errStr, ErrClientTimeout)
 }
 
 func (api *RelayAPI) demoteBuilder(pubkey string, req *common.VersionedSubmitBlockRequest, simError error) {
