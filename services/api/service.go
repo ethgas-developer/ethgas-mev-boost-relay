@@ -2232,6 +2232,7 @@ func (api *RelayAPI) handleGetPayload(w http.ResponseWriter, req *http.Request) 
 	}
 
 	// Validate proposer signature
+	log.Infof("checkProposerSignature - Version: %v", payload.Version)
 	ok, err := api.checkProposerSignature(payload, pk[:])
 	if !ok || err != nil {
 		if api.ffLogInvalidSignaturePayload {
@@ -2604,6 +2605,7 @@ func (api *RelayAPI) checkSubmissionSlotDetails(w http.ResponseWriter, log *logr
 		return false
 	}
 	if api.isElectra(submission.BidTrace.Slot) && payload.Electra == nil {
+		log.Infof("Payload details - Version: %v, Electra: %v", payload.Version, payload.Electra)
 		log.Info("rejecting submission - non electra payload for electra fork")
 		api.RespondError(w, http.StatusBadRequest, "not electra payload")
 		return false
@@ -2778,6 +2780,21 @@ func (api *RelayAPI) updateRedisBid(opts redisUpdateBidOpts) (*datastore.SaveBid
 	return &updateBidResult, getPayloadResponse, true
 }
 
+func (api *RelayAPI) getForkFromSlot(slot uint64) spec.DataVersion {
+	switch {
+	case api.isFulu(slot):
+		return spec.DataVersionFulu
+	case api.isElectra(slot):
+		return spec.DataVersionElectra
+	case api.isDeneb(slot):
+		return spec.DataVersionDeneb
+	case api.isCapella(slot):
+		return spec.DataVersionCapella
+	default:
+		return spec.DataVersionUnknown
+	}
+}
+
 func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Request) {
 	var pf common.Profile
 	var prevTime, nextTime time.Time
@@ -2845,36 +2862,48 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	payload := new(common.VersionedSubmitBlockRequest)
 
 	// Check for SSZ encoding
-	contentType := req.Header.Get("Content-Type")
+	contentType, _, err := getHeaderContentType(req.Header)
+	if err != nil {
+		api.log.WithError(err).Error("failed to parse proposer content type")
+		api.RespondError(w, http.StatusUnsupportedMediaType, err.Error())
+		return
+	}
 
-	if contentType == "application/octet-stream" {
+	if contentType == common.ApplicationOctetStream {
 		log = log.WithField("reqContentType", "ssz")
-		pf.ContentType = "ssz"
-		if err = payload.UnmarshalSSZ(requestPayloadBytes); err != nil {
-			log.WithError(err).Warn("could not decode payload - SSZ")
+	} else {
+		log = log.WithField("reqContentType", "json")
+	}
 
-			// SSZ decoding failed. try JSON as fallback (some builders used octet-stream for json before)
-			if err2 := json.Unmarshal(requestPayloadBytes, payload); err2 != nil {
-				log.WithError(fmt.Errorf("%w / %w", err, err2)).Warn("could not decode payload - SSZ or JSON")
+	builderEthConsensusVersion := req.Header.Get(HeaderEthConsensusVersion)
+	if builderEthConsensusVersion == "" {
+		// don't reject a builder submission if the Eth-Consensus-Version header is not present
+		if contentType == common.ApplicationOctetStream {
+			slot, err := getSlotFromBuilderSSZPayload(requestPayloadBytes)
+			if err != nil {
+				log.WithError(err).Warn("could not get slot from builder ssz payload")
 				api.RespondError(w, http.StatusBadRequest, err.Error())
 				return
 			}
-			log = log.WithField("reqContentType", "json")
-			pf.ContentType = "json"
+			builderEthConsensusVersion = api.getForkFromSlot(slot).String()
 		} else {
-			log.Debug("received ssz-encoded payload")
-		}
-	} else {
-		log = log.WithField("reqContentType", "json")
-		pf.ContentType = "json"
-		if err := json.Unmarshal(requestPayloadBytes, payload); err != nil {
-			log.WithError(err).Warn("could not decode payload - JSON")
-			api.RespondError(w, http.StatusBadRequest, err.Error())
-			return
+			slot, err := getSlotFromBuilderJSONPayload(requestPayloadBytes)
+			if err != nil {
+				log.WithError(err).Warn("could not get slot from builder json payload")
+				api.RespondError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			builderEthConsensusVersion = api.getForkFromSlot(slot).String()
 		}
 	}
 
 	nextTime = time.Now().UTC()
+	if err := payload.UnmarshalWithVersion(requestPayloadBytes, contentType, builderEthConsensusVersion); err != nil {
+		log.WithError(err).Warn("could not decode payload")
+		api.RespondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	pf.Decode = uint64(nextTime.Sub(prevTime).Microseconds()) //nolint:gosec
 	prevTime = nextTime
 
