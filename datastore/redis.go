@@ -680,9 +680,9 @@ func (r *RedisCache) SaveBidAndUpdateTopBid(ctx context.Context, pipeliner redis
 	// If top bid value hasn't changed, abort now
 	_, state.TopBidValue = builderBids.getTopBid()
 	// preconf txs should have 0 bid value if there have no public txs
-	// if state.TopBidValue.Cmp(state.PrevTopBidValue) == 0 {
-	// 	return state, nil
-	// }
+	if state.TopBidValue.Cmp(state.PrevTopBidValue) == 0 {
+		return state, nil
+	}
 
 	state, err = r._updateTopBid(ctx, pipeliner, state, builderBids, submission.BidTrace.Slot, submission.BidTrace.ParentHash.String(), submission.BidTrace.ProposerPubkey.String(), floorValue)
 	if err != nil {
