@@ -2173,7 +2173,30 @@ func (api *RelayAPI) handleGetPayload(w http.ResponseWriter, req *http.Request) 
 
 	// Get the optional consensus version
 	proposerEthConsensusVersion := req.Header.Get(HeaderEthConsensusVersion)
+	log.Infof("HeaderEthConsensusVersion - Version: %s", proposerEthConsensusVersion)
+
 	payload := new(common.VersionedSignedBlindedBeaconBlock)
+	if proposerEthConsensusVersion == "" {
+		if proposerMediaType == ApplicationJSON {
+			if err := json.NewDecoder(bytes.NewReader(body)).Decode(payload); err != nil {
+				log.WithError(err).Warn("failed to decode getPayload request by NewDecoder")
+				api.RespondError(w, http.StatusBadRequest, "failed to decode payload")
+				return
+			}
+			slot, err := payload.Slot()
+			if err != nil {
+				log.WithError(err).Warn("failed to get payload slot")
+				api.RespondError(w, http.StatusBadRequest, "failed to get payload slot")
+				return
+			}
+			proposerEthConsensusVersion = api.getForkFromSlot(uint64(slot)).String()
+		} else {
+			// For SSZ, the consensus version is required to decode
+			api.RespondError(w, http.StatusUnsupportedMediaType, "missing Eth-Consensus-Version header for SSZ payload")
+			return
+		}
+	}
+
 	err = payload.Unmarshal(body, proposerMediaType, proposerEthConsensusVersion)
 	if err != nil {
 		log.WithError(err).Warn("failed to decode getPayload request")
