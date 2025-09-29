@@ -13,6 +13,7 @@ import (
 	"io/ioutil"
 	"log"
 	"math/big"
+	"mime"
 	"net/http"
 	_ "net/http/pprof"
 	"net/url"
@@ -97,6 +98,7 @@ var (
 	pathDataProposerPayloadDelivered = "/relay/v1/data/bidtraces/proposer_payload_delivered"
 	pathDataBuilderBidsReceived      = "/relay/v1/data/bidtraces/builder_blocks_received"
 	pathDataValidatorRegistration    = "/relay/v1/data/validator_registration"
+	pathDataValidatorsRegistration   = "/relay/v1/data/validators_registration"
 
 	// Internal API
 	pathInternalBuilderStatus     = "/internal/v1/builder/{pubkey:0x[a-fA-F0-9]+}"
@@ -749,6 +751,8 @@ func (api *RelayAPI) getRouter() http.Handler {
 		r.HandleFunc(pathDataProposerPayloadDelivered, api.handleDataProposerPayloadDelivered).Methods(http.MethodGet)
 		r.HandleFunc(pathDataBuilderBidsReceived, api.handleDataBuilderBidsReceived).Methods(http.MethodGet)
 		r.HandleFunc(pathDataValidatorRegistration, api.handleDataValidatorRegistration).Methods(http.MethodGet)
+		r.HandleFunc(pathDataValidatorsRegistration, api.handleDataValidatorsRegistration).Methods(http.MethodPost)
+
 	}
 
 	// Pprof
@@ -2158,8 +2162,20 @@ func (api *RelayAPI) handleGetPayload(w http.ResponseWriter, req *http.Request) 
 	}
 
 	// Decode payload
+	// Determine what encoding the proposer sent
+	proposerContentType := req.Header.Get(HeaderContentType)
+	proposerMediaType, _, err := mime.ParseMediaType(proposerContentType)
+	if err != nil {
+		api.log.WithError(err).Error("failed to parse proposer content type")
+		api.RespondError(w, http.StatusUnsupportedMediaType, err.Error())
+		return
+	}
+
+	// Get the optional consensus version
+	proposerEthConsensusVersion := req.Header.Get(HeaderEthConsensusVersion)
 	payload := new(common.VersionedSignedBlindedBeaconBlock)
-	if err := json.NewDecoder(bytes.NewReader(body)).Decode(payload); err != nil {
+	err = payload.Unmarshal(body, proposerMediaType, proposerEthConsensusVersion)
+	if err != nil {
 		log.WithError(err).Warn("failed to decode getPayload request")
 		api.RespondError(w, http.StatusBadRequest, "failed to decode payload")
 		return
@@ -2917,9 +2933,6 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	}
 	slotStartTimestamp := api.genesisInfo.Data.GenesisTime + ((submission.BidTrace.Slot) * common.SecondsPerSlot)
 	msIntoSlot := receivedAt.UnixMilli() - int64((slotStartTimestamp * 1000))
-	api.log.Info("=====msIntoSlo")
-
-	api.log.Info(msIntoSlot)
 	//before deadline: no check, is valid = false
 	//after deadline: check builder id, is fullfilled preconf, is valid = false/true
 	//get header: 1. builder + true, 2. fallback builder + true, 3. builder + false 4. fallback builder + false 5. other builder
@@ -3902,6 +3915,83 @@ func (api *RelayAPI) handleDataValidatorRegistration(w http.ResponseWriter, req 
 	}
 
 	api.RespondOK(w, signedRegistration)
+}
+
+func (api *RelayAPI) handleDataValidatorsRegistration(w http.ResponseWriter, req *http.Request) {
+	// Define request structure
+	type ValidatorsRequest struct {
+		Pubkeys []string `json:"pubkeys"`
+	}
+
+	// Read and parse request body
+	limitReader := io.LimitReader(req.Body, int64(apiMaxPayloadBytes))
+	body, err := io.ReadAll(limitReader)
+	if err != nil {
+		api.log.WithError(err).Warn("failed to read request body")
+		api.RespondError(w, http.StatusBadRequest, "failed to read request body")
+		return
+	}
+	defer req.Body.Close()
+
+	var request ValidatorsRequest
+	if err := json.Unmarshal(body, &request); err != nil {
+		api.log.WithError(err).Warn("failed to decode request body")
+		api.RespondError(w, http.StatusBadRequest, "failed to decode request body")
+		return
+	}
+
+	// Validate input
+	if len(request.Pubkeys) == 0 {
+		api.RespondError(w, http.StatusBadRequest, "no pubkeys provided")
+		return
+	}
+
+	// Validate each pubkey format
+	for _, pkStr := range request.Pubkeys {
+		if pkStr == "" {
+			api.RespondError(w, http.StatusBadRequest, "empty pubkey provided")
+			return
+		}
+		_, err := utils.HexToPubkey(pkStr)
+		if err != nil {
+			api.log.WithError(err).WithField("pubkey", pkStr).Warn("invalid pubkey format")
+			api.RespondError(w, http.StatusBadRequest, fmt.Sprintf("invalid pubkey format: %s", pkStr))
+			return
+		}
+	}
+
+	// Get existing registrations from database
+	validatorRegistrationEntries, err := api.db.GetValidatorRegistrationsForPubkeys(request.Pubkeys)
+	if err != nil {
+		api.log.WithError(err).Error("error getting validator registrations")
+		api.RespondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	// Create a map of registered pubkeys for efficient lookup
+	registeredPubkeys := make(map[string]bool)
+	for _, entry := range validatorRegistrationEntries {
+		registeredPubkeys[entry.Pubkey] = true
+	}
+
+	// Find pubkeys that are NOT registered
+	var notRegistered []string
+	for _, pubkey := range request.Pubkeys {
+		if !registeredPubkeys[pubkey] {
+			notRegistered = append(notRegistered, pubkey)
+		}
+	}
+
+	// Define response structure
+	type ValidatorsResponse struct {
+		NotRegistered []string `json:"not_registered"`
+	}
+
+	response := ValidatorsResponse{
+		NotRegistered: notRegistered,
+	}
+
+	api.RespondOK(w, response)
 }
 
 func (api *RelayAPI) handleLivez(w http.ResponseWriter, req *http.Request) {
