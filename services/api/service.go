@@ -4005,6 +4005,11 @@ func (api *RelayAPI) handleDataValidatorsRegistration(w http.ResponseWriter, req
 		}
 	}
 
+	// Ensure we always return an empty array, not nil
+	if notRegistered == nil {
+		notRegistered = []string{}
+	}
+
 	// Define response structure
 	type ValidatorsResponse struct {
 		NotRegistered []string `json:"not_registered"`
