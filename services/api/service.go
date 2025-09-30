@@ -3983,6 +3983,11 @@ func (api *RelayAPI) handleDataValidatorsRegistration(w http.ResponseWriter, req
 		}
 	}
 
+	// Convert all pubkeys to lowercase
+	for i, pkStr := range request.Pubkeys {
+		request.Pubkeys[i] = strings.ToLower(pkStr)
+	}
+
 	// Get existing registrations from database
 	validatorRegistrationEntries, err := api.db.GetValidatorRegistrationsForPubkeys(request.Pubkeys)
 	if err != nil {
