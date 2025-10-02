@@ -2563,38 +2563,27 @@ func (api *RelayAPI) checkSubmissionFeeRecipient(w http.ResponseWriter, log *log
 	api.proposerDutiesLock.RLock()
 	slotDuty := api.proposerDutiesMap[bidTrace.Slot]
 	api.proposerDutiesLock.RUnlock()
-	// expectedFeeRecipient := ""
+	expectedFeeRecipient := ""
 	if slotDuty != nil {
-		// expectedFeeRecipient = slotDuty.Entry.Message.FeeRecipient.String()
+		expectedFeeRecipient = slotDuty.Entry.Message.FeeRecipient.String()
 	} else {
 		log.Warn("could not find slot duty")
 		api.RespondError(w, http.StatusBadRequest, "could not find slot duty")
 		return 0, false
 	}
 
-	//only fall back builder (our builder) need to check this.
-	// if feeRecipient != "" {
-	// 	expectedFeeRecipient = feeRecipient
-	// 	if strings.EqualFold(builderPubkey, defaultBuilder) && !strings.EqualFold(expectedFeeRecipient, bidTrace.ProposerFeeRecipient.String()) {
-	// 		//only fallback builder need to check fee recipient
-	// 		log.WithFields(logrus.Fields{
-	// 			"expectedFeeRecipient": expectedFeeRecipient,
-	// 			"actualFeeRecipient":   bidTrace.ProposerFeeRecipient.String(),
-	// 		}).Info("fee recipient does not match")
-	// 		api.RespondError(w, http.StatusBadRequest, "fee recipient does not match")
-	// 		return 0, false
-	// 	}
-	// } else {
-	// 	if strings.EqualFold(builderPubkey, defaultBuilder) && !strings.EqualFold(expectedFeeRecipient, bidTrace.ProposerFeeRecipient.String()) && !strings.EqualFold(defaultFeeRecipient, bidTrace.ProposerFeeRecipient.String()) {
-	// 		//only fallback builder need to check fee recipient
-	// 		log.WithFields(logrus.Fields{
-	// 			"expectedFeeRecipient": expectedFeeRecipient,
-	// 			"actualFeeRecipient":   bidTrace.ProposerFeeRecipient.String(),
-	// 		}).Info("fee recipient does not match")
-	// 		api.RespondError(w, http.StatusBadRequest, "fee recipient does not match")
-	// 		return 0, false
-	// 	}
-	// }
+	//all builder need to send the payout to new block buyer
+	if feeRecipient != "" {
+		expectedFeeRecipient = feeRecipient
+	}
+	if !strings.EqualFold(expectedFeeRecipient, bidTrace.ProposerFeeRecipient.String()) {
+		log.WithFields(logrus.Fields{
+			"expectedFeeRecipient": expectedFeeRecipient,
+			"actualFeeRecipient":   bidTrace.ProposerFeeRecipient.String(),
+		}).Info("fee recipient does not match")
+		api.RespondError(w, http.StatusBadRequest, "fee recipient does not match")
+		return 0, false
+	}
 	return slotDuty.Entry.Message.GasLimit, true
 }
 
@@ -3012,71 +3001,75 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 			expiration: time.Now().Add(1 * time.Minute),
 		})
 		if msIntoSlot >= int64(getExchangeFinalizedCutoffMs) {
-			if !skipPreconfCheck {
-				// Cache management code
-				preconfCacheMutex.Lock()
-				if submission.BidTrace.Slot != currentSlot {
-					preconfCache = make(map[uint64]PreconfBundles)
-					currentSlot = submission.BidTrace.Slot
+			// Cache management code
+			preconfCacheMutex.Lock()
+			if submission.BidTrace.Slot != currentSlot {
+				preconfCache = make(map[uint64]PreconfBundles)
+				currentSlot = submission.BidTrace.Slot
+			}
+			preconfCacheMutex.Unlock()
+
+			// Check cache first
+			preconfCacheMutex.RLock()
+			cachedPreconfs, exists := preconfCache[submission.BidTrace.Slot]
+			preconfCacheMutex.RUnlock()
+
+			if !exists {
+				// url := fmt.Sprintf("%s/api/slot/bundles?slot=%d", client.APIURL, submission.BidTrace.Slot)
+				url := fmt.Sprintf("%s/api/v1/slot/bundles?slot=%d", client.APIURL, submission.BidTrace.Slot)
+				log.Printf(url)
+				req, err := http.NewRequest("GET", url, nil)
+				if err != nil {
+					log.Printf("cannot fetch preconf requests from preconf server, %v", err)
+					return
 				}
+				header := fmt.Sprintf("Bearer %s", client.AccessToken)
+				req.Header.Set("AUTHORIZATION", header)
+
+				resp, err := client.Client.Do(req)
+				if err != nil {
+					log.Printf("cannot fetch preconf requests from preconf server, %v", err)
+					return
+				}
+				defer resp.Body.Close()
+
+				var apiResponse ApiResponse
+				err = json.NewDecoder(resp.Body).Decode(&apiResponse)
+				if err != nil {
+					log.Printf("Failed to fetch preconf request: %v", err)
+					return
+				}
+
+				if !apiResponse.Success {
+					log.Printf("Failed to fetch inclusion preconf from server: %v", apiResponse)
+					return
+				}
+
+				// Log the raw data before unmarshaling
+				log.Printf("Raw preconf bundles data: %s", string(apiResponse.Data))
+
+				var preconfBundles PreconfBundles
+				err = json.Unmarshal(apiResponse.Data, &preconfBundles)
+				if err != nil {
+					log.Printf("Failed to unmarshal preconf bundles: %v, raw data: %s", err, string(apiResponse.Data))
+					return
+				}
+
+				// Log the successfully unmarshaled data
+				log.Printf("Successfully unmarshaled preconf bundles: %+v", preconfBundles)
+
+				// Store in cache
+				preconfCacheMutex.Lock()
+				preconfCache[submission.BidTrace.Slot] = preconfBundles
 				preconfCacheMutex.Unlock()
 
-				// Check cache first
-				preconfCacheMutex.RLock()
-				cachedPreconfs, exists := preconfCache[submission.BidTrace.Slot]
-				preconfCacheMutex.RUnlock()
+				cachedPreconfs = preconfBundles
+			}
+			if cachedPreconfs.FeeRecipient != "" {
+				feeRecipient = cachedPreconfs.FeeRecipient
+			}
 
-				if !exists {
-					// url := fmt.Sprintf("%s/api/slot/bundles?slot=%d", client.APIURL, submission.BidTrace.Slot)
-					url := fmt.Sprintf("%s/api/v1/slot/bundles?slot=%d", client.APIURL, submission.BidTrace.Slot)
-					log.Printf(url)
-					req, err := http.NewRequest("GET", url, nil)
-					if err != nil {
-						log.Printf("cannot fetch preconf requests from preconf server, %v", err)
-						return
-					}
-					header := fmt.Sprintf("Bearer %s", client.AccessToken)
-					req.Header.Set("AUTHORIZATION", header)
-
-					resp, err := client.Client.Do(req)
-					if err != nil {
-						log.Printf("cannot fetch preconf requests from preconf server, %v", err)
-						return
-					}
-					defer resp.Body.Close()
-
-					var apiResponse ApiResponse
-					err = json.NewDecoder(resp.Body).Decode(&apiResponse)
-					if err != nil {
-						log.Printf("Failed to fetch preconf request: %v", err)
-						return
-					}
-
-					if !apiResponse.Success {
-						log.Printf("Failed to fetch inclusion preconf from server: %v", apiResponse)
-						return
-					}
-
-					// Log the raw data before unmarshaling
-					log.Printf("Raw preconf bundles data: %s", string(apiResponse.Data))
-
-					var preconfBundles PreconfBundles
-					err = json.Unmarshal(apiResponse.Data, &preconfBundles)
-					if err != nil {
-						log.Printf("Failed to unmarshal preconf bundles: %v, raw data: %s", err, string(apiResponse.Data))
-						return
-					}
-
-					// Log the successfully unmarshaled data
-					log.Printf("Successfully unmarshaled preconf bundles: %+v", preconfBundles)
-
-					// Store in cache
-					preconfCacheMutex.Lock()
-					preconfCache[submission.BidTrace.Slot] = preconfBundles
-					preconfCacheMutex.Unlock()
-
-					cachedPreconfs = preconfBundles
-				}
+			if !skipPreconfCheck {
 
 				// Transaction checking logic
 				// Convert all block transactions to lowercase for case-insensitive comparison
@@ -3089,9 +3082,6 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 				missingTxs := []string{}
 				missingOrderBundle := []string{}
 				count := 0
-				if cachedPreconfs.FeeRecipient != "" {
-					feeRecipient = cachedPreconfs.FeeRecipient
-				}
 				numOfTxBottomOfBottom := 0
 
 				for _, preconf := range cachedPreconfs.Bundles {
