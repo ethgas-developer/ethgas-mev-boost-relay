@@ -4053,6 +4053,12 @@ func (api *RelayAPI) handleDataValidatorRegistration(w http.ResponseWriter, req 
 	api.RespondOK(w, signedRegistration)
 }
 
+// Define response structure
+type ValidatorRegistration struct {
+	Pubkey       string `json:"pubkey"`
+	FeeRecipient string `json:"fee_recipient"`
+}
+
 func (api *RelayAPI) handleDataValidatorsRegistration(w http.ResponseWriter, req *http.Request) {
 	// Define request structure
 	type ValidatorsRequest struct {
@@ -4109,32 +4115,36 @@ func (api *RelayAPI) handleDataValidatorsRegistration(w http.ResponseWriter, req
 		return
 	}
 
-	// Create a map of registered pubkeys for efficient lookup
-	registeredPubkeys := make(map[string]bool)
+	// Create a map of pubkey -> registration for efficient lookup
+	registrationMap := make(map[string]*database.ValidatorRegistrationEntry)
 	for _, entry := range validatorRegistrationEntries {
-		registeredPubkeys[entry.Pubkey] = true
+		registrationMap[entry.Pubkey] = entry
 	}
 
-	// Find pubkeys that are NOT registered
-	var notRegistered []string
+	// Build response with only registered validators
+	var registrations []ValidatorRegistration
 	for _, pubkey := range request.Pubkeys {
-		if !registeredPubkeys[pubkey] {
-			notRegistered = append(notRegistered, pubkey)
+		if registration, exists := registrationMap[pubkey]; exists {
+			// Only include registered validators
+			registrations = append(registrations, ValidatorRegistration{
+				Pubkey:       registration.Pubkey,
+				FeeRecipient: registration.FeeRecipient,
+			})
 		}
+		// Unregistered validators are omitted entirely
 	}
 
 	// Ensure we always return an empty array, not nil
-	if notRegistered == nil {
-		notRegistered = []string{}
+	if registrations == nil {
+		registrations = []ValidatorRegistration{}
 	}
 
-	// Define response structure
 	type ValidatorsResponse struct {
-		NotRegistered []string `json:"not_registered"`
+		Registrations []ValidatorRegistration `json:"registrations"`
 	}
 
 	response := ValidatorsResponse{
-		NotRegistered: notRegistered,
+		Registrations: registrations,
 	}
 
 	api.RespondOK(w, response)
