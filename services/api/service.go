@@ -1762,7 +1762,7 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 
 	// Only allow requests for the current slot after exchange finished trading
 	if msIntoSlot < int64(getExchangeFinalizedCutoffMs) {
-		log.Info("getHeader sent too early, wait for exchange finalized")
+		// log.Info("getHeader sent too early, wait for exchange finalized")
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -1781,7 +1781,7 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 	// log.Info("builder id", builderResp.Builder)
 	if msIntoSlot < 1000 {
 		//only delay when ms in slot < 1sec
-		log.Info("delay to add more value ms: ", delayGetHeader)
+		// log.Info("delay to add more value ms: ", delayGetHeader)
 		time.Sleep(time.Duration(delayGetHeader) * time.Millisecond)
 	}
 	bid, err := api.redis.GetBestBid(slot, parentHashHex, proposerPubkeyHex)
@@ -1906,7 +1906,7 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 
 	// HARDCODE to modify the bid value to force validator select our block
 	if bid.Capella != nil {
-		api.log.Info("Modifying Capella bid")
+		// api.log.Info("Modifying Capella bid")
 		// log.Info("set fake bid.Capella.Message.Value")
 		// log.Info("old bid.Capella.Message.Value: ", bid.Capella.Message.Value)
 		baseValue := uint256.MustFromDecimal("11000000000000000000000") // Base value (11000 ETH)
@@ -1955,7 +1955,7 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 		// log.Info("new bid.Capella.Signature: ", bid.Capella.Signature)
 
 	} else if bid.Deneb != nil {
-		api.log.Info("Modifying Deneb bid")
+		// api.log.Info("Modifying Deneb bid")
 
 		// log.Info("set fake bid.Deneb.Message.Value")
 		baseValue := uint256.MustFromDecimal("11000000000000000000000") // Base value (11000 ETH)
@@ -1990,7 +1990,7 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 		// Assign the signature
 		copy(bid.Deneb.Signature[:], signatureBytes)
 	} else if bid.Electra != nil {
-		api.log.Info("Modifying Electra bid")
+		// api.log.Info("Modifying Electra bid")
 		baseValue := uint256.MustFromDecimal("11000000000000000000000") // Base value (11000 ETH)
 		acualValue := bid.Electra.Message.Value
 		totalValue := new(uint256.Int).Add(baseValue, acualValue) // Add base value and requestTime
@@ -2028,7 +2028,7 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 	} else if bid.Fulu != nil {
 		// The BuilderBid type for fulu is the same as that of electra
 
-		api.log.Info("Modifying Fulu bid")
+		// api.log.Info("Modifying Fulu bid")
 		baseValue := uint256.MustFromDecimal("11000000000000000000000") // Base value (11000 ETH)
 		acualValue := bid.Fulu.Message.Value
 		totalValue := new(uint256.Int).Add(baseValue, acualValue) // Add base value and requestTime
