@@ -1867,7 +1867,7 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 
 	//No bid => proxy out
 	if bid == nil || bid.IsEmpty() {
-		log.Info("no bid found")
+		// log.Info("no bid found")
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
