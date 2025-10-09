@@ -1867,37 +1867,42 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 
 	//No bid => proxy out
 	if bid == nil || bid.IsEmpty() {
-		// Check cache first
-		headerCacheMutex.RLock()
-		cachedResp, exists := headerCache[fmt.Sprintf("%d", slot)]
-		headerCacheMutex.RUnlock()
-		log.Printf("slot: %s", slotStr)
-		if exists {
-			// Serve from cache
-			log.Printf("Proxy mode Serve from cache, slot: %s", slotStr)
-
-			copyHeaders(w.Header(), cachedResp.Headers)
-			w.WriteHeader(cachedResp.StatusCode)
-			w.Write(cachedResp.Response)
-			return
-		} else {
-
-			proxyURL := fmt.Sprintf("%s%s", proxyRelayURL, req.URL.Path)
-			log.Printf("Proxy mode get header from: %s", proxyURL)
-
-			resp, err := forwardRequest(req.Method, proxyURL, req)
-			if err != nil {
-				log.Printf("Error forwarding request: %v", err)
-				w.WriteHeader(http.StatusNoContent)
-				return
-			}
-			copyHeaders(w.Header(), resp.Header)
-			w.WriteHeader(resp.StatusCode)
-			io.Copy(w, resp.Body)
-			resp.Body.Close()
-			return
-		}
+		log.Info("no bid found")
+		w.WriteHeader(http.StatusNoContent)
+		return
 	}
+	// if bid == nil || bid.IsEmpty() {
+	// 	// Check cache first
+	// 	headerCacheMutex.RLock()
+	// 	cachedResp, exists := headerCache[fmt.Sprintf("%d", slot)]
+	// 	headerCacheMutex.RUnlock()
+	// 	log.Printf("slot: %s", slotStr)
+	// 	if exists {
+	// 		// Serve from cache
+	// 		log.Printf("Proxy mode Serve from cache, slot: %s", slotStr)
+
+	// 		copyHeaders(w.Header(), cachedResp.Headers)
+	// 		w.WriteHeader(cachedResp.StatusCode)
+	// 		w.Write(cachedResp.Response)
+	// 		return
+	// 	} else {
+
+	// 		proxyURL := fmt.Sprintf("%s%s", proxyRelayURL, req.URL.Path)
+	// 		log.Printf("Proxy mode get header from: %s", proxyURL)
+
+	// 		resp, err := forwardRequest(req.Method, proxyURL, req)
+	// 		if err != nil {
+	// 			log.Printf("Error forwarding request: %v", err)
+	// 			w.WriteHeader(http.StatusNoContent)
+	// 			return
+	// 		}
+	// 		copyHeaders(w.Header(), resp.Header)
+	// 		w.WriteHeader(resp.StatusCode)
+	// 		io.Copy(w, resp.Body)
+	// 		resp.Body.Close()
+	// 		return
+	// 	}
+	// }
 
 	// HARDCODE to modify the bid value to force validator select our block
 	if bid.Capella != nil {
