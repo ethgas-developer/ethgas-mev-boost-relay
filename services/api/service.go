@@ -2180,14 +2180,14 @@ func (api *RelayAPI) handleGetPayloadV2(w http.ResponseWriter, req *http.Request
 // func (api *RelayAPI) handleGetPayload(w http.ResponseWriter, req *http.Request) {
 func (api *RelayAPI) innerHandleGetPayload(w http.ResponseWriter, req *http.Request, version HandleGetPayloadVersion, negotiatedResponseMediaType string) {
 
-	reqClone, err := deepCloneRequest(req)
-	if err != nil {
-		api.RespondError(w, http.StatusInternalServerError, "failed to clone request")
-		return
-	}
+	// reqClone, err := deepCloneRequest(req)
+	// if err != nil {
+	// 	api.RespondError(w, http.StatusInternalServerError, "failed to clone request")
+	// 	return
+	// }
 
-	log.Printf("Initial reqClone: %+v", reqClone)
-	log.Printf("Initial reqClone.Body: %v", reqClone.Body)
+	// log.Printf("Initial reqClone: %+v", reqClone)
+	// log.Printf("Initial reqClone.Body: %v", reqClone.Body)
 
 	// if proxyMode {
 	// 	proxyURL := fmt.Sprintf("%s%s", proxyRelayURL, req.URL.Path)
@@ -2478,22 +2478,7 @@ func (api *RelayAPI) innerHandleGetPayload(w http.ResponseWriter, req *http.Requ
 				bid, err := api.db.GetBlockSubmissionEntry(uint64(slot), proposerPubkey.String(), blockHash.String())
 				if errors.Is(err, sql.ErrNoRows) {
 					log.Warn("failed getting execution payload (2/2) - payload not found, block was never submitted to this relay")
-					log.Warn("failed getting execution payload (2/2) - Probably it is proxy relay block, send it to proxy relay")
-					log.Printf("Before forwarding reqClone: %+v", reqClone)
-					log.Printf("Before forwarding reqClone.Body: %v", reqClone.Body)
-
-					proxyURL := fmt.Sprintf("%s%s", proxyRelayURL, req.URL.Path)
-					resp, err := forwardRequest(req.Method, proxyURL, reqClone)
-					if err != nil {
-						api.RespondError(w, http.StatusInternalServerError, "proxy request failed")
-						return
-					}
-					copyHeaders(w.Header(), resp.Header)
-					w.WriteHeader(resp.StatusCode)
-					io.Copy(w, resp.Body)
-					resp.Body.Close()
-					return
-					// api.RespondError(w, http.StatusBadRequest, "no execution payload for this request - block was never seen by this relay")
+					api.RespondError(w, http.StatusBadRequest, "no execution payload for this request - block was never seen by this relay")
 				} else if err != nil {
 					log.WithError(err).Error("failed getting execution payload (2/2) - payload not found, and error on checking bids")
 				} else if bid.EligibleAt.Valid {
