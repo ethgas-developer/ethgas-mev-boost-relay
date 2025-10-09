@@ -1652,13 +1652,13 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 	}
 
 	// Check if cachedPreconfs isSold is false and determine if we should proxy
-	preconfCacheMutex.RLock()
-	cachedPreconfs, exists := preconfCache[slot]
-	preconfCacheMutex.RUnlock()
-	// shouldProxy := proxyMode
-	if exists {
-		log.Printf("cachedPreconfs.IsSold: %v", cachedPreconfs.IsSold)
-	}
+	// preconfCacheMutex.RLock()
+	// cachedPreconfs, exists := preconfCache[slot]
+	// preconfCacheMutex.RUnlock()
+	// // shouldProxy := proxyMode
+	// if exists {
+	// 	log.Printf("cachedPreconfs.IsSold: %v", cachedPreconfs.IsSold)
+	// }
 
 	// if shouldProxy {
 	// 	// Check cache first
