@@ -1640,10 +1640,10 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 	}
 
 	// Rate limit specific user agent
-	if ua == "mio_httpc 0.10.6" {
-		api.RespondError(w, http.StatusTooManyRequests, "rate limited please contact tg: @lok_ethgas for support")
-		return
-	}
+	// if ua == "mio_httpc 0.10.6" {
+	// 	api.RespondError(w, http.StatusTooManyRequests, "rate limited please contact tg: @lok_ethgas for support")
+	// 	return
+	// }
 
 	slot, err := strconv.ParseUint(slotStr, 10, 64)
 	if err != nil {
