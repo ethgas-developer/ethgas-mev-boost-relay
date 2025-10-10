@@ -784,9 +784,14 @@ func (api *RelayAPI) getRouter() http.Handler {
 	r.HandleFunc("/miladyz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK); w.Write(mresp) }).Methods(http.MethodGet) //nolint:errcheck
 
 	// r.Use(mux.CORSMethodMiddleware(r))
-	loggedRouter := httplogger.LoggingMiddlewareLogrus(api.log, r)
-	withGz := gziphandler.GzipHandler(loggedRouter)
-	return withGz
+	if os.Getenv("HTTP_LOGGING") != "false" {
+		loggedRouter := httplogger.LoggingMiddlewareLogrus(api.log, r)
+		withGz := gziphandler.GzipHandler(loggedRouter)
+		return withGz
+	} else {
+		withGz := gziphandler.GzipHandler(r)
+		return withGz
+	}
 }
 
 // StartServer starts up this API instance and HTTP server
