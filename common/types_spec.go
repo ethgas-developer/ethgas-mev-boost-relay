@@ -487,7 +487,9 @@ func (r *BuilderBlockValidationRequest) MarshalJSON() ([]byte, error) {
 }
 
 type BuilderBlockValidationResponse struct {
-	BlockValue *uint256.Int `json:"block_value"` // true block value calculated from simulation
+	BlockValue       *uint256.Int                          `json:"block_value"`          // true block value calculated from simulation
+	BlockHash        string                                `json:"block_hash,omitempty"` // optional updated block hash from simulation
+	ExecutionPayload *builderApi.VersionedExecutionPayload `json:"execution_payload,omitempty"`
 }
 
 type VersionedSubmitBlockRequest struct {

@@ -16,6 +16,7 @@ import (
 	"github.com/flashbots/go-utils/cli"
 	"github.com/flashbots/go-utils/jsonrpc"
 	"github.com/goccy/go-json"
+	"github.com/sirupsen/logrus"
 )
 
 var (
@@ -105,6 +106,13 @@ func (b *BlockSimulationRateLimiter) Send(
 	if err != nil {
 		return nil, err, nil
 	}
+
+	logrus.WithFields(logrus.Fields{
+		"sim_payloadBlockHash":          payload.Electra.Message.BlockHash.String(),
+		"sim_ExecutionPayloadBlockHash": payload.Electra.ExecutionPayload.BlockHash.String(),
+		"sim_bidTraceBlockHash":         submission.BidTrace.BlockHash.String(),
+		"sim_payloadVersion":            payload.Version,
+	}).Info("prepared block simulation request")
 
 	// Prepare headers
 	headers := http.Header{}

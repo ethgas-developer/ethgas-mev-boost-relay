@@ -18,6 +18,7 @@ import (
 	_ "net/http/pprof"
 	"net/url"
 	"os"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -41,8 +42,13 @@ import (
 
 	builderApiV1 "github.com/attestantio/go-builder-client/api/v1"
 	"github.com/attestantio/go-eth2-client/spec"
+	bellatrix "github.com/attestantio/go-eth2-client/spec/bellatrix"
+	"github.com/attestantio/go-eth2-client/spec/deneb"
+	electraSpec "github.com/attestantio/go-eth2-client/spec/electra"
 	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/buger/jsonparser"
+	ethcommon "github.com/ethereum/go-ethereum/common"
+	gethtypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/signer/core/apitypes"
 	"github.com/flashbots/go-boost-utils/bls"
@@ -80,6 +86,9 @@ const (
 	HandleGetPayloadVersionV2 HandleGetPayloadVersion = "V2"
 )
 
+// Number of attempts we give the simulator to provide all recoverable hints plus a clean run.
+const maxRelayRebuildSimulationAttempts = 5
+
 var (
 	ErrMissingLogOpt              = errors.New("log parameter is nil")
 	ErrMissingBeaconClientOpt     = errors.New("beacon-client is nil")
@@ -116,6 +125,10 @@ var (
 
 	// number of goroutines to save active validator
 	numValidatorRegProcessors = cli.GetEnvInt("NUM_VALIDATOR_REG_PROCESSORS", 10)
+
+	//relay builder
+	relayBuilderPrivateKey = GetEnvStr("RELAY_BUILDER_PRIVATE_KEY", "5eae315483f028b5cdd5d1090ff0c7618b18737ea9bf3c35047189db22835c48")
+	isAddTxs               = os.Getenv("IS_ADD_TXS") == "true"
 
 	// API URL
 	exchangeAPIURL          = GetEnvStr("EXCHANGE_API_URL", "http://localhost:3210")
@@ -354,7 +367,7 @@ type blockBuilderCacheEntry struct {
 
 type blockSimResult struct {
 	wasSimulated         bool
-	blockValue           *uint256.Int
+	response             *common.BuilderBlockValidationResponse
 	optimisticSubmission bool
 	requestErr           error
 	validationErr        error
@@ -1013,7 +1026,7 @@ func (api *RelayAPI) startValidatorRegistrationDBProcessor() {
 }
 
 // simulateBlock sends a request for a block simulation to blockSimRateLimiter.
-func (api *RelayAPI) simulateBlock(ctx context.Context, opts blockSimOptions) (blockValue *uint256.Int, requestErr, validationErr error) {
+func (api *RelayAPI) simulateBlock(ctx context.Context, opts blockSimOptions) (resp *common.BuilderBlockValidationResponse, requestErr, validationErr error) {
 	t := time.Now()
 	response, requestErr, validationErr := api.blockSimRateLimiter.Send(ctx, opts.req, opts.isHighPrio, opts.fastTrack)
 	log := opts.log.WithFields(logrus.Fields{
@@ -1051,7 +1064,7 @@ func (api *RelayAPI) simulateBlock(ctx context.Context, opts blockSimOptions) (b
 		log.Warn("block validation response is nil")
 		return nil, nil, nil
 	}
-	return response.BlockValue, nil, nil
+	return response, nil, nil
 
 	// blockValue = uint256.NewInt(9000000000000000000)
 	// return blockValue, nil, nil
@@ -1133,8 +1146,14 @@ func (api *RelayAPI) processOptimisticBlock(opts blockSimOptions, simResultC cha
 		// it for logging, it is not atomic to avoid the performance impact.
 		"optBlocksInFlight": api.optimisticBlocksInFlight,
 	}).Infof("simulating optimistic block with hash: %v", submission.BidTrace.BlockHash.String())
-	blockValue, reqErr, simErr := api.simulateBlock(ctx, opts)
-	simResultC <- &blockSimResult{reqErr == nil, blockValue, true, reqErr, simErr}
+	simResp, reqErr, simErr := api.simulateBlock(ctx, opts)
+	simResultC <- &blockSimResult{
+		wasSimulated:         reqErr == nil && simErr == nil,
+		response:             simResp,
+		optimisticSubmission: true,
+		requestErr:           reqErr,
+		validationErr:        simErr,
+	}
 	if reqErr != nil || simErr != nil {
 		// Mark builder as non-optimistic.
 		opts.builder.status.IsOptimistic = false
@@ -3417,6 +3436,86 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		return
 	}
 
+	topBidValue := big.NewInt(0)
+	bidIsTopBid := false
+	topBidTx := api.redis.NewTxPipeline()
+	topBidValue, err = api.redis.GetTopBidValue(
+		context.Background(),
+		topBidTx,
+		submission.BidTrace.Slot,
+		submission.BidTrace.ParentHash.String(),
+		submission.BidTrace.ProposerPubkey.String(),
+	)
+	if err != nil {
+		log.WithError(err).Error("failed to get top bid value from redis")
+	} else {
+		bidIsTopBid = submission.BidTrace.Value.ToBig().Cmp(topBidValue) >= 0
+		log = log.WithFields(logrus.Fields{
+			"topBidValue":    topBidValue.String(),
+			"newBidIsTopBid": bidIsTopBid,
+		})
+		if !bidIsTopBid && !isCancellationEnabled {
+			log.Info("submission below current top bid, skipping")
+		}
+	}
+	topBidTx.Discard()
+	attrs := api.payloadAttributes[getPayloadAttributesKey(submission.BidTrace.ParentHash.String(), submission.BidTrace.Slot)]
+
+	originalSnapshotLog := log.WithFields(logrus.Fields{
+		"originalTxCount": len(submission.Transactions),
+		"originalGasUsed": submission.GasUsed,
+	})
+	if submission.BidTrace != nil {
+		originalSnapshotLog = originalSnapshotLog.WithFields(logrus.Fields{
+			"originalBidTraceGasUsed": submission.BidTrace.GasUsed,
+			"originalBidTraceBlock":   submission.BidTrace.BlockHash.String(),
+			"originalBuilderPubkey":   submission.BidTrace.BuilderPubkey.String(),
+		})
+	}
+	appendedRelayTx := false
+	//only top bid need to merge block
+	if isAddTxs && bidIsTopBid {
+		originalSnapshotLog.Info("builder submission snapshot before relay adjustments")
+
+		appendedRelayTx, err = api.appendRelaySelfTransferTx(req.Context(), payload, submission, log)
+		if err != nil {
+			log.WithError(err).Warn("failed to append relay self-transfer transaction")
+		}
+		if appendedRelayTx {
+			if refreshedSubmission, refreshErr := common.GetBlockSubmissionInfo(payload); refreshErr != nil {
+				log.WithError(refreshErr).Warn("failed to refresh submission after relay transaction")
+			} else {
+				*submission = *refreshedSubmission
+			}
+			parentBeaconRoot := attrs.parentBeaconRoot
+			if parentBeaconRoot == nil {
+				parentBeaconRoot = api.lookupParentBeaconBlockRoot(submission)
+			}
+			if err := api.rebuildExecutionPayload(req.Context(), payload, submission, parentBeaconRoot, log); err != nil {
+				log.WithError(err).Warn("failed to rebuild execution payload after relay transaction")
+			}
+			log.WithFields(logrus.Fields{
+				"afterUpdate_executionPayload_blockHash":    getExecutionPayloadBlockHash(payload),
+				"afterUpdate_executionPayload_stateRoot":    getExecutionPayloadStateRoot(payload),
+				"afterUpdate_executionPayload_receiptsRoot": getExecutionPayloadReceiptsRoot(payload),
+				"afterUpdate_executionPayload_gasUsed":      getExecutionPayloadGasUsed(payload),
+				"afterUpdate_bidTrace_blockHash":            getBidTraceBlockHash(payload),
+				"afterUpdate_submission_blockHash":          submission.BidTrace.BlockHash.String(),
+				"afterUpdate_submission_GasUsed":            submission.BidTrace.GasUsed,
+			}).Info("AFTER UPDATE (rebuildExecutionPayload): Updated payload values")
+
+			postRelayFields := logrus.Fields{
+				"postRelayTxCount": len(submission.Transactions),
+				"postRelayGasUsed": submission.GasUsed,
+			}
+			if submission.BidTrace != nil {
+				postRelayFields["postRelayBidTraceGasUsed"] = submission.BidTrace.GasUsed
+				postRelayFields["postRelayBidTraceBlock"] = submission.BidTrace.BlockHash.String()
+			}
+			log.WithFields(postRelayFields).Info("relay adjustments applied to submission")
+		}
+	}
+
 	// preconf txs should have 0 bid value if there have no public txs
 	// // Don't accept blocks with 0 value
 	// if submission.BidTrace.Value.ToBig().Cmp(ZeroU256.BigInt()) == 0 || len(submission.Transactions) == 0 {
@@ -3435,25 +3534,29 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 
 	//temp: disable payload checking for devnet
 	// attrs, ok := api.checkSubmissionPayloadAttrs(w, log, submission)
-
 	// if !ok {
 	// 	return
 	// }
-	attrs := api.payloadAttributes[getPayloadAttributesKey(submission.BidTrace.ParentHash.String(), submission.BidTrace.Slot)]
 
 	// Verify the signature
 	log = log.WithField("timestampBeforeSignatureCheck", time.Now().UTC().UnixMilli())
+	skipSignatureValidation := isAddTxs && appendedRelayTx
 	signature := submission.Signature
-	ok, err = ssz.VerifySignature(submission.BidTrace, api.opts.EthNetDetails.DomainBuilder, builderPubkey[:], signature[:])
-	log = log.WithField("timestampAfterSignatureCheck", time.Now().UTC().UnixMilli())
-	if err != nil {
-		log.WithError(err).Warn("failed verifying builder signature")
-		api.RespondError(w, http.StatusBadRequest, "failed verifying builder signature")
-		return
-	} else if !ok {
-		log.Warn("invalid builder signature")
-		api.RespondError(w, http.StatusBadRequest, "invalid signature")
-		return
+	if skipSignatureValidation {
+		log.Warn("skipping builder signature validation due to relay transaction injection")
+		log = log.WithField("timestampAfterSignatureCheck", time.Now().UTC().UnixMilli())
+	} else {
+		ok, err = ssz.VerifySignature(submission.BidTrace, api.opts.EthNetDetails.DomainBuilder, builderPubkey[:], signature[:])
+		log = log.WithField("timestampAfterSignatureCheck", time.Now().UTC().UnixMilli())
+		if err != nil {
+			log.WithError(err).Warn("failed verifying builder signature")
+			api.RespondError(w, http.StatusBadRequest, "failed verifying builder signature")
+			return
+		} else if !ok {
+			log.Warn("invalid builder signature")
+			api.RespondError(w, http.StatusBadRequest, "invalid signature")
+			return
+		}
 	}
 
 	log = log.WithField("timestampBeforeCheckingFloorBid", time.Now().UTC().UnixMilli())
@@ -3489,7 +3592,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		case simResult = <-simResultC:
 		case <-time.After(10 * time.Second):
 			log.Warn("timed out waiting for simulation result")
-			simResult = &blockSimResult{false, nil, false, nil, nil}
+			simResult = &blockSimResult{wasSimulated: false, response: nil, optimisticSubmission: false, requestErr: nil, validationErr: nil}
 		}
 
 		if isValidPreconf != "" {
@@ -3497,7 +3600,24 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 			log.Warn("Invalid preconf detected: " + isValidPreconf)
 		}
 
-		submissionEntry, err := api.db.SaveBuilderBlockSubmission(payload, simResult.requestErr, simResult.validationErr, receivedAt, eligibleAt, simResult.wasSimulated, savePayloadToDatabase, pf, simResult.optimisticSubmission, simResult.blockValue)
+		if isAddTxs && appendedRelayTx {
+			if simResult != nil {
+				simResult.wasSimulated = true
+				simResult.requestErr = nil
+				simResult.validationErr = nil
+			}
+		}
+
+		if simResult != nil {
+			pf.SimulationSuccess = simResult.requestErr == nil && simResult.validationErr == nil
+		}
+
+		var simBlockValue *uint256.Int
+		if simResult.response != nil {
+			simBlockValue = simResult.response.BlockValue
+		}
+
+		submissionEntry, err := api.db.SaveBuilderBlockSubmission(payload, simResult.requestErr, simResult.validationErr, receivedAt, eligibleAt, simResult.wasSimulated, savePayloadToDatabase, pf, simResult.optimisticSubmission, simBlockValue)
 		if err != nil {
 			log.WithError(err).WithFields(logrus.Fields{
 				"payload":   payload,
@@ -3516,22 +3636,9 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	// THE BID WILL BE SIMULATED SHORTLY
 	// ---------------------------------
 
-	log = log.WithField("timestampBeforeCheckingTopBid", time.Now().UTC().UnixMilli())
+	// log = log.WithField("timestampBeforeCheckingTopBid", time.Now().UTC().UnixMilli())
 
-	// Get the latest top bid value from Redis
-	bidIsTopBid := false
-	topBidValue, err := api.redis.GetTopBidValue(context.Background(), tx, submission.BidTrace.Slot, submission.BidTrace.ParentHash.String(), (submission.BidTrace.ProposerPubkey.String()))
-	if err != nil {
-		log.WithError(err).Error("failed to get top bid value from redis")
-	} else {
-		bidIsTopBid = submission.BidTrace.Value.ToBig().Cmp(topBidValue) >= 0
-		log = log.WithFields(logrus.Fields{
-			"topBidValue":    topBidValue.String(),
-			"newBidIsTopBid": bidIsTopBid,
-		})
-	}
-
-	log = log.WithField("timestampAfterCheckingTopBid", time.Now().UTC().UnixMilli())
+	// log = log.WithField("timestampAfterCheckingTopBid", time.Now().UTC().UnixMilli())
 
 	nextTime = time.Now().UTC()
 	pf.Prechecks = uint64(nextTime.Sub(prevTime).Microseconds()) //nolint:gosec
@@ -3546,6 +3653,21 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		"fastTrackValidation":       fastTrackValidation,
 	})
 
+	parentBeaconRoot := attrs.parentBeaconRoot
+	if parentBeaconRoot == nil {
+		parentBeaconRoot = api.lookupParentBeaconBlockRoot(submission)
+	}
+	if versionedPayload, err := versionedExecutionPayloadFromSubmitRequest(payload); err != nil {
+		log.WithError(err).Warn("failed to build versioned payload for pre-simulation logging")
+	} else if headerHash, err := utils.ComputeBlockHash(versionedPayload, parentBeaconRoot); err != nil {
+		log.WithError(err).Warn("failed to compute execution payload hash for pre-simulation logging")
+	} else {
+		log.WithFields(logrus.Fields{
+			"preSim_bidTrace_blockHash": submission.BidTrace.BlockHash.String(),
+			"preSim_header_blockHash":   headerHash.String(),
+		}).Info("pre-simulation block hash snapshot")
+	}
+
 	// Construct simulation request
 	opts := blockSimOptions{
 		isHighPrio: builderEntry.status.IsHighPrio,
@@ -3555,13 +3677,16 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		req: &common.BuilderBlockValidationRequest{
 			VersionedSubmitBlockRequest: payload,
 			RegisteredGasLimit:          gasLimit,
-			ParentBeaconBlockRoot:       attrs.parentBeaconRoot,
+			ParentBeaconBlockRoot:       parentBeaconRoot,
 		},
 	}
 	// With sufficient collateral, process the block optimistically.
 	optimistic := builderEntry.status.IsOptimistic &&
 		builderEntry.collateral.Cmp(submission.BidTrace.Value.ToBig()) >= 0 &&
 		submission.BidTrace.Slot == api.optimisticSlot.Load()
+	// if appendedRelayTx {
+	// 	optimistic = false
+	// }
 	pf.Optimistic = optimistic
 	slotLastPayloadDelivered, err := api.redis.GetLastSlotDelivered(context.Background(), tx)
 	//no need simulate if the block is already delivered
@@ -3597,6 +3722,12 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	pf.Simulation = uint64(nextTime.Sub(prevTime).Microseconds()) //nolint:gosec
 	pf.SimulationSuccess = true
 	prevTime = nextTime
+
+	// if isAddTxs && appendedRelayTx {
+	// 	if err := api.rewriteSubmissionWithRelayIdentity(payload, submission, log); err != nil {
+	// 		log.WithError(err).Warn("failed to rewrite submission with relay identity")
+	// 	}
+	// }
 
 	// If cancellations are enabled, then abort now if this submission is not the latest one
 	if isCancellationEnabled {
@@ -4757,6 +4888,1628 @@ func (api *RelayAPI) processValidatorRegistrationsSSZ(regs []*builderApiV1.Signe
 	return newRegistrations, nil, nil
 }
 
+func (api *RelayAPI) appendRelaySelfTransferTx(ctx context.Context, payload *common.VersionedSubmitBlockRequest, submission *common.BlockSubmissionInfo, log *logrus.Entry) (bool, error) {
+	if strings.TrimSpace(relayBuilderPrivateKey) == "" {
+		return false, nil
+	}
+
+	privateKeyHex := strings.TrimPrefix(relayBuilderPrivateKey, "0x")
+	relayKey, err := crypto.HexToECDSA(privateKeyHex)
+	if err != nil {
+		return false, fmt.Errorf("invalid relay builder private key: %w", err)
+	}
+
+	chainIDBig, err := parseChainIDValue(chainID)
+	if err != nil {
+		return false, fmt.Errorf("invalid chain id: %w", err)
+	}
+
+	if rpcChainID, err := api.fetchRPCChainID(ctx); err != nil {
+		log.WithError(err).Warn("failed to query execution chain id via RPC")
+	} else {
+		if rpcChainID.Cmp(chainIDBig) != 0 {
+			log.WithFields(logrus.Fields{
+				"configuredChainID": chainIDBig.String(),
+				"rpcChainID":        rpcChainID.String(),
+			}).Warn("relay chain id mismatch between configuration and execution endpoint")
+		} else {
+			log.WithField("chainID", chainIDBig.String()).Debug("relay self-transfer using execution chain id")
+		}
+	}
+
+	signer := gethtypes.LatestSignerForChainID(chainIDBig)
+	relayAddress := crypto.PubkeyToAddress(relayKey.PublicKey)
+
+	nonce, existingHashes, err := api.deriveRelayNonceAndHashes(ctx, signer, submission, relayAddress, log)
+	if err != nil {
+		return false, fmt.Errorf("failed to derive relay nonce: %w", err)
+	}
+
+	baseFee := executionPayloadBaseFee(payload)
+	gasTipCap := big.NewInt(0)
+	gasFeeCap := new(big.Int).Set(baseFee)
+	if gasFeeCap.Sign() == 0 {
+		gasFeeCap.SetUint64(1_000_000_000)
+	}
+
+	txDataPayload := []byte("This is test for merge block")
+	gasLimit := uint64(21_000) + uint64(len(txDataPayload))*40
+
+	txData := &gethtypes.DynamicFeeTx{
+		ChainID:   chainIDBig,
+		Nonce:     nonce,
+		GasTipCap: gasTipCap,
+		GasFeeCap: gasFeeCap,
+		Gas:       gasLimit,
+		To:        &relayAddress,
+		Value:     big.NewInt(0),
+		Data:      txDataPayload,
+	}
+
+	signedTx, err := gethtypes.SignNewTx(relayKey, signer, txData)
+	if err != nil {
+		return false, fmt.Errorf("failed to sign relay self-transfer: %w", err)
+	}
+
+	txHash := signedTx.Hash().Hex()
+	if _, exists := existingHashes[txHash]; exists {
+		log.WithField("relaySelfTxHash", txHash).Debug("relay self-transfer already present in payload")
+		return false, nil
+	}
+
+	rawTx, err := signedTx.MarshalBinary()
+	if err != nil {
+		return false, fmt.Errorf("failed to marshal relay self-transfer: %w", err)
+	}
+
+	existingTxsHex := make([]string, len(submission.Transactions))
+	for i, txBytes := range submission.Transactions {
+		existingTxsHex[i] = "0x" + hex.EncodeToString(txBytes)
+	}
+	// relayTxHex := "0x" + hex.EncodeToString(rawTx)
+
+	// log.WithFields(logrus.Fields{
+	// 	"existingTransactionsHex": existingTxsHex,
+	// 	"relaySelfTxRawHex":       relayTxHex,
+	// }).Info("relay append transaction hex snapshot before payload update")
+
+	if err := appendTxToPayload(payload, rawTx, signedTx.Gas()); err != nil {
+		return false, err
+	}
+
+	// submission.Transactions = append(submission.Transactions, bellatrix.Transaction(rawTx))
+	last := submission.Transactions[len(submission.Transactions)-1]
+	submission.Transactions = append(submission.Transactions[:len(submission.Transactions)-1], bellatrix.Transaction(rawTx))
+	submission.Transactions = append(submission.Transactions, last)
+
+	submission.GasUsed += signedTx.Gas()
+	if submission.BidTrace != nil {
+		submission.BidTrace.GasUsed += signedTx.Gas()
+	}
+
+	finalTxsHex := make([]string, len(submission.Transactions))
+	for i, txBytes := range submission.Transactions {
+		finalTxsHex[i] = "0x" + hex.EncodeToString(txBytes)
+	}
+
+	// log.WithFields(logrus.Fields{
+	// 	"relaySelfTxHash":        txHash,
+	// 	"relaySelfTxNonce":       nonce,
+	// 	"transactionsHexAfter":   finalTxsHex,
+	// 	"relaySelfTxRawHexAfter": relayTxHex,
+	// }).Info("appended relay self-transfer transaction to block submission")
+
+	return true, nil
+}
+
+func (api *RelayAPI) rebuildExecutionPayload(ctx context.Context, payload *common.VersionedSubmitBlockRequest, submission *common.BlockSubmissionInfo, parentBeaconRoot *phase0.Root, log *logrus.Entry) error {
+	if payload == nil {
+		return fmt.Errorf("payload is nil")
+	}
+	if submission == nil {
+		return fmt.Errorf("submission info is nil")
+	}
+	if submission.BidTrace == nil {
+		return fmt.Errorf("submission bid trace missing")
+	}
+	if api.blockSimRateLimiter == nil {
+		return fmt.Errorf("block simulation client not configured")
+	}
+
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	registeredGasLimit := submission.BidTrace.GasLimit
+	if registeredGasLimit == 0 {
+		registeredGasLimit = submission.GasLimit
+	}
+
+	if parentBeaconRoot == nil {
+		parentBeaconRoot = api.lookupParentBeaconBlockRoot(submission)
+	}
+
+	rebuildLog := log.WithFields(logrus.Fields{
+		"slot":                submission.BidTrace.Slot,
+		"builderBlockHash":    submission.BidTrace.BlockHash.String(),
+		"builderParentHash":   submission.BidTrace.ParentHash.String(),
+		"submissionTxCount":   len(submission.Transactions),
+		"registeredGasLimit":  registeredGasLimit,
+		"parentBeaconRootSet": parentBeaconRoot != nil,
+	})
+	rebuildLog.Info("starting relay rebuild")
+
+	simReq := &common.BuilderBlockValidationRequest{
+		VersionedSubmitBlockRequest: payload,
+		RegisteredGasLimit:          registeredGasLimit,
+		ParentBeaconBlockRoot:       parentBeaconRoot,
+	}
+
+	if err := api.tryLocalRebuild(ctx, payload, submission, log, simReq); err == nil {
+		rebuildLog.WithFields(logrus.Fields{
+			"relayRebuiltBlockHash": submission.BidTrace.BlockHash.String(),
+			"relayRebuiltGasUsed":   submission.GasUsed,
+		}).Info("rebuilt execution payload via local state")
+		return nil
+	} else if err != nil {
+		rebuildLog.WithError(err).Info("local rebuild unavailable, falling back to simulator")
+	}
+
+	// for attempt := 0; attempt < maxRelayRebuildSimulationAttempts; attempt++ {
+
+	// 	resp, requestErr, validationErr := api.blockSimRateLimiter.Send(ctx, simReq, false, false)
+	// 	if requestErr != nil {
+	// 		rebuildLog.WithField("attempt", attempt+1).WithError(requestErr).Warn("relay rebuild simulation request failed")
+	// 		return fmt.Errorf("block rebuild simulation request failed: %w", requestErr)
+	// 	}
+	// 	if validationErr != nil {
+	// 		needRetry := false
+	// 		if got, expected, ok := parseSimulationGasMismatch(validationErr); ok {
+	// 			if err := updateSubmissionGasUsed(payload, submission, got); err != nil {
+	// 				return fmt.Errorf("block rebuild simulation validation failed (update gas used %d/%d): %w", got, expected, err)
+	// 			}
+	// 			rebuildLog.WithFields(logrus.Fields{
+	// 				"attempt":             attempt + 1,
+	// 				"relaySimGasUsedGot":  got,
+	// 				"relaySimGasExpected": expected,
+	// 			}).Info("relay rebuild simulation updated gas used, retrying")
+	// 			needRetry = true
+	// 		}
+	// 		if newHash, ok := parseSimulationBlockHash(validationErr); ok && newHash != "" {
+	// 			if err := updateSubmissionBlockHash(payload, submission, newHash); err != nil {
+	// 				return fmt.Errorf("block rebuild simulation validation failed (update hash %s): %w", newHash, err)
+	// 			}
+	// 			rebuildLog.WithFields(logrus.Fields{
+	// 				"attempt":               attempt + 1,
+	// 				"relayRebuiltBlockHash": newHash,
+	// 				"validationErr":         validationErr.Error(),
+	// 			}).Info("relay rebuild simulation updated block hash, retrying")
+	// 			needRetry = true
+	// 		}
+	// 		if gotRoot, expectedRoot, ok := parseSimulationReceiptsRoot(validationErr); ok {
+	// 			if err := updateSubmissionReceiptsRoot(payload, submission, expectedRoot); err != nil {
+	// 				return fmt.Errorf("block rebuild simulation validation failed (update receipts root %s/%s): %w", gotRoot, expectedRoot, err)
+	// 			}
+	// 			rebuildLog.WithFields(logrus.Fields{
+	// 				"attempt":                 attempt + 1,
+	// 				"relayRebuiltReceiptsGot": gotRoot,
+	// 				"relayRebuiltReceipts":    expectedRoot,
+	// 			}).Info("relay rebuild simulation updated receipts root, retrying")
+	// 			needRetry = true
+	// 		}
+	// 		if needRetry {
+	// 			continue
+	// 		}
+	// 		rebuildLog.WithField("attempt", attempt+1).WithError(validationErr).Warn("relay rebuild simulation validation failed without recoverable hints")
+	// 		return fmt.Errorf("block rebuild simulation validation failed: %w", validationErr)
+	// 	}
+	// 	if resp == nil {
+	// 		rebuildLog.WithField("attempt", attempt+1).Warn("relay rebuild simulation returned nil response")
+	// 		return fmt.Errorf("block rebuild simulation returned nil response")
+	// 	}
+
+	// 	if resp.ExecutionPayload != nil {
+	// 		if err := api.applySimulationPayloadToSubmission(payload, submission, resp, log); err != nil {
+	// 			return fmt.Errorf("failed to apply rebuild simulation payload: %w", err)
+	// 		}
+	// 	} else if resp.BlockHash != "" {
+	// 		if err := updateSubmissionBlockHash(payload, submission, resp.BlockHash); err != nil {
+	// 			return fmt.Errorf("failed to update block hash from rebuild simulation: %w", err)
+	// 		}
+	// 	}
+
+	// 	finalHash := submission.BidTrace.BlockHash.String()
+	// 	if resp.BlockHash != "" {
+	// 		finalHash = resp.BlockHash
+	// 	}
+
+	// 	rebuildLog.WithFields(logrus.Fields{
+	// 		"attempt":               attempt + 1,
+	// 		"relayRebuiltBlockHash": finalHash,
+	// 		"simRespHasPayload":     resp.ExecutionPayload != nil,
+	// 	}).Info("rebuilt execution payload via simulation")
+
+	// 	return nil
+	// }
+
+	// return fmt.Errorf("block rebuild simulation could not converge after %d attempts", maxRelayRebuildSimulationAttempts)
+	return nil
+}
+
+func (api *RelayAPI) lookupParentBeaconBlockRoot(submission *common.BlockSubmissionInfo) *phase0.Root {
+	if submission == nil || submission.BidTrace == nil {
+		return nil
+	}
+
+	api.payloadAttributesLock.RLock()
+	attrs, ok := api.payloadAttributes[getPayloadAttributesKey(submission.BidTrace.ParentHash.String(), submission.BidTrace.Slot)]
+	api.payloadAttributesLock.RUnlock()
+	if !ok || attrs.parentBeaconRoot == nil {
+		return nil
+	}
+
+	rootCopy := *attrs.parentBeaconRoot
+	return &rootCopy
+}
+
+func (api *RelayAPI) applySimulationPayloadToSubmission(payload *common.VersionedSubmitBlockRequest, submission *common.BlockSubmissionInfo, simResp *common.BuilderBlockValidationResponse, log *logrus.Entry) error {
+	if simResp == nil {
+		return nil
+	}
+
+	updatedPayload := false
+	if simResp.ExecutionPayload != nil {
+		switch payload.Version { //nolint:exhaustive
+		case spec.DataVersionBellatrix:
+			if payload.Bellatrix != nil && simResp.ExecutionPayload.Bellatrix != nil {
+				payload.Bellatrix.ExecutionPayload = simResp.ExecutionPayload.Bellatrix
+				if payload.Bellatrix.Message != nil {
+					payload.Bellatrix.Message.BlockHash = payload.Bellatrix.ExecutionPayload.BlockHash
+					payload.Bellatrix.Message.GasUsed = payload.Bellatrix.ExecutionPayload.GasUsed
+					payload.Bellatrix.Message.GasLimit = payload.Bellatrix.ExecutionPayload.GasLimit
+				}
+				updatedPayload = true
+			}
+		case spec.DataVersionCapella:
+			if payload.Capella != nil && simResp.ExecutionPayload.Capella != nil {
+				payload.Capella.ExecutionPayload = simResp.ExecutionPayload.Capella
+				if payload.Capella.Message != nil {
+					payload.Capella.Message.BlockHash = payload.Capella.ExecutionPayload.BlockHash
+					payload.Capella.Message.GasUsed = payload.Capella.ExecutionPayload.GasUsed
+					payload.Capella.Message.GasLimit = payload.Capella.ExecutionPayload.GasLimit
+				}
+				updatedPayload = true
+			}
+		case spec.DataVersionDeneb:
+			if payload.Deneb != nil && simResp.ExecutionPayload.Deneb != nil {
+				payload.Deneb.ExecutionPayload = simResp.ExecutionPayload.Deneb
+				if payload.Deneb.Message != nil {
+					payload.Deneb.Message.BlockHash = payload.Deneb.ExecutionPayload.BlockHash
+					payload.Deneb.Message.GasUsed = payload.Deneb.ExecutionPayload.GasUsed
+					payload.Deneb.Message.GasLimit = payload.Deneb.ExecutionPayload.GasLimit
+				}
+				updatedPayload = true
+			}
+		case spec.DataVersionElectra:
+			if payload.Electra != nil && simResp.ExecutionPayload.Electra != nil {
+				payload.Electra.ExecutionPayload = simResp.ExecutionPayload.Electra
+				if payload.Electra.Message != nil {
+					payload.Electra.Message.BlockHash = payload.Electra.ExecutionPayload.BlockHash
+					payload.Electra.Message.GasUsed = payload.Electra.ExecutionPayload.GasUsed
+					payload.Electra.Message.GasLimit = payload.Electra.ExecutionPayload.GasLimit
+				}
+				updatedPayload = true
+			}
+		case spec.DataVersionFulu:
+			if payload.Fulu != nil && simResp.ExecutionPayload.Fulu != nil {
+				payload.Fulu.ExecutionPayload = simResp.ExecutionPayload.Fulu
+				if payload.Fulu.Message != nil {
+					payload.Fulu.Message.BlockHash = payload.Fulu.ExecutionPayload.BlockHash
+					payload.Fulu.Message.GasUsed = payload.Fulu.ExecutionPayload.GasUsed
+					payload.Fulu.Message.GasLimit = payload.Fulu.ExecutionPayload.GasLimit
+				}
+				updatedPayload = true
+			}
+		default:
+			return fmt.Errorf("unsupported payload version %d for simulation update", payload.Version)
+		}
+	}
+
+	if simResp.BlockHash != "" {
+		hash, err := utils.HexToHash(simResp.BlockHash)
+		if err != nil {
+			log.WithError(err).Warn("failed to parse simulated block hash")
+		} else {
+			var phaseHash phase0.Hash32
+			copy(phaseHash[:], hash[:])
+			switch payload.Version { //nolint:exhaustive
+			case spec.DataVersionBellatrix:
+				if payload.Bellatrix != nil && payload.Bellatrix.ExecutionPayload != nil {
+					payload.Bellatrix.ExecutionPayload.BlockHash = phaseHash
+					if payload.Bellatrix.Message != nil {
+						payload.Bellatrix.Message.BlockHash = phaseHash
+						payload.Bellatrix.Message.GasUsed = payload.Bellatrix.ExecutionPayload.GasUsed
+						payload.Bellatrix.Message.GasLimit = payload.Bellatrix.ExecutionPayload.GasLimit
+					}
+					updatedPayload = true
+				}
+			case spec.DataVersionCapella:
+				if payload.Capella != nil && payload.Capella.ExecutionPayload != nil {
+					payload.Capella.ExecutionPayload.BlockHash = phaseHash
+					if payload.Capella.Message != nil {
+						payload.Capella.Message.BlockHash = phaseHash
+						payload.Capella.Message.GasUsed = payload.Capella.ExecutionPayload.GasUsed
+						payload.Capella.Message.GasLimit = payload.Capella.ExecutionPayload.GasLimit
+					}
+					updatedPayload = true
+				}
+			case spec.DataVersionDeneb:
+				if payload.Deneb != nil && payload.Deneb.ExecutionPayload != nil {
+					payload.Deneb.ExecutionPayload.BlockHash = phaseHash
+					if payload.Deneb.Message != nil {
+						payload.Deneb.Message.BlockHash = phaseHash
+						payload.Deneb.Message.GasUsed = payload.Deneb.ExecutionPayload.GasUsed
+						payload.Deneb.Message.GasLimit = payload.Deneb.ExecutionPayload.GasLimit
+					}
+					updatedPayload = true
+				}
+			case spec.DataVersionElectra:
+				if payload.Electra != nil && payload.Electra.ExecutionPayload != nil {
+					payload.Electra.ExecutionPayload.BlockHash = phaseHash
+					if payload.Electra.Message != nil {
+						payload.Electra.Message.BlockHash = phaseHash
+						payload.Electra.Message.GasUsed = payload.Electra.ExecutionPayload.GasUsed
+						payload.Electra.Message.GasLimit = payload.Electra.ExecutionPayload.GasLimit
+					}
+					updatedPayload = true
+				}
+			case spec.DataVersionFulu:
+				if payload.Fulu != nil && payload.Fulu.ExecutionPayload != nil {
+					payload.Fulu.ExecutionPayload.BlockHash = phaseHash
+					if payload.Fulu.Message != nil {
+						payload.Fulu.Message.BlockHash = phaseHash
+						payload.Fulu.Message.GasUsed = payload.Fulu.ExecutionPayload.GasUsed
+						payload.Fulu.Message.GasLimit = payload.Fulu.ExecutionPayload.GasLimit
+					}
+					updatedPayload = true
+				}
+			}
+		}
+	}
+
+	if !updatedPayload && simResp.BlockHash == "" {
+		return nil
+	}
+
+	newSubmission, err := common.GetBlockSubmissionInfo(payload)
+	if err != nil {
+		return fmt.Errorf("failed to refresh block submission info: %w", err)
+	}
+	*submission = *newSubmission
+
+	phaseHash := submission.ExecutionPayloadBlockHash
+	switch payload.Version { //nolint:exhaustive
+	case spec.DataVersionBellatrix:
+		if payload.Bellatrix != nil && payload.Bellatrix.Message != nil {
+			payload.Bellatrix.Message.BlockHash = phaseHash
+		}
+	case spec.DataVersionCapella:
+		if payload.Capella != nil && payload.Capella.Message != nil {
+			payload.Capella.Message.BlockHash = phaseHash
+		}
+	case spec.DataVersionDeneb:
+		if payload.Deneb != nil && payload.Deneb.Message != nil {
+			payload.Deneb.Message.BlockHash = phaseHash
+		}
+	case spec.DataVersionElectra:
+		if payload.Electra != nil && payload.Electra.Message != nil {
+			payload.Electra.Message.BlockHash = phaseHash
+		}
+	case spec.DataVersionFulu:
+		if payload.Fulu != nil && payload.Fulu.Message != nil {
+			payload.Fulu.Message.BlockHash = phaseHash
+		}
+	}
+
+	targetHash := submission.BidTrace.BlockHash.String()
+	if simResp.BlockHash != "" {
+		targetHash = simResp.BlockHash
+	}
+	log.WithField("relaySimulatedBlockHash", targetHash).Info("applied execution payload from simulation")
+
+	return nil
+}
+
+var (
+	blockGasMismatchRegex    = regexp.MustCompile(`block gas used mismatch: got ([0-9]+), expected ([0-9]+)`)
+	blockHashMismatchRegex   = regexp.MustCompile(`want (0x[0-9a-fA-F]+)`)
+	receiptRootMismatchRegex = regexp.MustCompile(`receipt root mismatch: got (0x[0-9a-fA-F]+), expected (0x[0-9a-fA-F]+)`)
+)
+
+func parseSimulationGasMismatch(err error) (uint64, uint64, bool) {
+	if err == nil {
+		return 0, 0, false
+	}
+	matches := blockGasMismatchRegex.FindStringSubmatch(err.Error())
+	if len(matches) != 3 {
+		return 0, 0, false
+	}
+
+	got, errGot := strconv.ParseUint(matches[1], 10, 64)
+	if errGot != nil {
+		return 0, 0, false
+	}
+	expected, errExpected := strconv.ParseUint(matches[2], 10, 64)
+	if errExpected != nil {
+		return 0, 0, false
+	}
+
+	return got, expected, true
+}
+
+func parseSimulationBlockHash(err error) (string, bool) {
+	if err == nil {
+		return "", false
+	}
+	matches := blockHashMismatchRegex.FindStringSubmatch(err.Error())
+	if len(matches) != 2 {
+		return "", false
+	}
+	return matches[1], true
+}
+
+func parseSimulationReceiptsRoot(err error) (string, string, bool) {
+	if err == nil {
+		return "", "", false
+	}
+
+	matches := receiptRootMismatchRegex.FindStringSubmatch(err.Error())
+	if len(matches) != 3 {
+		return "", "", false
+	}
+
+	return matches[1], matches[2], true
+}
+
+type localRebuildResult struct {
+	BlockHash         string          `json:"block_hash"`
+	GasUsed           string          `json:"gas_used"`
+	StateRoot         string          `json:"state_root"`
+	ReceiptsRoot      string          `json:"receipts_root"`
+	LogsBloom         string          `json:"logs_bloom"`
+	ExecutionPayload  json.RawMessage `json:"execution_payload"`
+	BlobsBundle       json.RawMessage `json:"blobs_bundle"`
+	ExecutionRequests json.RawMessage `json:"execution_requests"`
+	Transactions      []string        `json:"transactions"`
+}
+
+func importRemoteRebuildPayload(payload *common.VersionedSubmitBlockRequest, result *localRebuildResult) error {
+	if payload == nil {
+		return fmt.Errorf("payload is nil")
+	}
+	if result == nil {
+		return fmt.Errorf("remote rebuild result is nil")
+	}
+
+	if len(bytes.TrimSpace(result.ExecutionPayload)) == 0 {
+		return fmt.Errorf("remote rebuild response missing execution payload")
+	}
+
+	switch payload.Version { //nolint:exhaustive
+	case spec.DataVersionDeneb:
+		if payload.Deneb == nil {
+			return fmt.Errorf("deneb payload is nil")
+		}
+		execPayload := new(deneb.ExecutionPayload)
+		if err := json.Unmarshal(result.ExecutionPayload, execPayload); err != nil {
+			return fmt.Errorf("failed to decode remote execution payload: %w", err)
+		}
+		payload.Deneb.ExecutionPayload = execPayload
+
+		if trimmed := bytes.TrimSpace(result.BlobsBundle); len(trimmed) > 0 && !strings.EqualFold(string(trimmed), "null") {
+			blobsBundle := new(builderApiDeneb.BlobsBundle)
+			if err := json.Unmarshal(result.BlobsBundle, blobsBundle); err != nil {
+				return fmt.Errorf("failed to decode remote blobs bundle: %w", err)
+			}
+			payload.Deneb.BlobsBundle = blobsBundle
+		} else {
+			payload.Deneb.BlobsBundle = nil
+		}
+	case spec.DataVersionElectra:
+		if payload.Electra == nil {
+			return fmt.Errorf("electra payload is nil")
+		}
+		execPayload := new(deneb.ExecutionPayload)
+		if err := json.Unmarshal(result.ExecutionPayload, execPayload); err != nil {
+			return fmt.Errorf("failed to decode remote execution payload: %w", err)
+		}
+		payload.Electra.ExecutionPayload = execPayload
+
+		if trimmed := bytes.TrimSpace(result.BlobsBundle); len(trimmed) > 0 && !strings.EqualFold(string(trimmed), "null") {
+			blobsBundle := new(builderApiDeneb.BlobsBundle)
+			if err := json.Unmarshal(result.BlobsBundle, blobsBundle); err != nil {
+				return fmt.Errorf("failed to decode remote blobs bundle: %w", err)
+			}
+			payload.Electra.BlobsBundle = blobsBundle
+		} else {
+			payload.Electra.BlobsBundle = nil
+		}
+
+		if trimmed := bytes.TrimSpace(result.ExecutionRequests); len(trimmed) > 0 && !strings.EqualFold(string(trimmed), "null") {
+			execRequests := new(electraSpec.ExecutionRequests)
+			if err := json.Unmarshal(result.ExecutionRequests, execRequests); err != nil {
+				return fmt.Errorf("failed to decode remote execution requests: %w", err)
+			}
+			payload.Electra.ExecutionRequests = execRequests
+		} else {
+			payload.Electra.ExecutionRequests = nil
+		}
+	default:
+		return fmt.Errorf("remote rebuild payload import not implemented for fork version %s", payload.Version)
+	}
+
+	return nil
+}
+
+func (api *RelayAPI) tryLocalRebuild(
+	ctx context.Context,
+	payload *common.VersionedSubmitBlockRequest,
+	submission *common.BlockSubmissionInfo,
+	log *logrus.Entry,
+	simReq *common.BuilderBlockValidationRequest,
+) error {
+	if remoteURL := strings.TrimSpace(os.Getenv("RETH_BLOCK_REBUILDER_URL")); remoteURL != "" {
+		if err := api.tryRemoteRebuild(ctx, payload, submission, log, simReq, remoteURL); err == nil {
+			return nil
+		} else {
+			log.WithError(err).Info("remote rebuild attempt failed")
+		}
+	}
+
+	// else {
+
+	// 	binPath := os.Getenv("RETH_BLOCK_REBUILDER_BIN")
+	// 	if strings.TrimSpace(binPath) == "" {
+	// 		log.Info("local rebuild skipped: RETH_BLOCK_REBUILDER_BIN not configured")
+	// 		return fmt.Errorf("local rebuilder binary not configured")
+	// 	}
+
+	// 	datadir := os.Getenv("RETH_DATADIR")
+	// 	if strings.TrimSpace(datadir) == "" {
+	// 		log.Info("local rebuild skipped: RETH_DATADIR not set")
+	// 		return fmt.Errorf("RETH_DATADIR env var not set")
+	// 	}
+
+	// 	if ctx == nil {
+	// 		ctx = context.Background()
+	// 	}
+
+	// 	log.WithFields(logrus.Fields{
+	// 		"rebuildBin": binPath,
+	// 		"datadir":    datadir,
+	// 		"slot":       submission.BidTrace.Slot,
+	// 	}).Info("starting local rebuild attempt")
+
+	// 	requestBytes, err := json.Marshal(simReq)
+	// 	if err != nil {
+	// 		return fmt.Errorf("failed to marshal local rebuild request: %w", err)
+	// 	}
+
+	// 	requestFile, err := os.CreateTemp("", "relay-local-rebuild-*.json")
+	// 	if err != nil {
+	// 		return fmt.Errorf("failed to create temp request file: %w", err)
+	// 	}
+	// 	defer os.Remove(requestFile.Name())
+
+	// 	if _, err := requestFile.Write(requestBytes); err != nil {
+	// 		requestFile.Close()
+	// 		return fmt.Errorf("failed to write request file: %w", err)
+	// 	}
+	// 	if err := requestFile.Close(); err != nil {
+	// 		return fmt.Errorf("failed to close request file: %w", err)
+	// 	}
+
+	// 	args := []string{"--datadir", datadir, "--request", requestFile.Name()}
+	// 	if chain := strings.TrimSpace(os.Getenv("RETH_CHAIN")); chain != "" {
+	// 		args = append(args, "--chain", chain)
+	// 	}
+
+	// 	log.WithField("requestFile", requestFile.Name()).Info("invoking local block rebuilder")
+
+	// 	cmd := exec.CommandContext(ctx, binPath, args...)
+	// 	cmd.Env = os.Environ()
+	// 	var stdout, stderr bytes.Buffer
+	// 	cmd.Stdout = &stdout
+	// 	cmd.Stderr = &stderr
+
+	// 	if err := cmd.Run(); err != nil {
+	// 		log.WithField("stderr", strings.TrimSpace(stderr.String())).Warn("local block rebuilder failed")
+	// 		return fmt.Errorf("local rebuilder failed: %w (stderr=%s)", err, strings.TrimSpace(stderr.String()))
+	// 	}
+
+	// 	responseJSON := bytes.TrimSpace(stdout.Bytes())
+
+	// 	log.WithField("stdout", string(responseJSON)).Info("local block rebuilder completed, parsing response")
+
+	// 	var result localRebuildResult
+	// 	if err := json.Unmarshal(responseJSON, &result); err != nil {
+	// 		return fmt.Errorf("failed to decode local rebuild response: %w", err)
+	// 	}
+
+	// 	if strings.TrimSpace(result.BlockHash) == "" {
+	// 		return fmt.Errorf("local rebuild response missing block hash")
+	// 	}
+
+	// 	gasUsed, err := strconv.ParseUint(result.GasUsed, 10, 64)
+	// 	if err != nil {
+	// 		return fmt.Errorf("invalid gas used in local rebuild response: %w", err)
+	// 	}
+
+	// 	if err := updateSubmissionGasUsed(payload, submission, gasUsed); err != nil {
+	// 		return fmt.Errorf("failed to apply gas used from local rebuild: %w", err)
+	// 	}
+	// 	if err := updateSubmissionBlockHash(payload, submission, result.BlockHash); err != nil {
+	// 		return fmt.Errorf("failed to apply block hash from local rebuild: %w", err)
+	// 	}
+	// 	if err := updateSubmissionReceiptsRoot(payload, submission, result.ReceiptsRoot); err != nil {
+	// 		return fmt.Errorf("failed to apply receipts root from local rebuild: %w", err)
+	// 	}
+	// 	if err := updateSubmissionStateRoot(payload, submission, result.StateRoot); err != nil {
+	// 		return fmt.Errorf("failed to apply state root from local rebuild: %w", err)
+	// 	}
+	// 	if err := updateSubmissionLogsBloom(payload, submission, result.LogsBloom); err != nil {
+	// 		return fmt.Errorf("failed to apply logs bloom from local rebuild: %w", err)
+	// 	}
+	// 	if err := updateSubmissionBidTraceBlockHash(payload, submission, result.BlockHash); err != nil {
+	// 		return fmt.Errorf("failed to apply bid trace block hash from remote rebuild: %w", err)
+	// 	}
+	// 	if err := api.resignBlockAfterRebuild(payload, submission); err != nil {
+	// 		return fmt.Errorf("failed to re-sign block after local rebuild: %w", err)
+	// 	}
+	// 	log.WithFields(logrus.Fields{
+	// 		"relayLocalRebuildBlockHash": result.BlockHash,
+	// 		"relayLocalRebuildGasUsed":   gasUsed,
+	// 		"relayLocalRebuildStateRoot": result.StateRoot,
+	// 		"relayLocalRebuildReceipts":  result.ReceiptsRoot,
+	// 	}).Debug("applied local rebuild results")
+	// }
+	return nil
+}
+
+func (api *RelayAPI) tryRemoteRebuild(
+	ctx context.Context,
+	payload *common.VersionedSubmitBlockRequest,
+	submission *common.BlockSubmissionInfo,
+	log *logrus.Entry,
+	simReq *common.BuilderBlockValidationRequest,
+	endpoint string,
+) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	requestBytes, err := json.Marshal(simReq)
+	if err != nil {
+		return fmt.Errorf("failed to marshal remote rebuild request: %w", err)
+	}
+
+	const maxAttempts = 2
+	var lastErr error
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		attemptLog := log.WithFields(logrus.Fields{
+			"remoteEndpoint":        endpoint,
+			"remoteRebuildAttempt":  attempt + 1,
+			"remoteRebuildAttempts": maxAttempts,
+		})
+
+		err := api.performRemoteRebuildAttempt(ctx, payload, submission, attemptLog, simReq, endpoint, requestBytes)
+		if err == nil {
+			return nil
+		}
+
+		lastErr = err
+
+		if ctx.Err() != nil || attempt+1 == maxAttempts {
+			break
+		}
+
+		attemptLog.WithError(err).Warn("remote rebuild attempt failed, retrying once")
+	}
+
+	return lastErr
+}
+
+func (api *RelayAPI) performRemoteRebuildAttempt(
+	ctx context.Context,
+	payload *common.VersionedSubmitBlockRequest,
+	submission *common.BlockSubmissionInfo,
+	log *logrus.Entry,
+	simReq *common.BuilderBlockValidationRequest,
+	endpoint string,
+	requestBytes []byte,
+) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(requestBytes))
+	if err != nil {
+		return fmt.Errorf("failed to create remote rebuild request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	log.Info("invoking remote block rebuilder API")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("remote rebuilder request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read remote rebuild response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("remote rebuilder returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var result localRebuildResult
+	if err := json.Unmarshal(body, &result); err != nil {
+		return fmt.Errorf("failed to decode remote rebuild response: %w", err)
+	}
+
+	log.WithFields(logrus.Fields{
+		"result_blockHash":    result.BlockHash,
+		"result_gasUsed":      result.GasUsed,
+		"result_stateRoot":    result.StateRoot,
+		"result_receiptsRoot": result.ReceiptsRoot,
+		"result_logsBloom":    result.LogsBloom,
+	}).Info("localRebuildResult parsed values")
+
+	if strings.TrimSpace(result.BlockHash) == "" {
+		return fmt.Errorf("remote rebuild response missing block hash")
+	}
+
+	gasUsed, err := strconv.ParseUint(result.GasUsed, 10, 64)
+	if err != nil {
+		return fmt.Errorf("invalid gas used in remote rebuild response: %w", err)
+	}
+
+	log.WithFields(logrus.Fields{
+		"beforeUpdate_executionPayload_blockHash":    getExecutionPayloadBlockHash(payload),
+		"beforeUpdate_executionPayload_stateRoot":    getExecutionPayloadStateRoot(payload),
+		"beforeUpdate_executionPayload_receiptsRoot": getExecutionPayloadReceiptsRoot(payload),
+		"beforeUpdate_executionPayload_gasUsed":      getExecutionPayloadGasUsed(payload),
+		"beforeUpdate_bidTrace_blockHash":            getBidTraceBlockHash(payload),
+	}).Info("BEFORE UPDATE: Current payload values")
+
+	if err := importRemoteRebuildPayload(payload, &result); err != nil {
+		return fmt.Errorf("failed to import remote rebuild payload: %w", err)
+	}
+
+	targetBlockHash := result.BlockHash
+
+	if err := updateSubmissionGasUsed(payload, submission, gasUsed); err != nil {
+		return fmt.Errorf("failed to apply gas used from remote rebuild: %w", err)
+	}
+	if err := updateSubmissionBlockHash(payload, submission, targetBlockHash); err != nil {
+		return fmt.Errorf("failed to apply block hash from remote rebuild: %w", err)
+	}
+	if err := updateSubmissionReceiptsRoot(payload, submission, result.ReceiptsRoot); err != nil {
+		return fmt.Errorf("failed to apply receipts root from remote rebuild: %w", err)
+	}
+	if err := updateSubmissionStateRoot(payload, submission, result.StateRoot); err != nil {
+		return fmt.Errorf("failed to apply state root from remote rebuild: %w", err)
+	}
+	if err := updateSubmissionLogsBloom(payload, submission, result.LogsBloom); err != nil {
+		return fmt.Errorf("failed to apply logs bloom from remote rebuild: %w", err)
+	}
+
+	if err := api.resignBlockAfterRebuild(payload, submission); err != nil {
+		return fmt.Errorf("failed to re-sign block after local rebuild: %w", err)
+	}
+
+	if refreshedSubmission, err := common.GetBlockSubmissionInfo(payload); err != nil {
+		return fmt.Errorf("failed to refresh submission info after re-signing: %w", err)
+	} else {
+		*submission = *refreshedSubmission
+	}
+
+	log.WithFields(logrus.Fields{
+		"afterResign_executionPayload_blockHash":    getExecutionPayloadBlockHash(payload),
+		"afterResign_executionPayload_stateRoot":    getExecutionPayloadStateRoot(payload),
+		"afterResign_executionPayload_receiptsRoot": getExecutionPayloadReceiptsRoot(payload),
+		"afterResign_executionPayload_gasUsed":      getExecutionPayloadGasUsed(payload),
+		"afterResign_bidTrace_blockHash":            getBidTraceBlockHash(payload),
+		"afterResign_signature":                     getSignature(payload),
+	}).Info("AFTER RESIGN: Final payload values")
+
+	log.WithFields(logrus.Fields{
+		"relayRemoteRebuildBlockHash": targetBlockHash,
+		"relayRemoteRebuildGasUsed":   gasUsed,
+		"relayRemoteRebuildStateRoot": result.StateRoot,
+		"relayRemoteRebuildReceipts":  result.ReceiptsRoot,
+	}).Info("applied remote rebuild results")
+
+	return nil
+}
+
+func versionedExecutionPayloadFromSubmitRequest(payload *common.VersionedSubmitBlockRequest) (*builderApi.VersionedExecutionPayload, error) {
+	if payload == nil {
+		return nil, fmt.Errorf("payload is nil")
+	}
+
+	versionedPayload := &builderApi.VersionedExecutionPayload{Version: payload.Version}
+
+	switch payload.Version { //nolint:exhaustive
+	case spec.DataVersionBellatrix:
+		if payload.Bellatrix == nil || payload.Bellatrix.ExecutionPayload == nil {
+			return nil, fmt.Errorf("bellatrix execution payload missing")
+		}
+		versionedPayload.Bellatrix = payload.Bellatrix.ExecutionPayload
+	case spec.DataVersionCapella:
+		if payload.Capella == nil || payload.Capella.ExecutionPayload == nil {
+			return nil, fmt.Errorf("capella execution payload missing")
+		}
+		versionedPayload.Capella = payload.Capella.ExecutionPayload
+	case spec.DataVersionDeneb:
+		if payload.Deneb == nil || payload.Deneb.ExecutionPayload == nil {
+			return nil, fmt.Errorf("deneb execution payload missing")
+		}
+		versionedPayload.Deneb = payload.Deneb.ExecutionPayload
+	case spec.DataVersionElectra:
+		if payload.Electra == nil || payload.Electra.ExecutionPayload == nil {
+			return nil, fmt.Errorf("electra execution payload missing")
+		}
+		versionedPayload.Electra = payload.Electra.ExecutionPayload
+	case spec.DataVersionFulu:
+		if payload.Fulu == nil || payload.Fulu.ExecutionPayload == nil {
+			return nil, fmt.Errorf("fulu execution payload missing")
+		}
+		versionedPayload.Fulu = payload.Fulu.ExecutionPayload
+	default:
+		return nil, fmt.Errorf("unsupported payload version for execution payload extraction: %v", payload.Version)
+	}
+
+	return versionedPayload, nil
+}
+
+func updateSubmissionBlockHash(payload *common.VersionedSubmitBlockRequest, submission *common.BlockSubmissionInfo, hashHex string) error {
+	hash, err := utils.HexToHash(hashHex)
+	if err != nil {
+		return err
+	}
+	var phaseHash phase0.Hash32
+	copy(phaseHash[:], hash[:])
+
+	switch payload.Version { //nolint:exhaustive
+	case spec.DataVersionBellatrix:
+		if payload.Bellatrix != nil {
+			if payload.Bellatrix.ExecutionPayload != nil {
+				payload.Bellatrix.ExecutionPayload.BlockHash = phaseHash
+			}
+			if payload.Bellatrix.Message != nil {
+				payload.Bellatrix.Message.BlockHash = phaseHash
+			}
+		}
+	case spec.DataVersionCapella:
+		if payload.Capella != nil {
+			if payload.Capella.ExecutionPayload != nil {
+				payload.Capella.ExecutionPayload.BlockHash = phaseHash
+			}
+			if payload.Capella.Message != nil {
+				payload.Capella.Message.BlockHash = phaseHash
+			}
+		}
+	case spec.DataVersionDeneb:
+		if payload.Deneb != nil {
+			if payload.Deneb.ExecutionPayload != nil {
+				payload.Deneb.ExecutionPayload.BlockHash = phaseHash
+			}
+			if payload.Deneb.Message != nil {
+				payload.Deneb.Message.BlockHash = phaseHash
+			}
+		}
+	case spec.DataVersionElectra:
+		if payload.Electra != nil {
+			if payload.Electra.ExecutionPayload != nil {
+				payload.Electra.ExecutionPayload.BlockHash = phaseHash
+			}
+			if payload.Electra.Message != nil {
+				payload.Electra.Message.BlockHash = phaseHash
+			}
+		}
+	case spec.DataVersionFulu:
+		if payload.Fulu != nil {
+			if payload.Fulu.ExecutionPayload != nil {
+				payload.Fulu.ExecutionPayload.BlockHash = phaseHash
+			}
+			if payload.Fulu.Message != nil {
+				payload.Fulu.Message.BlockHash = phaseHash
+			}
+		}
+	default:
+		return fmt.Errorf("unsupported payload version %d for block hash update", payload.Version)
+	}
+
+	newSubmission, err := common.GetBlockSubmissionInfo(payload)
+	if err != nil {
+		return err
+	}
+	*submission = *newSubmission
+	return nil
+}
+
+func updateSubmissionGasUsed(payload *common.VersionedSubmitBlockRequest, submission *common.BlockSubmissionInfo, gasUsed uint64) error {
+	if payload == nil {
+		return fmt.Errorf("payload is nil")
+	}
+
+	switch payload.Version { //nolint:exhaustive
+	case spec.DataVersionBellatrix:
+		if payload.Bellatrix == nil || payload.Bellatrix.ExecutionPayload == nil {
+			return fmt.Errorf("bellatrix execution payload missing")
+		}
+		payload.Bellatrix.ExecutionPayload.GasUsed = gasUsed
+		if payload.Bellatrix.Message != nil {
+			payload.Bellatrix.Message.GasUsed = gasUsed
+		}
+	case spec.DataVersionCapella:
+		if payload.Capella == nil || payload.Capella.ExecutionPayload == nil {
+			return fmt.Errorf("capella execution payload missing")
+		}
+		payload.Capella.ExecutionPayload.GasUsed = gasUsed
+		if payload.Capella.Message != nil {
+			payload.Capella.Message.GasUsed = gasUsed
+		}
+	case spec.DataVersionDeneb:
+		if payload.Deneb == nil || payload.Deneb.ExecutionPayload == nil {
+			return fmt.Errorf("deneb execution payload missing")
+		}
+		payload.Deneb.ExecutionPayload.GasUsed = gasUsed
+		if payload.Deneb.Message != nil {
+			payload.Deneb.Message.GasUsed = gasUsed
+		}
+	case spec.DataVersionElectra:
+		if payload.Electra == nil || payload.Electra.ExecutionPayload == nil {
+			return fmt.Errorf("electra execution payload missing")
+		}
+		payload.Electra.ExecutionPayload.GasUsed = gasUsed
+		if payload.Electra.Message != nil {
+			payload.Electra.Message.GasUsed = gasUsed
+		}
+	case spec.DataVersionFulu:
+		if payload.Fulu == nil || payload.Fulu.ExecutionPayload == nil {
+			return fmt.Errorf("fulu execution payload missing")
+		}
+		payload.Fulu.ExecutionPayload.GasUsed = gasUsed
+		if payload.Fulu.Message != nil {
+			payload.Fulu.Message.GasUsed = gasUsed
+		}
+	default:
+		return fmt.Errorf("unsupported payload version %d for gas used update", payload.Version)
+	}
+
+	if submission != nil {
+		submission.GasUsed = gasUsed
+		if submission.BidTrace != nil {
+			submission.BidTrace.GasUsed = gasUsed
+		}
+	}
+
+	newSubmission, err := common.GetBlockSubmissionInfo(payload)
+	if err != nil {
+		return err
+	}
+	if submission != nil {
+		*submission = *newSubmission
+	}
+	return nil
+}
+
+func updateSubmissionReceiptsRoot(payload *common.VersionedSubmitBlockRequest, submission *common.BlockSubmissionInfo, rootHex string) error {
+	if payload == nil {
+		return fmt.Errorf("payload is nil")
+	}
+
+	rootHash, err := utils.HexToHash(rootHex)
+	if err != nil {
+		return err
+	}
+
+	var root [32]byte
+	copy(root[:], rootHash[:])
+
+	switch payload.Version { //nolint:exhaustive
+	case spec.DataVersionBellatrix:
+		if payload.Bellatrix == nil || payload.Bellatrix.ExecutionPayload == nil {
+			return fmt.Errorf("bellatrix execution payload missing")
+		}
+		payload.Bellatrix.ExecutionPayload.ReceiptsRoot = root
+	case spec.DataVersionCapella:
+		if payload.Capella == nil || payload.Capella.ExecutionPayload == nil {
+			return fmt.Errorf("capella execution payload missing")
+		}
+		payload.Capella.ExecutionPayload.ReceiptsRoot = root
+	case spec.DataVersionDeneb:
+		if payload.Deneb == nil || payload.Deneb.ExecutionPayload == nil {
+			return fmt.Errorf("deneb execution payload missing")
+		}
+		payload.Deneb.ExecutionPayload.ReceiptsRoot = root
+	case spec.DataVersionElectra:
+		if payload.Electra == nil || payload.Electra.ExecutionPayload == nil {
+			return fmt.Errorf("electra execution payload missing")
+		}
+		payload.Electra.ExecutionPayload.ReceiptsRoot = root
+	case spec.DataVersionFulu:
+		if payload.Fulu == nil || payload.Fulu.ExecutionPayload == nil {
+			return fmt.Errorf("fulu execution payload missing")
+		}
+		payload.Fulu.ExecutionPayload.ReceiptsRoot = root
+	default:
+		return fmt.Errorf("unsupported payload version %d for receipts root update", payload.Version)
+	}
+
+	newSubmission, err := common.GetBlockSubmissionInfo(payload)
+	if err != nil {
+		return err
+	}
+
+	*submission = *newSubmission
+	return nil
+}
+
+func updateSubmissionStateRoot(payload *common.VersionedSubmitBlockRequest, submission *common.BlockSubmissionInfo, rootHex string) error {
+	if payload == nil {
+		return fmt.Errorf("payload is nil")
+	}
+
+	hash, err := utils.HexToHash(rootHex)
+	if err != nil {
+		return err
+	}
+
+	var phaseRoot phase0.Hash32
+	copy(phaseRoot[:], hash[:])
+	// fmt.Printf("STATE ROOT UPDATE - Input: %s, Parsed: %s\n", rootHex, phaseRoot.String())
+
+	switch payload.Version { //nolint:exhaustive
+	case spec.DataVersionBellatrix:
+		if payload.Bellatrix == nil || payload.Bellatrix.ExecutionPayload == nil {
+			return fmt.Errorf("bellatrix execution payload missing")
+		}
+		// fmt.Printf("STATE ROOT UPDATE - Before Bellatrix: %s\n", payload.Bellatrix.ExecutionPayload.StateRoot)
+		payload.Bellatrix.ExecutionPayload.StateRoot = phaseRoot
+		// fmt.Printf("STATE ROOT UPDATE - After Bellatrix: %s\n", payload.Bellatrix.ExecutionPayload.StateRoot)
+	case spec.DataVersionCapella:
+		if payload.Capella == nil || payload.Capella.ExecutionPayload == nil {
+			return fmt.Errorf("capella execution payload missing")
+		}
+		// fmt.Printf("STATE ROOT UPDATE - Before Capella: %s\n", payload.Capella.ExecutionPayload.StateRoot)
+		payload.Capella.ExecutionPayload.StateRoot = phaseRoot
+		// fmt.Printf("STATE ROOT UPDATE - After Capella: %s\n", payload.Capella.ExecutionPayload.StateRoot)
+	case spec.DataVersionDeneb:
+		if payload.Deneb == nil || payload.Deneb.ExecutionPayload == nil {
+			return fmt.Errorf("deneb execution payload missing")
+		}
+		// fmt.Printf("STATE ROOT UPDATE - Before Deneb: %s\n", payload.Deneb.ExecutionPayload.StateRoot.String())
+		payload.Deneb.ExecutionPayload.StateRoot = phase0.Root(phaseRoot)
+		// fmt.Printf("STATE ROOT UPDATE - After Deneb: %s\n", payload.Deneb.ExecutionPayload.StateRoot.String())
+	case spec.DataVersionElectra:
+		if payload.Electra == nil || payload.Electra.ExecutionPayload == nil {
+			return fmt.Errorf("electra execution payload missing")
+		}
+		// fmt.Printf("STATE ROOT UPDATE - Before Electra: %s\n", payload.Electra.ExecutionPayload.StateRoot.String())
+		payload.Electra.ExecutionPayload.StateRoot = phase0.Root(phaseRoot)
+		// fmt.Printf("STATE ROOT UPDATE - After Electra: %s\n", payload.Electra.ExecutionPayload.StateRoot.String())
+	case spec.DataVersionFulu:
+		if payload.Fulu == nil || payload.Fulu.ExecutionPayload == nil {
+			return fmt.Errorf("fulu execution payload missing")
+		}
+		// fmt.Printf("STATE ROOT UPDATE - Before Fulu: %s\n", payload.Fulu.ExecutionPayload.StateRoot.String())
+		payload.Fulu.ExecutionPayload.StateRoot = phase0.Root(phaseRoot)
+		// fmt.Printf("STATE ROOT UPDATE - After Fulu: %s\n", payload.Fulu.ExecutionPayload.StateRoot.String())
+	default:
+		return fmt.Errorf("unsupported payload version %d for state root update", payload.Version)
+	}
+
+	newSubmission, err := common.GetBlockSubmissionInfo(payload)
+	if err != nil {
+		return err
+	}
+	*submission = *newSubmission
+	return nil
+}
+
+func updateSubmissionLogsBloom(payload *common.VersionedSubmitBlockRequest, submission *common.BlockSubmissionInfo, bloomHex string) error {
+	if payload == nil {
+		return fmt.Errorf("payload is nil")
+	}
+
+	bloomBytes, err := hex.DecodeString(strings.TrimPrefix(bloomHex, "0x"))
+	if err != nil {
+		return err
+	}
+
+	switch payload.Version { //nolint:exhaustive
+	case spec.DataVersionBellatrix:
+		if payload.Bellatrix == nil || payload.Bellatrix.ExecutionPayload == nil {
+			return fmt.Errorf("bellatrix execution payload missing")
+		}
+		if len(bloomBytes) != len(payload.Bellatrix.ExecutionPayload.LogsBloom) {
+			return fmt.Errorf("invalid bloom length for bellatrix payload")
+		}
+		copy(payload.Bellatrix.ExecutionPayload.LogsBloom[:], bloomBytes)
+	case spec.DataVersionCapella:
+		if payload.Capella == nil || payload.Capella.ExecutionPayload == nil {
+			return fmt.Errorf("capella execution payload missing")
+		}
+		if len(bloomBytes) != len(payload.Capella.ExecutionPayload.LogsBloom) {
+			return fmt.Errorf("invalid bloom length for capella payload")
+		}
+		copy(payload.Capella.ExecutionPayload.LogsBloom[:], bloomBytes)
+	case spec.DataVersionDeneb:
+		if payload.Deneb == nil || payload.Deneb.ExecutionPayload == nil {
+			return fmt.Errorf("deneb execution payload missing")
+		}
+		if len(bloomBytes) != len(payload.Deneb.ExecutionPayload.LogsBloom) {
+			return fmt.Errorf("invalid bloom length for deneb payload")
+		}
+		copy(payload.Deneb.ExecutionPayload.LogsBloom[:], bloomBytes)
+	case spec.DataVersionElectra:
+		if payload.Electra == nil || payload.Electra.ExecutionPayload == nil {
+			return fmt.Errorf("electra execution payload missing")
+		}
+		if len(bloomBytes) != len(payload.Electra.ExecutionPayload.LogsBloom) {
+			return fmt.Errorf("invalid bloom length for electra payload")
+		}
+		copy(payload.Electra.ExecutionPayload.LogsBloom[:], bloomBytes)
+	case spec.DataVersionFulu:
+		if payload.Fulu == nil || payload.Fulu.ExecutionPayload == nil {
+			return fmt.Errorf("fulu execution payload missing")
+		}
+		if len(bloomBytes) != len(payload.Fulu.ExecutionPayload.LogsBloom) {
+			return fmt.Errorf("invalid bloom length for fulu payload")
+		}
+		copy(payload.Fulu.ExecutionPayload.LogsBloom[:], bloomBytes)
+	default:
+		return fmt.Errorf("unsupported payload version %d for logs bloom update", payload.Version)
+	}
+
+	newSubmission, err := common.GetBlockSubmissionInfo(payload)
+	if err != nil {
+		return err
+	}
+	*submission = *newSubmission
+	return nil
+}
+
+func (api *RelayAPI) rewriteSubmissionWithRelayIdentity(payload *common.VersionedSubmitBlockRequest, submission *common.BlockSubmissionInfo, log *logrus.Entry) error {
+	if api.blsSk == nil || api.publicKey == nil {
+		return fmt.Errorf("relay BLS key not configured")
+	}
+	if submission == nil || submission.BidTrace == nil {
+		return fmt.Errorf("submission bid trace missing")
+	}
+
+	if submission.BidTrace.BuilderPubkey == *api.publicKey {
+		return nil
+	}
+
+	submission.BidTrace.BuilderPubkey = *api.publicKey
+
+	var (
+		bidTrace *builderApiV1.BidTrace
+		setSig   func(phase0.BLSSignature)
+	)
+
+	switch payload.Version { //nolint:exhaustive
+	case spec.DataVersionBellatrix:
+		if payload.Bellatrix == nil || payload.Bellatrix.Message == nil {
+			return fmt.Errorf("bellatrix payload message missing")
+		}
+		payload.Bellatrix.Message.BuilderPubkey = *api.publicKey
+		bidTrace = payload.Bellatrix.Message
+		setSig = func(sig phase0.BLSSignature) {
+			payload.Bellatrix.Signature = sig
+		}
+	case spec.DataVersionCapella:
+		if payload.Capella == nil || payload.Capella.Message == nil {
+			return fmt.Errorf("capella payload message missing")
+		}
+		payload.Capella.Message.BuilderPubkey = *api.publicKey
+		bidTrace = payload.Capella.Message
+		setSig = func(sig phase0.BLSSignature) {
+			payload.Capella.Signature = sig
+		}
+	case spec.DataVersionDeneb:
+		if payload.Deneb == nil || payload.Deneb.Message == nil {
+			return fmt.Errorf("deneb payload message missing")
+		}
+		payload.Deneb.Message.BuilderPubkey = *api.publicKey
+		bidTrace = payload.Deneb.Message
+		setSig = func(sig phase0.BLSSignature) {
+			payload.Deneb.Signature = sig
+		}
+	case spec.DataVersionElectra:
+		if payload.Electra == nil || payload.Electra.Message == nil {
+			return fmt.Errorf("electra payload message missing")
+		}
+		payload.Electra.Message.BuilderPubkey = *api.publicKey
+		bidTrace = payload.Electra.Message
+		setSig = func(sig phase0.BLSSignature) {
+			payload.Electra.Signature = sig
+		}
+	case spec.DataVersionFulu:
+		if payload.Fulu == nil || payload.Fulu.Message == nil {
+			return fmt.Errorf("fulu payload message missing")
+		}
+		payload.Fulu.Message.BuilderPubkey = *api.publicKey
+		bidTrace = payload.Fulu.Message
+		setSig = func(sig phase0.BLSSignature) {
+			payload.Fulu.Signature = sig
+		}
+	default:
+		return fmt.Errorf("unsupported payload version %d", payload.Version)
+	}
+
+	if bidTrace == nil {
+		return fmt.Errorf("bid trace message not available for re-signing")
+	}
+
+	signature, err := ssz.SignMessage(bidTrace, api.opts.EthNetDetails.DomainBuilder, api.blsSk)
+	if err != nil {
+		return fmt.Errorf("failed to sign bid trace with relay key: %w", err)
+	}
+
+	submission.Signature = signature
+	setSig(signature)
+
+	log.WithField("relayBuilderPubkey", api.publicKey.String()).Info("rewrote submission with relay identity and signature")
+
+	return nil
+}
+
+func (api *RelayAPI) deriveRelayNonceAndHashes(ctx context.Context, signer gethtypes.Signer, submission *common.BlockSubmissionInfo, relayAddress ethcommon.Address, log *logrus.Entry) (uint64, map[string]struct{}, error) {
+	if submission == nil {
+		return 0, nil, fmt.Errorf("submission info is nil")
+	}
+
+	nonce, err := api.fetchAccountNonce(ctx, relayAddress, submission.BlockNumber)
+	if err != nil {
+		return 0, nil, err
+	}
+
+	existingHashes := make(map[string]struct{}, len(submission.Transactions))
+	nextNonce := nonce
+
+	for _, txBytes := range submission.Transactions {
+		if len(txBytes) == 0 {
+			continue
+		}
+
+		tx := new(gethtypes.Transaction)
+		if err := tx.UnmarshalBinary([]byte(txBytes)); err != nil {
+			log.WithError(err).Debug("failed to decode transaction while deriving relay nonce")
+			continue
+		}
+
+		txHash := tx.Hash().Hex()
+		existingHashes[txHash] = struct{}{}
+
+		sender, err := signer.Sender(tx)
+		if err != nil {
+			log.WithError(err).Debug("failed to recover sender while deriving relay nonce")
+			continue
+		}
+
+		if sender == relayAddress && tx.Nonce() >= nextNonce {
+			nextNonce = tx.Nonce() + 1
+		}
+	}
+
+	return nextNonce, existingHashes, nil
+}
+
+func (api *RelayAPI) fetchAccountNonce(ctx context.Context, address ethcommon.Address, blockNumber uint64) (uint64, error) {
+	if strings.TrimSpace(executionEndpoint) == "" {
+		return 0, fmt.Errorf("execution endpoint not configured")
+	}
+
+	blockParam := "latest"
+	if blockNumber > 0 {
+		blockParam = fmt.Sprintf("0x%x", blockNumber-1)
+	} else {
+		blockParam = "0x0"
+	}
+
+	requestPayload := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "eth_getTransactionCount",
+		"params":  []interface{}{address.Hex(), blockParam},
+	}
+
+	body, err := json.Marshal(requestPayload)
+	if err != nil {
+		return 0, fmt.Errorf("failed to marshal nonce request: %w", err)
+	}
+
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	timeoutCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(timeoutCtx, http.MethodPost, executionEndpoint, bytes.NewReader(body))
+	if err != nil {
+		return 0, fmt.Errorf("failed to build nonce request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := (&http.Client{}).Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("failed to call execution endpoint: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= http.StatusBadRequest {
+		errorBody, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return 0, fmt.Errorf("execution endpoint returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(errorBody)))
+	}
+
+	var rpcResp struct {
+		Result string `json:"result"`
+		Error  *struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error,omitempty"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&rpcResp); err != nil {
+		return 0, fmt.Errorf("failed to decode nonce response: %w", err)
+	}
+	if rpcResp.Error != nil {
+		return 0, fmt.Errorf("execution endpoint error %d: %s", rpcResp.Error.Code, rpcResp.Error.Message)
+	}
+
+	result := strings.TrimPrefix(rpcResp.Result, "0x")
+	if result == "" {
+		return 0, fmt.Errorf("execution endpoint returned empty nonce")
+	}
+
+	nonceBig, ok := new(big.Int).SetString(result, 16)
+	if !ok {
+		return 0, fmt.Errorf("execution endpoint returned invalid nonce %q", rpcResp.Result)
+	}
+	if !nonceBig.IsUint64() {
+		return 0, fmt.Errorf("nonce value out of range: %s", nonceBig.String())
+	}
+
+	return nonceBig.Uint64(), nil
+}
+
+func (api *RelayAPI) fetchRPCChainID(ctx context.Context) (*big.Int, error) {
+	if strings.TrimSpace(executionEndpoint) == "" {
+		return nil, fmt.Errorf("execution endpoint not configured")
+	}
+
+	requestPayload := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "eth_chainId",
+		"params":  []interface{}{},
+	}
+
+	body, err := json.Marshal(requestPayload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal chain id request: %w", err)
+	}
+
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	timeoutCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(timeoutCtx, http.MethodPost, executionEndpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("failed to build chain id request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := (&http.Client{}).Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to call execution endpoint for chain id: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= http.StatusBadRequest {
+		errorBody, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf(
+			"execution endpoint returned status %d while fetching chain id: %s",
+			resp.StatusCode,
+			strings.TrimSpace(string(errorBody)),
+		)
+	}
+
+	var rpcResp struct {
+		Result string `json:"result"`
+		Error  *struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error,omitempty"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&rpcResp); err != nil {
+		return nil, fmt.Errorf("failed to decode chain id response: %w", err)
+	}
+	if rpcResp.Error != nil {
+		return nil, fmt.Errorf(
+			"execution endpoint chain id error %d: %s",
+			rpcResp.Error.Code,
+			rpcResp.Error.Message,
+		)
+	}
+
+	result := strings.TrimSpace(rpcResp.Result)
+	if result == "" {
+		return nil, fmt.Errorf("execution endpoint returned empty chain id")
+	}
+
+	parsed, err := parseChainIDValue(result)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse chain id %q: %w", rpcResp.Result, err)
+	}
+	return parsed, nil
+}
+
+func executionPayloadBaseFee(payload *common.VersionedSubmitBlockRequest) *big.Int {
+	if payload == nil {
+		return big.NewInt(0)
+	}
+
+	switch payload.Version {
+	case spec.DataVersionBellatrix:
+		if payload.Bellatrix != nil && payload.Bellatrix.ExecutionPayload != nil {
+			return littleEndianBytesToBigInt(payload.Bellatrix.ExecutionPayload.BaseFeePerGas)
+		}
+	case spec.DataVersionCapella:
+		if payload.Capella != nil && payload.Capella.ExecutionPayload != nil {
+			return littleEndianBytesToBigInt(payload.Capella.ExecutionPayload.BaseFeePerGas)
+		}
+	case spec.DataVersionDeneb:
+		if payload.Deneb != nil && payload.Deneb.ExecutionPayload != nil && payload.Deneb.ExecutionPayload.BaseFeePerGas != nil {
+			return payload.Deneb.ExecutionPayload.BaseFeePerGas.ToBig()
+		}
+	case spec.DataVersionElectra:
+		if payload.Electra != nil && payload.Electra.ExecutionPayload != nil && payload.Electra.ExecutionPayload.BaseFeePerGas != nil {
+			return payload.Electra.ExecutionPayload.BaseFeePerGas.ToBig()
+		}
+	case spec.DataVersionFulu:
+		if payload.Fulu != nil && payload.Fulu.ExecutionPayload != nil && payload.Fulu.ExecutionPayload.BaseFeePerGas != nil {
+			return payload.Fulu.ExecutionPayload.BaseFeePerGas.ToBig()
+		}
+	}
+
+	return big.NewInt(0)
+}
+
+func littleEndianBytesToBigInt(value [32]byte) *big.Int {
+	reversed := make([]byte, len(value))
+	for i := range value {
+		reversed[len(value)-1-i] = value[i]
+	}
+	return new(big.Int).SetBytes(reversed)
+}
+
+func parseChainIDValue(value string) (*big.Int, error) {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return nil, fmt.Errorf("chain id not configured")
+	}
+
+	if strings.HasPrefix(v, "0x") || strings.HasPrefix(v, "0X") {
+		if parsed, ok := new(big.Int).SetString(v[2:], 16); ok && parsed.Sign() > 0 {
+			return parsed, nil
+		}
+	} else {
+		if parsed, ok := new(big.Int).SetString(v, 10); ok && parsed.Sign() > 0 {
+			return parsed, nil
+		}
+		if parsed, ok := new(big.Int).SetString(v, 16); ok && parsed.Sign() > 0 {
+			return parsed, nil
+		}
+	}
+
+	return nil, fmt.Errorf("invalid chain id %q", value)
+}
+
+func appendTxToPayload(payload *common.VersionedSubmitBlockRequest, txBytes []byte, gasUsed uint64) error {
+	tx := bellatrix.Transaction(txBytes)
+
+	switch payload.Version {
+	case spec.DataVersionCapella:
+		if payload.Capella == nil || payload.Capella.ExecutionPayload == nil {
+			return fmt.Errorf("capella execution payload missing")
+		}
+		txs := payload.Capella.ExecutionPayload.Transactions
+		if len(txs) == 0 {
+			return fmt.Errorf("capella execution payload has no transactions")
+		}
+		last := txs[len(txs)-1]
+		txs = append(txs[:len(txs)-1], tx)
+		payload.Capella.ExecutionPayload.Transactions = append(txs, last)
+		payload.Capella.ExecutionPayload.GasUsed += gasUsed
+		if payload.Capella.Message != nil {
+			payload.Capella.Message.GasUsed += gasUsed
+		}
+	case spec.DataVersionDeneb:
+		if payload.Deneb == nil || payload.Deneb.ExecutionPayload == nil {
+			return fmt.Errorf("deneb execution payload missing")
+		}
+		txs := payload.Deneb.ExecutionPayload.Transactions
+		if len(txs) == 0 {
+			return fmt.Errorf("deneb execution payload has no transactions")
+		}
+		last := txs[len(txs)-1]
+		txs = append(txs[:len(txs)-1], tx)
+		payload.Deneb.ExecutionPayload.Transactions = append(txs, last)
+		payload.Deneb.ExecutionPayload.GasUsed += gasUsed
+		if payload.Deneb.Message != nil {
+			payload.Deneb.Message.GasUsed += gasUsed
+		}
+	case spec.DataVersionElectra:
+		if payload.Electra == nil || payload.Electra.ExecutionPayload == nil {
+			return fmt.Errorf("electra execution payload missing")
+		}
+		txs := payload.Electra.ExecutionPayload.Transactions
+		if len(txs) == 0 {
+			return fmt.Errorf("electra execution payload has no transactions")
+		}
+		last := txs[len(txs)-1]
+		txs = append(txs[:len(txs)-1], tx)
+		payload.Electra.ExecutionPayload.Transactions = append(txs, last)
+		payload.Electra.ExecutionPayload.GasUsed += gasUsed
+		if payload.Electra.Message != nil {
+			payload.Electra.Message.GasUsed += gasUsed
+		}
+	case spec.DataVersionFulu:
+		if payload.Fulu == nil || payload.Fulu.ExecutionPayload == nil {
+			return fmt.Errorf("fulu execution payload missing")
+		}
+		txs := payload.Fulu.ExecutionPayload.Transactions
+		if len(txs) == 0 {
+			return fmt.Errorf("fulu execution payload has no transactions")
+		}
+		last := txs[len(txs)-1]
+		txs = append(txs[:len(txs)-1], tx)
+		payload.Fulu.ExecutionPayload.Transactions = append(txs, last)
+		payload.Fulu.ExecutionPayload.GasUsed += gasUsed
+		if payload.Fulu.Message != nil {
+			payload.Fulu.Message.GasUsed += gasUsed
+		}
+	case spec.DataVersionBellatrix:
+		if payload.Bellatrix == nil || payload.Bellatrix.ExecutionPayload == nil {
+			return fmt.Errorf("bellatrix execution payload missing")
+		}
+		txs := payload.Bellatrix.ExecutionPayload.Transactions
+		if len(txs) == 0 {
+			return fmt.Errorf("bellatrix execution payload has no transactions")
+		}
+		last := txs[len(txs)-1]
+		txs = append(txs[:len(txs)-1], tx)
+		payload.Bellatrix.ExecutionPayload.Transactions = append(txs, last)
+		payload.Bellatrix.ExecutionPayload.GasUsed += gasUsed
+		if payload.Bellatrix.Message != nil {
+			payload.Bellatrix.Message.GasUsed += gasUsed
+		}
+	default:
+		return fmt.Errorf("unsupported payload version %d", payload.Version)
+	}
+
+	return nil
+}
+
 // respondGetPayloadSSZ responds to the proposer in SSZ
 func (api *RelayAPI) respondGetPayloadSSZ(w http.ResponseWriter, result *builderApi.VersionedSubmitBlindedBlockResponse) {
 	// Serialize the response
@@ -4796,4 +6549,178 @@ func (api *RelayAPI) respondGetPayloadSSZ(w http.ResponseWriter, result *builder
 		api.log.WithError(err).Error("error writing SSZ response")
 		http.Error(w, "failed to write response", http.StatusInternalServerError)
 	}
+}
+
+func (api *RelayAPI) resignBlockAfterRebuild(payload *common.VersionedSubmitBlockRequest, submission *common.BlockSubmissionInfo) error {
+	// Create versioned payload from the execution payload
+	versionedPayload, err := versionedExecutionPayloadFromSubmitRequest(payload)
+	if err != nil {
+		return fmt.Errorf("failed to build execution payload for re-signing: %w", err)
+	}
+	submission.BidTrace.BuilderPubkey = *api.publicKey
+
+	// Create header from the execution payload
+	header, err := utils.PayloadToPayloadHeader(versionedPayload)
+	if err != nil {
+		return fmt.Errorf("failed to create header from execution payload: %w", err)
+	}
+
+	// Create BuilderBid with the header and sign it
+	switch payload.Version {
+	case spec.DataVersionCapella:
+		if payload.Capella != nil {
+			builderBid := builderApiCapella.BuilderBid{
+				Value:  submission.BidTrace.Value,
+				Header: header.Capella,
+				Pubkey: *api.publicKey,
+			}
+
+			signature, err := ssz.SignMessage(&builderBid, api.opts.EthNetDetails.DomainBuilder, api.blsSk)
+			if err != nil {
+				return fmt.Errorf("failed to re-sign capella block: %w", err)
+			}
+
+			copy(payload.Capella.Signature[:], signature[:])
+		}
+	case spec.DataVersionDeneb:
+		if payload.Deneb != nil {
+			builderBid := builderApiDeneb.BuilderBid{
+				Value:              submission.BidTrace.Value,
+				Header:             header.Deneb,
+				BlobKZGCommitments: payload.Deneb.BlobsBundle.Commitments,
+				Pubkey:             *api.publicKey,
+			}
+
+			signature, err := ssz.SignMessage(&builderBid, api.opts.EthNetDetails.DomainBuilder, api.blsSk)
+			if err != nil {
+				return fmt.Errorf("failed to re-sign deneb block: %w", err)
+			}
+
+			copy(payload.Deneb.Signature[:], signature[:])
+		}
+	case spec.DataVersionElectra:
+		if payload.Electra != nil {
+			builderBid := builderApiElectra.BuilderBid{
+				Value:              submission.BidTrace.Value,
+				Header:             header.Electra,
+				BlobKZGCommitments: payload.Electra.BlobsBundle.Commitments,
+				ExecutionRequests:  payload.Electra.ExecutionRequests,
+				Pubkey:             *api.publicKey,
+			}
+
+			signature, err := ssz.SignMessage(&builderBid, api.opts.EthNetDetails.DomainBuilder, api.blsSk)
+			if err != nil {
+				return fmt.Errorf("failed to re-sign electra block: %w", err)
+			}
+
+			copy(payload.Electra.Signature[:], signature[:])
+		}
+	case spec.DataVersionFulu:
+		if payload.Fulu != nil {
+			builderBid := builderApiElectra.BuilderBid{
+				Value:              submission.BidTrace.Value,
+				Header:             header.Fulu,
+				BlobKZGCommitments: payload.Fulu.BlobsBundle.Commitments,
+				ExecutionRequests:  payload.Fulu.ExecutionRequests,
+				Pubkey:             *api.publicKey,
+			}
+
+			signature, err := ssz.SignMessage(&builderBid, api.opts.EthNetDetails.DomainBuilder, api.blsSk)
+			if err != nil {
+				return fmt.Errorf("failed to re-sign fulu block: %w", err)
+			}
+
+			copy(payload.Fulu.Signature[:], signature[:])
+		}
+	default:
+		return fmt.Errorf("unsupported payload version for re-signing: %v", payload.Version)
+	}
+
+	return nil
+}
+
+// /TODO remove helper function
+func getExecutionPayloadBlockHash(payload *common.VersionedSubmitBlockRequest) string {
+	switch payload.Version {
+	case spec.DataVersionElectra:
+		if payload.Electra != nil && payload.Electra.ExecutionPayload != nil {
+			return payload.Electra.ExecutionPayload.BlockHash.String()
+		}
+	case spec.DataVersionFulu:
+		if payload.Fulu != nil && payload.Fulu.ExecutionPayload != nil {
+			return payload.Fulu.ExecutionPayload.BlockHash.String()
+		}
+	}
+	return "unknown"
+}
+
+func getExecutionPayloadStateRoot(payload *common.VersionedSubmitBlockRequest) string {
+	switch payload.Version {
+	case spec.DataVersionElectra:
+		if payload.Electra != nil && payload.Electra.ExecutionPayload != nil {
+			return payload.Electra.ExecutionPayload.StateRoot.String()
+		}
+	case spec.DataVersionFulu:
+		if payload.Fulu != nil && payload.Fulu.ExecutionPayload != nil {
+			return payload.Fulu.ExecutionPayload.StateRoot.String()
+		}
+	}
+	return "unknown"
+}
+
+func getExecutionPayloadReceiptsRoot(payload *common.VersionedSubmitBlockRequest) string {
+	switch payload.Version {
+	case spec.DataVersionElectra:
+		if payload.Electra != nil && payload.Electra.ExecutionPayload != nil {
+			return payload.Electra.ExecutionPayload.ReceiptsRoot.String()
+		}
+	case spec.DataVersionFulu:
+		if payload.Fulu != nil && payload.Fulu.ExecutionPayload != nil {
+			return payload.Fulu.ExecutionPayload.ReceiptsRoot.String()
+		}
+	}
+	return "unknown"
+}
+
+func getExecutionPayloadGasUsed(payload *common.VersionedSubmitBlockRequest) uint64 {
+	switch payload.Version {
+
+	case spec.DataVersionElectra:
+		if payload.Electra != nil && payload.Electra.ExecutionPayload != nil {
+			return payload.Electra.ExecutionPayload.GasUsed
+		}
+	case spec.DataVersionFulu:
+		if payload.Fulu != nil && payload.Fulu.ExecutionPayload != nil {
+			return payload.Fulu.ExecutionPayload.GasUsed
+		}
+	}
+	return 0
+}
+
+func getBidTraceBlockHash(payload *common.VersionedSubmitBlockRequest) string {
+	switch payload.Version {
+	case spec.DataVersionElectra:
+		if payload.Electra != nil && payload.Electra.Message != nil {
+			return payload.Electra.Message.BlockHash.String()
+		}
+	case spec.DataVersionFulu:
+		if payload.Fulu != nil && payload.Fulu.Message != nil {
+			return payload.Fulu.Message.BlockHash.String()
+		}
+	}
+	return "unknown"
+}
+
+func getSignature(payload *common.VersionedSubmitBlockRequest) string {
+	switch payload.Version {
+	case spec.DataVersionElectra:
+		if payload.Electra != nil {
+			return payload.Electra.Signature.String()
+		}
+	case spec.DataVersionFulu:
+		if payload.Fulu != nil {
+			return payload.Fulu.Signature.String()
+		}
+	}
+	return "unknown"
 }
