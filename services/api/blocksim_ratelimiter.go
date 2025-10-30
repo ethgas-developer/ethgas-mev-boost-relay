@@ -107,12 +107,27 @@ func (b *BlockSimulationRateLimiter) Send(
 		return nil, err, nil
 	}
 
-	logrus.WithFields(logrus.Fields{
-		"sim_payloadBlockHash":          payload.Electra.Message.BlockHash.String(),
-		"sim_ExecutionPayloadBlockHash": payload.Electra.ExecutionPayload.BlockHash.String(),
-		"sim_bidTraceBlockHash":         submission.BidTrace.BlockHash.String(),
-		"sim_payloadVersion":            payload.Version,
-	}).Info("prepared block simulation request")
+	logFields := logrus.Fields{
+		"sim_bidTraceBlockHash": submission.BidTrace.BlockHash.String(),
+		"sim_payloadVersion":    payload.Version,
+	}
+
+	switch payload.Version { //nolint:exhaustive // versions are validated above
+	case spec.DataVersionCapella:
+		logFields["sim_payloadBlockHash"] = payload.Capella.Message.BlockHash.String()
+		logFields["sim_ExecutionPayloadBlockHash"] = payload.Capella.ExecutionPayload.BlockHash.String()
+	case spec.DataVersionDeneb:
+		logFields["sim_payloadBlockHash"] = payload.Deneb.Message.BlockHash.String()
+		logFields["sim_ExecutionPayloadBlockHash"] = payload.Deneb.ExecutionPayload.BlockHash.String()
+	case spec.DataVersionElectra:
+		logFields["sim_payloadBlockHash"] = payload.Electra.Message.BlockHash.String()
+		logFields["sim_ExecutionPayloadBlockHash"] = payload.Electra.ExecutionPayload.BlockHash.String()
+	case spec.DataVersionFulu:
+		logFields["sim_payloadBlockHash"] = payload.Fulu.Message.BlockHash.String()
+		logFields["sim_ExecutionPayloadBlockHash"] = payload.Fulu.ExecutionPayload.BlockHash.String()
+	}
+
+	logrus.WithFields(logFields).Info("prepared block simulation request")
 
 	// Prepare headers
 	headers := http.Header{}
