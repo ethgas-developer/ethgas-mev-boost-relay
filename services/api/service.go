@@ -39,12 +39,14 @@ import (
 	builderApiCapella "github.com/attestantio/go-builder-client/api/capella"
 	builderApiDeneb "github.com/attestantio/go-builder-client/api/deneb"
 	builderApiElectra "github.com/attestantio/go-builder-client/api/electra"
+	builderApiFulu "github.com/attestantio/go-builder-client/api/fulu"
 
 	builderApiV1 "github.com/attestantio/go-builder-client/api/v1"
 	"github.com/attestantio/go-eth2-client/spec"
 	bellatrix "github.com/attestantio/go-eth2-client/spec/bellatrix"
 	"github.com/attestantio/go-eth2-client/spec/deneb"
 	electraSpec "github.com/attestantio/go-eth2-client/spec/electra"
+
 	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/buger/jsonparser"
 	ethcommon "github.com/ethereum/go-ethereum/common"
@@ -1891,7 +1893,9 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 
 	//No bid => proxy out
 	if bid == nil || bid.IsEmpty() {
-		// log.Info("no bid found")
+		if strings.Contains(ua, "commit-boost") {
+			log.Info("no bid found")
+		}
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -4992,12 +4996,10 @@ func (api *RelayAPI) appendRelaySelfTransferTx(ctx context.Context, payload *com
 		finalTxsHex[i] = "0x" + hex.EncodeToString(txBytes)
 	}
 
-	// log.WithFields(logrus.Fields{
-	// 	"relaySelfTxHash":        txHash,
-	// 	"relaySelfTxNonce":       nonce,
-	// 	"transactionsHexAfter":   finalTxsHex,
-	// 	"relaySelfTxRawHexAfter": relayTxHex,
-	// }).Info("appended relay self-transfer transaction to block submission")
+	log.WithFields(logrus.Fields{
+		"relaySelfTxHash":  txHash,
+		"relaySelfTxNonce": nonce,
+	}).Info("appended relay self-transfer transaction to block submission")
 
 	return true, nil
 }
@@ -5443,6 +5445,35 @@ func importRemoteRebuildPayload(payload *common.VersionedSubmitBlockRequest, res
 			payload.Electra.ExecutionRequests = execRequests
 		} else {
 			payload.Electra.ExecutionRequests = nil
+		}
+	case spec.DataVersionFulu:
+		if payload.Fulu == nil {
+			return fmt.Errorf("fulu payload is nil")
+		}
+		execPayload := new(deneb.ExecutionPayload)
+		if err := json.Unmarshal(result.ExecutionPayload, execPayload); err != nil {
+			return fmt.Errorf("failed to decode remote execution payload: %w", err)
+		}
+		payload.Fulu.ExecutionPayload = execPayload
+
+		if trimmed := bytes.TrimSpace(result.BlobsBundle); len(trimmed) > 0 && !strings.EqualFold(string(trimmed), "null") {
+			blobsBundle := new(builderApiFulu.BlobsBundle)
+			if err := json.Unmarshal(result.BlobsBundle, blobsBundle); err != nil {
+				return fmt.Errorf("failed to decode remote blobs bundle: %w", err)
+			}
+			payload.Fulu.BlobsBundle = blobsBundle
+		} else {
+			payload.Fulu.BlobsBundle = nil
+		}
+
+		if trimmed := bytes.TrimSpace(result.ExecutionRequests); len(trimmed) > 0 && !strings.EqualFold(string(trimmed), "null") {
+			execRequests := new(electraSpec.ExecutionRequests)
+			if err := json.Unmarshal(result.ExecutionRequests, execRequests); err != nil {
+				return fmt.Errorf("failed to decode remote execution requests: %w", err)
+			}
+			payload.Fulu.ExecutionRequests = execRequests
+		} else {
+			payload.Fulu.ExecutionRequests = nil
 		}
 	default:
 		return fmt.Errorf("remote rebuild payload import not implemented for fork version %s", payload.Version)
