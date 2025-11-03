@@ -740,7 +740,7 @@ func NewRelayAPI(opts RelayAPIOpts) (api *RelayAPI, err error) {
 	api.log.Info("NewRelayAPI Done")
 
 	// Start the header cache cron job
-	api.startHeaderCacheCron()
+	// api.startHeaderCacheCron()
 	api.startCacheCleaner()
 
 	return api, nil
