@@ -444,6 +444,8 @@ type fuluBuilderBlockValidationRequestJSON struct {
 }
 
 func (r *BuilderBlockValidationRequest) MarshalJSON() ([]byte, error) {
+	parentBeaconBlockRoot := formatParentBeaconBlockRoot(r.ParentBeaconBlockRoot)
+
 	switch r.Version { //nolint:exhaustive
 	case spec.DataVersionCapella:
 		return json.Marshal(&capellaBuilderBlockValidationRequestJSON{
@@ -459,7 +461,7 @@ func (r *BuilderBlockValidationRequest) MarshalJSON() ([]byte, error) {
 			BlobsBundle:           r.Deneb.BlobsBundle,
 			Signature:             r.Deneb.Signature.String(),
 			RegisteredGasLimit:    r.RegisteredGasLimit,
-			ParentBeaconBlockRoot: r.ParentBeaconBlockRoot.String(),
+			ParentBeaconBlockRoot: parentBeaconBlockRoot,
 		})
 	case spec.DataVersionElectra:
 		return json.Marshal(&electraBuilderBlockValidationRequestJSON{
@@ -469,7 +471,7 @@ func (r *BuilderBlockValidationRequest) MarshalJSON() ([]byte, error) {
 			ExecutionRequests:     r.Electra.ExecutionRequests,
 			Signature:             r.Electra.Signature.String(),
 			RegisteredGasLimit:    r.RegisteredGasLimit,
-			ParentBeaconBlockRoot: r.ParentBeaconBlockRoot.String(),
+			ParentBeaconBlockRoot: parentBeaconBlockRoot,
 		})
 	case spec.DataVersionFulu:
 		return json.Marshal(&fuluBuilderBlockValidationRequestJSON{
@@ -479,11 +481,20 @@ func (r *BuilderBlockValidationRequest) MarshalJSON() ([]byte, error) {
 			ExecutionRequests:     r.Fulu.ExecutionRequests,
 			Signature:             r.Fulu.Signature.String(),
 			RegisteredGasLimit:    r.RegisteredGasLimit,
-			ParentBeaconBlockRoot: r.ParentBeaconBlockRoot.String(),
+			ParentBeaconBlockRoot: parentBeaconBlockRoot,
 		})
 	default:
 		return nil, errors.Wrap(ErrInvalidVersion, fmt.Sprintf("%s is not supported", r.Version))
 	}
+}
+
+func formatParentBeaconBlockRoot(root *phase0.Root) string {
+	if root == nil {
+		fmt.Println("formatParentBeaconBlockRoot: parent beacon block root is empty")
+		return ""
+	}
+
+	return root.String()
 }
 
 type BuilderBlockValidationResponse struct {
