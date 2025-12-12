@@ -3433,13 +3433,10 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		return
 	}
 
-	//temp: disable payload checking for devnet
-	// attrs, ok := api.checkSubmissionPayloadAttrs(w, log, submission)
-
-	// if !ok {
-	// 	return
-	// }
-	attrs := api.payloadAttributes[getPayloadAttributesKey(submission.BidTrace.ParentHash.String(), submission.BidTrace.Slot)]
+	attrs, ok := api.checkSubmissionPayloadAttrs(w, log, submission)
+	if !ok {
+		return
+	}
 
 	// Verify the signature
 	log = log.WithField("timestampBeforeSignatureCheck", time.Now().UTC().UnixMilli())
