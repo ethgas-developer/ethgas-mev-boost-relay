@@ -153,8 +153,9 @@ var (
 	//proxy mode
 	proxyMode = os.Getenv("IS_PROXY_RELAY") == "true"
 
-	skipPreconfCheck = os.Getenv("IS_SKIP_PRECONF") == "true"
-	delayGetHeader   = cli.GetEnvInt("GET_HEADER_DELAY_MS", 250)
+	skipPreconfCheck    = os.Getenv("IS_SKIP_PRECONF") == "true"
+	skipEmptySpaceCheck = os.Getenv("IS_SKIP_EMPTY_SPACE_CHECK") == "true"
+	delayGetHeader      = cli.GetEnvInt("GET_HEADER_DELAY_MS", 250)
 
 	// user-agents which shouldn't receive bids
 	apiNoHeaderUserAgents = common.GetEnvStrSlice("NO_HEADER_USERAGENTS", []string{
@@ -3311,8 +3312,6 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 				}
 
 				//check remain empty space
-				//hardcode test:
-				// cachedPreconfs.EmptySpace = "30000000"
 				if cachedPreconfs.EmptySpace > 0 { // Check if EmptySpace is greater than 0
 					//empty space === -1 = full block empty submission.BidTrace.GasLimit
 					requiredSpace := uint64(0)
