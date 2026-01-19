@@ -3310,7 +3310,8 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 					log.Printf("All preconf transactions are included in the block!")
 					// Remains empty string for valid case
 				}
-
+			}
+			if !skipEmptySpaceCheck {
 				//check remain empty space
 				if cachedPreconfs.EmptySpace > 0 { // Check if EmptySpace is greater than 0
 					//empty space === -1 = full block empty submission.BidTrace.GasLimit
