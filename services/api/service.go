@@ -228,6 +228,30 @@ type ApiResponse struct {
 	Data    json.RawMessage `json:"data"`
 }
 
+type WholeBlockMarketResponse struct {
+	Markets []WholeBlockMarket `json:"markets"`
+}
+
+type WholeBlockMarket struct {
+	MarketID         uint64 `json:"marketId"`
+	Slot             uint64 `json:"slot"`
+	InstrumentID     string `json:"instrumentId"`
+	Name             string `json:"name"`
+	PriceStep        string `json:"priceStep"`
+	MinPrice         string `json:"minPrice"`
+	MaxPrice         string `json:"maxPrice"`
+	AvailablePreconf uint64 `json:"availablePreconf"`
+	Direction        bool   `json:"direction"`
+	Price            string `json:"price"`
+	Status           int    `json:"status"`
+	MaturityTime     int64  `json:"maturityTime"`
+	BlockTime        int64  `json:"blockTime"`
+	FinalityTime     int64  `json:"finalityTime"`
+	UpdateDate       int64  `json:"updateDate"`
+	OFAC             bool   `json:"ofac"`
+	MultiRelay       bool   `json:"multiRelay"`
+}
+
 // Define the slotBundle type at the top of the file
 // type SlotBundleResponse struct {
 // 	SlotBundle PreconfBundles `json:"slotBundle"`
@@ -302,6 +326,11 @@ func (br *BuilderResponse) UnmarshalJSON(data []byte) error {
 
 type cacheBuilder struct {
 	value      *BuilderResponse
+	expiration time.Time
+}
+
+type marketCacheEntry struct {
+	value      *WholeBlockMarket
 	expiration time.Time
 }
 
@@ -423,6 +452,7 @@ type RelayAPI struct {
 	// Cache for builder statuses and collaterals.
 	blockBuildersCache map[string]*blockBuilderCacheEntry
 	builderCache       sync.Map // Key: slot (uint64), Value: *cacheEntry
+	marketCache        sync.Map // Key: slot (uint64), Value: *marketCacheEntry
 }
 
 // Add a cache map and a mutex for thread safety
@@ -1877,6 +1907,16 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+
+	var multiRelay bool
+	market, marketErr := api.getMarketForSlot(slot)
+	if marketErr != nil {
+		log.WithError(marketErr).Warn("failed to fetch market info; defaulting to single relay behavior")
+	} else if market != nil && market.MultiRelay {
+		multiRelay = true
+	}
+	log = log.WithField("multiRelay", multiRelay)
+
 	// if bid == nil || bid.IsEmpty() {
 	// 	// Check cache first
 	// 	headerCacheMutex.RLock()
@@ -1911,164 +1951,140 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 	// }
 
 	// HARDCODE to modify the bid value to force validator select our block
-	if bid.Capella != nil {
-		// api.log.Info("Modifying Capella bid")
-		// log.Info("set fake bid.Capella.Message.Value")
-		// log.Info("old bid.Capella.Message.Value: ", bid.Capella.Message.Value)
-		baseValue := uint256.MustFromDecimal("11000000000000000000000") // Base value (11000 ETH)
-		acualValue := bid.Capella.Message.Value
-		totalValue := new(uint256.Int).Add(baseValue, acualValue) // Add base value and requestTime
-		bid.Capella.Message.Value = totalValue                    // Set the new value
+	if !multiRelay {
+		if bid.Capella != nil {
+			baseValue := uint256.MustFromDecimal("11000000000000000000000") // Base value (11000 ETH)
+			acualValue := bid.Capella.Message.Value
+			totalValue := new(uint256.Int).Add(baseValue, acualValue) // Add base value and requestTime
+			bid.Capella.Message.Value = totalValue                    // Set the new value
 
-		// bid.Capella.Message.Value = uint256.MustFromDecimal("11000000000000000000000") // Set to desired value (11000 ETH)
-		// Serialize the bid data
-		// log.Info("new bid.Capella.Message.Value: ", bid.Capella.Message.Value)
-		// log.Info("old bid.Capella.Message.Pubkey: ", bid.Capella.Message.Pubkey)
+			bid.Capella.Message.Pubkey = *api.publicKey
 
-		bid.Capella.Message.Pubkey = *api.publicKey
-		// log.Info("new bid.Capella.Message.Pubkey: ", bid.Capella.Message.Pubkey)
+			builderBid := builderApiCapella.BuilderBid{
+				Value:  bid.Capella.Message.Value,
+				Header: bid.Capella.Message.Header,
+				Pubkey: *api.publicKey,
+			}
 
-		builderBid := builderApiCapella.BuilderBid{
-			Value:  bid.Capella.Message.Value,
-			Header: bid.Capella.Message.Header,
-			Pubkey: *api.publicKey,
+			signature, err := ssz.SignMessage(&builderBid, api.opts.EthNetDetails.DomainBuilder, api.blsSk)
+
+			if err != nil {
+				log.WithError(err).Error("failed to signature bid")
+				api.RespondError(w, http.StatusInternalServerError, "failed to signature bid")
+				return
+			}
+			// Re-sign the payload with the new bid value
+			signatureBytes := signature[:]
+
+			// Ensure the signature is the correct size
+			if len(signatureBytes) != 96 {
+				log.Error("signature size is incorrect")
+				api.RespondError(w, http.StatusInternalServerError, "signature size is incorrect")
+				return
+			}
+
+			// Assign the signature
+			copy(bid.Capella.Signature[:], signatureBytes)
+
+		} else if bid.Deneb != nil {
+			baseValue := uint256.MustFromDecimal("11000000000000000000000") // Base value (11000 ETH)
+			acualValue := bid.Deneb.Message.Value
+			totalValue := new(uint256.Int).Add(baseValue, acualValue) // Add base value and requestTime
+			bid.Deneb.Message.Value = totalValue
+			bid.Deneb.Message.Pubkey = *api.publicKey
+
+			builderBid := builderApiDeneb.BuilderBid{
+				Value:  bid.Deneb.Message.Value,
+				Header: bid.Deneb.Message.Header,
+				Pubkey: *api.publicKey,
+			}
+
+			signature, err := ssz.SignMessage(&builderBid, api.opts.EthNetDetails.DomainBuilder, api.blsSk)
+			if err != nil {
+				log.WithError(err).Error("failed to signature bid")
+				api.RespondError(w, http.StatusInternalServerError, "failed to signature bid")
+				return
+			}
+			signatureBytes := signature[:]
+
+			// Ensure the signature is the correct size
+			if len(signatureBytes) != 96 {
+				log.Error("signature size is incorrect")
+				api.RespondError(w, http.StatusInternalServerError, "signature size is incorrect")
+				return
+			}
+
+			// Assign the signature
+			copy(bid.Deneb.Signature[:], signatureBytes)
+		} else if bid.Electra != nil {
+			baseValue := uint256.MustFromDecimal("11000000000000000000000") // Base value (11000 ETH)
+			acualValue := bid.Electra.Message.Value
+			totalValue := new(uint256.Int).Add(baseValue, acualValue) // Add base value and requestTime
+			bid.Electra.Message.Value = totalValue
+			bid.Electra.Message.Pubkey = *api.publicKey
+
+			builderBid := builderApiElectra.BuilderBid{
+				Value:              bid.Electra.Message.Value,
+				Header:             bid.Electra.Message.Header,
+				ExecutionRequests:  bid.Electra.Message.ExecutionRequests,
+				BlobKZGCommitments: bid.Electra.Message.BlobKZGCommitments,
+				Pubkey:             *api.publicKey,
+			}
+
+			signature, err := ssz.SignMessage(&builderBid, api.opts.EthNetDetails.DomainBuilder, api.blsSk)
+			if err != nil {
+				log.WithError(err).Error("failed to signature bid")
+				api.RespondError(w, http.StatusInternalServerError, "failed to signature bid")
+				return
+			}
+			signatureBytes := signature[:]
+
+			// Ensure the signature is the correct size
+			if len(signatureBytes) != 96 {
+				log.Error("signature size is incorrect")
+				api.RespondError(w, http.StatusInternalServerError, "signature size is incorrect")
+				return
+			}
+
+			// Assign the signature
+			copy(bid.Electra.Signature[:], signatureBytes)
+
+		} else if bid.Fulu != nil {
+			baseValue := uint256.MustFromDecimal("11000000000000000000000") // Base value (11000 ETH)
+			acualValue := bid.Fulu.Message.Value
+			totalValue := new(uint256.Int).Add(baseValue, acualValue) // Add base value and requestTime
+			bid.Fulu.Message.Value = totalValue
+			bid.Fulu.Message.Pubkey = *api.publicKey
+
+			builderBid := builderApiElectra.BuilderBid{
+				Value:              bid.Fulu.Message.Value,
+				Header:             bid.Fulu.Message.Header,
+				ExecutionRequests:  bid.Fulu.Message.ExecutionRequests,
+				BlobKZGCommitments: bid.Fulu.Message.BlobKZGCommitments,
+				Pubkey:             *api.publicKey,
+			}
+
+			signature, err := ssz.SignMessage(&builderBid, api.opts.EthNetDetails.DomainBuilder, api.blsSk)
+			if err != nil {
+				log.WithError(err).Error("failed to signature bid")
+				api.RespondError(w, http.StatusInternalServerError, "failed to signature bid")
+				return
+			}
+			signatureBytes := signature[:]
+
+			// Ensure the signature is the correct size
+			if len(signatureBytes) != 96 {
+				log.Error("signature size is incorrect")
+				api.RespondError(w, http.StatusInternalServerError, "signature size is incorrect")
+				return
+			}
+
+			// Assign the signature
+			copy(bid.Fulu.Signature[:], signatureBytes)
+
 		}
-
-		// print("RESIGN")
-		// log.Info(&builderBid)
-		// log.Info(&api.opts.EthNetDetails.DomainBuilder)
-		// log.Info(api.blsSk)
-		signature, err := ssz.SignMessage(&builderBid, api.opts.EthNetDetails.DomainBuilder, api.blsSk)
-
-		if err != nil {
-			log.WithError(err).Error("failed to signature bid")
-			api.RespondError(w, http.StatusInternalServerError, "failed to signature bid")
-			return
-		}
-		// Re-sign the payload with the new bid value
-		signatureBytes := signature[:]
-
-		// Ensure the signature is the correct size
-		if len(signatureBytes) != 96 {
-			log.Error("signature size is incorrect")
-			api.RespondError(w, http.StatusInternalServerError, "signature size is incorrect")
-			return
-		}
-		// log.Info("old bid.Capella.Signature: ", bid.Capella.Signature)
-
-		// Assign the signature
-		copy(bid.Capella.Signature[:], signatureBytes)
-		// log.Info("new bid.Capella.Signature: ", bid.Capella.Signature)
-
-	} else if bid.Deneb != nil {
-		// api.log.Info("Modifying Deneb bid")
-
-		// log.Info("set fake bid.Deneb.Message.Value")
-		baseValue := uint256.MustFromDecimal("11000000000000000000000") // Base value (11000 ETH)
-		acualValue := bid.Deneb.Message.Value
-		totalValue := new(uint256.Int).Add(baseValue, acualValue) // Add base value and requestTime
-		bid.Deneb.Message.Value = totalValue
-		bid.Deneb.Message.Pubkey = *api.publicKey
-
-		// Serialize the bid data
-
-		builderBid := builderApiDeneb.BuilderBid{
-			Value:  bid.Deneb.Message.Value,
-			Header: bid.Deneb.Message.Header,
-			Pubkey: *api.publicKey,
-		}
-
-		signature, err := ssz.SignMessage(&builderBid, api.opts.EthNetDetails.DomainBuilder, api.blsSk)
-		if err != nil {
-			log.WithError(err).Error("failed to signature bid")
-			api.RespondError(w, http.StatusInternalServerError, "failed to signature bid")
-			return
-		}
-		signatureBytes := signature[:]
-
-		// Ensure the signature is the correct size
-		if len(signatureBytes) != 96 {
-			log.Error("signature size is incorrect")
-			api.RespondError(w, http.StatusInternalServerError, "signature size is incorrect")
-			return
-		}
-
-		// Assign the signature
-		copy(bid.Deneb.Signature[:], signatureBytes)
-	} else if bid.Electra != nil {
-		// api.log.Info("Modifying Electra bid")
-		baseValue := uint256.MustFromDecimal("11000000000000000000000") // Base value (11000 ETH)
-		acualValue := bid.Electra.Message.Value
-		totalValue := new(uint256.Int).Add(baseValue, acualValue) // Add base value and requestTime
-		bid.Electra.Message.Value = totalValue
-		bid.Electra.Message.Pubkey = *api.publicKey
-
-		// Serialize the bid data
-
-		builderBid := builderApiElectra.BuilderBid{
-			Value:              bid.Electra.Message.Value,
-			Header:             bid.Electra.Message.Header,
-			ExecutionRequests:  bid.Electra.Message.ExecutionRequests,
-			BlobKZGCommitments: bid.Electra.Message.BlobKZGCommitments,
-			Pubkey:             *api.publicKey,
-		}
-
-		signature, err := ssz.SignMessage(&builderBid, api.opts.EthNetDetails.DomainBuilder, api.blsSk)
-		if err != nil {
-			log.WithError(err).Error("failed to signature bid")
-			api.RespondError(w, http.StatusInternalServerError, "failed to signature bid")
-			return
-		}
-		signatureBytes := signature[:]
-
-		// Ensure the signature is the correct size
-		if len(signatureBytes) != 96 {
-			log.Error("signature size is incorrect")
-			api.RespondError(w, http.StatusInternalServerError, "signature size is incorrect")
-			return
-		}
-
-		// Assign the signature
-		copy(bid.Electra.Signature[:], signatureBytes)
-
-	} else if bid.Fulu != nil {
-		// The BuilderBid type for fulu is the same as that of electra
-
-		// api.log.Info("Modifying Fulu bid")
-		baseValue := uint256.MustFromDecimal("11000000000000000000000") // Base value (11000 ETH)
-		acualValue := bid.Fulu.Message.Value
-		totalValue := new(uint256.Int).Add(baseValue, acualValue) // Add base value and requestTime
-		bid.Fulu.Message.Value = totalValue
-		bid.Fulu.Message.Pubkey = *api.publicKey
-
-		// Serialize the bid data
-
-		builderBid := builderApiElectra.BuilderBid{
-			Value:              bid.Fulu.Message.Value,
-			Header:             bid.Fulu.Message.Header,
-			ExecutionRequests:  bid.Fulu.Message.ExecutionRequests,
-			BlobKZGCommitments: bid.Fulu.Message.BlobKZGCommitments,
-			Pubkey:             *api.publicKey,
-		}
-
-		signature, err := ssz.SignMessage(&builderBid, api.opts.EthNetDetails.DomainBuilder, api.blsSk)
-		if err != nil {
-			log.WithError(err).Error("failed to signature bid")
-			api.RespondError(w, http.StatusInternalServerError, "failed to signature bid")
-			return
-		}
-		signatureBytes := signature[:]
-
-		// Ensure the signature is the correct size
-		if len(signatureBytes) != 96 {
-			log.Error("signature size is incorrect")
-			api.RespondError(w, http.StatusInternalServerError, "signature size is incorrect")
-			return
-		}
-
-		// Assign the signature
-		copy(bid.Fulu.Signature[:], signatureBytes)
-
+	} else {
+		log.Debug("multiRelay market enabled; bid value left unchanged")
 	}
 
 	value, err := bid.Value()
@@ -4212,6 +4228,96 @@ func FetchBuilderPubKey(apiURL string, slot uint64) (*BuilderResponse, error) {
 
 	return &builderResp, nil
 }
+
+func ensureExchangeClientLoggedIn() error {
+	if client.AccessToken != "" {
+		return nil
+	}
+	accessToken, refreshToken, err := client.Login(exchangeLoginPrivateKey)
+	if err != nil {
+		return fmt.Errorf("failed to login before fetching market data: %w", err)
+	}
+	if accessToken == "" || refreshToken == "" {
+		return fmt.Errorf("exchange login returned empty tokens")
+	}
+	return nil
+}
+
+func FetchWholeBlockMarket(apiURL string, slot uint64) (*WholeBlockMarket, error) {
+	if err := ensureExchangeClientLoggedIn(); err != nil {
+		return nil, err
+	}
+
+	market, statusCode, err := requestWholeBlockMarket(apiURL, slot)
+	if err == nil || statusCode != http.StatusUnauthorized {
+		return market, err
+	}
+
+	if err := client.RefreshAccessToken(); err != nil {
+		return nil, fmt.Errorf("failed to refresh access token while fetching market data: %w", err)
+	}
+
+	market, _, err = requestWholeBlockMarket(apiURL, slot)
+	return market, err
+}
+
+func requestWholeBlockMarket(apiURL string, slot uint64) (*WholeBlockMarket, int, error) {
+	url := fmt.Sprintf("%s/api/v1/p/wholeblock/market?slot=%d", apiURL, slot)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to create market request: %w", err)
+	}
+	if client.AccessToken != "" {
+		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", client.AccessToken))
+	}
+
+	resp, err := client.Client.Do(req)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to fetch market status: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, resp.StatusCode, fmt.Errorf("failed to read market response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, resp.StatusCode, fmt.Errorf("market request returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var apiResponse ApiResponse
+	if err := json.Unmarshal(body, &apiResponse); err != nil {
+		return nil, resp.StatusCode, fmt.Errorf("failed to decode market api response: %w", err)
+	}
+
+	if !apiResponse.Success {
+		return nil, resp.StatusCode, fmt.Errorf("market api indicated failure: %s", string(body))
+	}
+
+	if len(apiResponse.Data) == 0 {
+		return nil, resp.StatusCode, nil
+	}
+
+	var marketResp WholeBlockMarketResponse
+	if err := json.Unmarshal(apiResponse.Data, &marketResp); err != nil {
+		return nil, resp.StatusCode, fmt.Errorf("failed to decode market data: %w", err)
+	}
+
+	if len(marketResp.Markets) == 0 {
+		return nil, resp.StatusCode, nil
+	}
+
+	for _, market := range marketResp.Markets {
+		if market.Slot == slot {
+			m := market
+			return &m, resp.StatusCode, nil
+		}
+	}
+
+	m := marketResp.Markets[0]
+	return &m, resp.StatusCode, nil
+}
 func (c *ApiClient) Login(privateKey string) (string, string, error) {
 	// Check cache first
 	loginCache.mutex.RLock()
@@ -4626,6 +4732,13 @@ func (api *RelayAPI) startCacheCleaner() {
 				}
 				return true
 			})
+			api.marketCache.Range(func(key, value interface{}) bool {
+				entry := value.(*marketCacheEntry)
+				if time.Now().After(entry.expiration) {
+					api.marketCache.Delete(key)
+				}
+				return true
+			})
 		}
 	}()
 }
@@ -4642,6 +4755,37 @@ func (br *BuilderResponse) isBuilder(pubkey string) bool {
 		}
 	}
 	return false
+}
+
+func (api *RelayAPI) getMarketForSlot(slot uint64) (*WholeBlockMarket, error) {
+	if cached, ok := api.marketCache.Load(slot); ok {
+		entry := cached.(*marketCacheEntry)
+		if time.Now().Before(entry.expiration) {
+			return entry.value, nil
+		}
+		api.marketCache.Delete(slot)
+	}
+
+	market, err := FetchWholeBlockMarket(exchangeAPIURL, slot)
+	cacheDuration := time.Duration(common.SecondsPerSlot) * time.Second
+	defaultEntry := &marketCacheEntry{
+		value: &WholeBlockMarket{
+			Slot:       slot,
+			MultiRelay: false,
+		},
+		expiration: time.Now().Add(cacheDuration),
+	}
+	if err != nil || market == nil {
+		api.marketCache.Store(slot, defaultEntry)
+		return defaultEntry.value, err
+	}
+
+	api.marketCache.Store(slot, &marketCacheEntry{
+		value:      market,
+		expiration: time.Now().Add(cacheDuration),
+	})
+
+	return market, nil
 }
 
 func (api *RelayAPI) processValidatorRegistrationJSON(regs []*common.SimpleValidatorRegistration) (newRegistrations []*builderApiV1.SignedValidatorRegistration, userErr, err error) {
