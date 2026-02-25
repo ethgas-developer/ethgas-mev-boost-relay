@@ -229,7 +229,7 @@ type ApiResponse struct {
 }
 
 type WholeBlockMarketResponse struct {
-	Markets []WholeBlockMarket `json:"markets"`
+	Markets WholeBlockMarket `json:"markets"`
 }
 
 type WholeBlockMarket struct {
@@ -4304,18 +4304,7 @@ func requestWholeBlockMarket(apiURL string, slot uint64) (*WholeBlockMarket, int
 		return nil, resp.StatusCode, fmt.Errorf("failed to decode market data: %w", err)
 	}
 
-	if len(marketResp.Markets) == 0 {
-		return nil, resp.StatusCode, nil
-	}
-
-	for _, market := range marketResp.Markets {
-		if market.Slot == slot {
-			m := market
-			return &m, resp.StatusCode, nil
-		}
-	}
-
-	m := marketResp.Markets[0]
+	m := marketResp.Markets
 	return &m, resp.StatusCode, nil
 }
 func (c *ApiClient) Login(privateKey string) (string, string, error) {
