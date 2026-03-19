@@ -150,16 +150,28 @@ func (s *DatabaseService) NumValidatorRegistrationRows() (count uint64, err erro
 	return count, err
 }
 
-func (s *DatabaseService) SaveValidatorRegistration(entry ValidatorRegistrationEntry) error {
-	query := `WITH latest_registration AS (
-		SELECT DISTINCT ON (pubkey) pubkey, fee_recipient, timestamp, gas_limit, signature FROM ` + vars.TableValidatorRegistration + ` WHERE pubkey=:pubkey ORDER BY pubkey, timestamp DESC limit 1
-	)
-	INSERT INTO ` + vars.TableValidatorRegistration + ` (pubkey, fee_recipient, timestamp, gas_limit, signature)
-	SELECT :pubkey, :fee_recipient, :timestamp, :gas_limit, :signature
-	WHERE NOT EXISTS (
-		SELECT 1 from latest_registration WHERE pubkey=:pubkey AND :timestamp <= latest_registration.timestamp OR (:fee_recipient = latest_registration.fee_recipient AND :gas_limit = latest_registration.gas_limit)
-	);`
-	_, err := s.DB.NamedExec(query, entry)
+func (s *DatabaseService) SaveValidatorRegistration(entry ValidatorRegistrationEntry) (err error) {
+	tx, err := s.DB.Beginx()
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		} else {
+			err = tx.Commit()
+		}
+	}()
+
+	deleteQuery := `DELETE FROM ` + vars.TableValidatorRegistration + ` WHERE pubkey=:pubkey;`
+	if _, err = tx.NamedExec(deleteQuery, entry); err != nil {
+		return err
+	}
+
+	insertQuery := `INSERT INTO ` + vars.TableValidatorRegistration + ` (pubkey, fee_recipient, timestamp, gas_limit, signature)
+		VALUES (:pubkey, :fee_recipient, :timestamp, :gas_limit, :signature);`
+	_, err = tx.NamedExec(insertQuery, entry)
 	return err
 }
 

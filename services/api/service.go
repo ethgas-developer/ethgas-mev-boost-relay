@@ -4781,6 +4781,8 @@ func (api *RelayAPI) getMarketForSlot(slot uint64) (*WholeBlockMarket, error) {
 	return market, nil
 }
 
+const validatorRegistrationRefreshInterval = 24 * time.Hour
+
 func (api *RelayAPI) processValidatorRegistrationJSON(regs []*common.SimpleValidatorRegistration) (newRegistrations []*builderApiV1.SignedValidatorRegistration, userErr, err error) {
 	newRegistrations = make([]*builderApiV1.SignedValidatorRegistration, 0)
 	registrationTimestampUpperBound := time.Now().UTC().Unix() + 10 // 10 seconds from now
@@ -4805,9 +4807,10 @@ func (api *RelayAPI) processValidatorRegistrationJSON(regs []*common.SimpleValid
 			isChangedFeeRecipient := cachedRegistrationData.FeeRecipient != reg.FeeRecipient
 			isChangedGasLimit := cachedRegistrationData.GasLimit != reg.GasLimit
 			isNewerTimestamp := reg.Timestamp.After(cachedRegistrationData.Timestamp)
+			isTimestampStale := reg.Timestamp.Sub(cachedRegistrationData.Timestamp) >= validatorRegistrationRefreshInterval
 
 			// If key fields haven't changed, can just discard without signature validation
-			if !isChangedFeeRecipient && !isChangedGasLimit {
+			if !isChangedFeeRecipient && !isChangedGasLimit && !isTimestampStale {
 				continue
 			}
 
@@ -4867,9 +4870,10 @@ func (api *RelayAPI) processValidatorRegistrationsSSZ(regs []*builderApiV1.Signe
 			isChangedFeeRecipient := cachedRegistrationData.FeeRecipient != signedValidatorRegistration.Message.FeeRecipient
 			isChangedGasLimit := cachedRegistrationData.GasLimit != signedValidatorRegistration.Message.GasLimit
 			isNewerTimestamp := signedValidatorRegistration.Message.Timestamp.UTC().Unix() > cachedRegistrationData.Timestamp.UTC().Unix()
+			isTimestampStale := signedValidatorRegistration.Message.Timestamp.Sub(cachedRegistrationData.Timestamp) >= validatorRegistrationRefreshInterval
 
 			// If key fields haven't changed, can just discard without signature validation
-			if !isChangedFeeRecipient && !isChangedGasLimit {
+			if !isChangedFeeRecipient && !isChangedGasLimit && !isTimestampStale {
 				continue
 			}
 
