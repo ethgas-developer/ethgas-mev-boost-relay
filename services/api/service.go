@@ -4071,6 +4071,8 @@ type ValidatorRegistration struct {
 	FeeRecipient string `json:"fee_recipient"`
 }
 
+const validatorDataRegistrationWindow = 72 * time.Hour
+
 func (api *RelayAPI) handleDataValidatorsRegistration(w http.ResponseWriter, req *http.Request) {
 	// Define request structure
 	type ValidatorsRequest struct {
@@ -4133,10 +4135,14 @@ func (api *RelayAPI) handleDataValidatorsRegistration(w http.ResponseWriter, req
 		registrationMap[entry.Pubkey] = entry
 	}
 
-	// Build response with only registered validators
+	// Build response with only registered validators that are fresh enough
+	cutoff := time.Now().Add(-validatorDataRegistrationWindow).Unix()
 	var registrations []ValidatorRegistration
 	for _, pubkey := range request.Pubkeys {
 		if registration, exists := registrationMap[pubkey]; exists {
+			if int64(registration.Timestamp) < cutoff {
+				continue
+			}
 			// Only include registered validators
 			registrations = append(registrations, ValidatorRegistration{
 				Pubkey:       registration.Pubkey,
