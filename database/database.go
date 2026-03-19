@@ -164,14 +164,18 @@ func (s *DatabaseService) SaveValidatorRegistration(entry ValidatorRegistrationE
 		}
 	}()
 
-	deleteQuery := `DELETE FROM ` + vars.TableValidatorRegistration + ` WHERE pubkey=:pubkey;`
-	if _, err = tx.NamedExec(deleteQuery, entry); err != nil {
+	upsertQuery := `INSERT INTO ` + vars.TableValidatorRegistration + ` (pubkey, fee_recipient, timestamp, gas_limit, signature)
+		VALUES (:pubkey, :fee_recipient, :timestamp, :gas_limit, :signature)
+		ON CONFLICT (pubkey, timestamp) DO UPDATE
+		SET fee_recipient = EXCLUDED.fee_recipient,
+		    gas_limit = EXCLUDED.gas_limit,
+		    signature = EXCLUDED.signature;`
+	if _, err = tx.NamedExec(upsertQuery, entry); err != nil {
 		return err
 	}
 
-	insertQuery := `INSERT INTO ` + vars.TableValidatorRegistration + ` (pubkey, fee_recipient, timestamp, gas_limit, signature)
-		VALUES (:pubkey, :fee_recipient, :timestamp, :gas_limit, :signature);`
-	_, err = tx.NamedExec(insertQuery, entry)
+	cleanupQuery := `DELETE FROM ` + vars.TableValidatorRegistration + ` WHERE pubkey=:pubkey AND timestamp < :timestamp;`
+	_, err = tx.NamedExec(cleanupQuery, entry)
 	return err
 }
 
