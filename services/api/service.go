@@ -4140,7 +4140,9 @@ func (api *RelayAPI) handleDataValidatorsRegistration(w http.ResponseWriter, req
 	var registrations []ValidatorRegistration
 	for _, pubkey := range request.Pubkeys {
 		if registration, exists := registrationMap[pubkey]; exists {
-			if int64(registration.Timestamp) < cutoff {
+			log.Println("registration.InsertedAt", registration.InsertedAt)
+			log.Println("cutoff", cutoff)
+			if registration.InsertedAt.Unix() < cutoff {
 				continue
 			}
 			// Only include registered validators
@@ -4812,9 +4814,8 @@ func (api *RelayAPI) processValidatorRegistrationJSON(regs []*common.SimpleValid
 			// See if we can discard (if no fields changed, or old timestamp)
 			isChangedFeeRecipient := cachedRegistrationData.FeeRecipient != reg.FeeRecipient
 			isChangedGasLimit := cachedRegistrationData.GasLimit != reg.GasLimit
-			isNewerTimestamp := reg.Timestamp.After(cachedRegistrationData.Timestamp)
-			isTimestampStale := reg.Timestamp.Sub(cachedRegistrationData.Timestamp) >= validatorRegistrationRefreshInterval
-
+			isNewerTimestamp := time.Now().UTC().After(cachedRegistrationData.Timestamp)
+			isTimestampStale := time.Now().UTC().Sub(cachedRegistrationData.Timestamp) >= validatorRegistrationRefreshInterval
 			// If key fields haven't changed, can just discard without signature validation
 			if !isChangedFeeRecipient && !isChangedGasLimit && !isTimestampStale {
 				continue

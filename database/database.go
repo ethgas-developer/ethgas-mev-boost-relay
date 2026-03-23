@@ -164,19 +164,18 @@ func (s *DatabaseService) SaveValidatorRegistration(entry ValidatorRegistrationE
 		}
 	}()
 
-	upsertQuery := `INSERT INTO ` + vars.TableValidatorRegistration + ` (pubkey, fee_recipient, timestamp, gas_limit, signature)
-		VALUES (:pubkey, :fee_recipient, :timestamp, :gas_limit, :signature)
+	insertQuery := `INSERT INTO ` + vars.TableValidatorRegistration + ` (pubkey, inserted_at, fee_recipient, timestamp, gas_limit, signature)
+		VALUES (:pubkey, CURRENT_TIMESTAMP, :fee_recipient, :timestamp, :gas_limit, :signature)
 		ON CONFLICT (pubkey, timestamp) DO UPDATE
-		SET fee_recipient = EXCLUDED.fee_recipient,
+		SET inserted_at = CURRENT_TIMESTAMP,
+		    fee_recipient = EXCLUDED.fee_recipient,
 		    gas_limit = EXCLUDED.gas_limit,
+		    timestamp = EXCLUDED.timestamp,
 		    signature = EXCLUDED.signature;`
-	if _, err = tx.NamedExec(upsertQuery, entry); err != nil {
+	if _, err = tx.NamedExec(insertQuery, entry); err != nil {
 		return err
 	}
-
-	cleanupQuery := `DELETE FROM ` + vars.TableValidatorRegistration + ` WHERE pubkey=:pubkey AND timestamp < :timestamp;`
-	_, err = tx.NamedExec(cleanupQuery, entry)
-	return err
+	return nil
 }
 
 func (s *DatabaseService) GetValidatorRegistration(pubkey string) (*ValidatorRegistrationEntry, error) {
@@ -190,7 +189,7 @@ func (s *DatabaseService) GetValidatorRegistration(pubkey string) (*ValidatorReg
 }
 
 func (s *DatabaseService) GetValidatorRegistrationsForPubkeys(pubkeys []string) (entries []*ValidatorRegistrationEntry, err error) {
-	query := `SELECT DISTINCT ON (pubkey) pubkey, fee_recipient, timestamp, gas_limit, signature
+	query := `SELECT DISTINCT ON (pubkey) inserted_at, pubkey, fee_recipient, timestamp, gas_limit, signature
 		FROM ` + vars.TableValidatorRegistration + `
 		WHERE pubkey IN (?)
 		ORDER BY pubkey, timestamp DESC;`
