@@ -99,6 +99,7 @@ type RedisCache struct {
 
 	// keys
 	keyValidatorRegistrationData string
+	keyValidatorRegistrationTimestamp string
 
 	keyRelayConfig        string
 	keyStats              string
@@ -141,6 +142,7 @@ func NewRedisCache(prefix, redisURI, readonlyURI string) (*RedisCache, error) {
 		prefixFloorBidValue:               fmt.Sprintf("%s/%s:bid-floor-value", redisPrefix, prefix),                // prefix:slot_parentHash_proposerPubkey
 
 		keyValidatorRegistrationData: fmt.Sprintf("%s/%s:validator-registration-data", redisPrefix, prefix),
+		keyValidatorRegistrationTimestamp: fmt.Sprintf("%s/%s:validator-registration-timestamp", redisPrefix, prefix),
 		keyRelayConfig:               fmt.Sprintf("%s/%s:relay-config", redisPrefix, prefix),
 
 		keyStats:              fmt.Sprintf("%s/%s:stats", redisPrefix, prefix),
@@ -267,6 +269,39 @@ func (r *RedisCache) SetValidatorRegistrationData(data *builderApiV1.ValidatorRe
 		return err
 	}
 	return r.client.HSet(context.Background(), r.keyValidatorRegistrationData, pk, dataBytes).Err()
+}
+
+// SetValidatorRegistrationTimestamp stores the unix seconds of when the validator registration was inserted.
+// Note: despite the method name, we use it as a proxy for "inserted_at" used for freshness checks.
+func (r *RedisCache) SetValidatorRegistrationTimestamp(pk common.PubkeyHex, timestamp uint64) error {
+	return r.client.HSet(context.Background(), r.keyValidatorRegistrationTimestamp, pk.String(), timestamp).Err()
+}
+
+func (r *RedisCache) GetValidatorRegistrationTimestamp(pk common.PubkeyHex) (uint64, error) {
+	raw, err := r.client.HGet(context.Background(), r.keyValidatorRegistrationTimestamp, pk.String()).Result()
+	if errors.Is(err, redis.Nil) {
+		return 0, nil
+	} else if err != nil {
+		return 0, err
+	}
+
+	parsed, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return parsed, nil
+}
+
+// SetValidatorRegistrationTimestampIfNewer sets the timestamp only if it's newer than the stored value.
+func (r *RedisCache) SetValidatorRegistrationTimestampIfNewer(pk common.PubkeyHex, timestamp uint64) error {
+	current, err := r.GetValidatorRegistrationTimestamp(pk)
+	if err != nil {
+		return err
+	}
+	if current >= timestamp {
+		return nil
+	}
+	return r.SetValidatorRegistrationTimestamp(pk, timestamp)
 }
 
 func (r *RedisCache) CheckAndSetLastSlotAndHashDelivered(slot uint64, hash string) (err error) {

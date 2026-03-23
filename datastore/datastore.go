@@ -34,6 +34,13 @@ type GetPayloadResponseKey struct {
 	BlockHash      string
 }
 
+// CachedValidatorRegistration is the cached validator registration plus its insertion time.
+// inserted_at is used for freshness checks (not the validator registration "timestamp").
+type CachedValidatorRegistration struct {
+	builderApiV1.ValidatorRegistration
+	InsertedAt time.Time
+}
+
 // Datastore provides a local memory cache with a Redis and DB backend
 type Datastore struct {
 	redis     *RedisCache
@@ -46,7 +53,7 @@ type Datastore struct {
 	knownValidatorsIsUpdating uberatomic.Bool
 	knownValidatorsLastSlot   uberatomic.Uint64
 
-	validatorRegistrations    map[common.PubkeyHex]builderApiV1.ValidatorRegistration
+	validatorRegistrations    map[common.PubkeyHex]CachedValidatorRegistration
 	validatorRegistrationLock sync.RWMutex
 
 	// Used for proposer-API readiness check
@@ -58,7 +65,7 @@ func NewDatastore(redisCache *RedisCache, memcached *Memcached, db database.IDat
 		db:                      db,
 		memcached:               memcached,
 		redis:                   redisCache,
-		validatorRegistrations:  make(map[common.PubkeyHex]builderApiV1.ValidatorRegistration),
+		validatorRegistrations:  make(map[common.PubkeyHex]CachedValidatorRegistration),
 		knownValidatorsByPubkey: make(map[common.PubkeyHex]uint64),
 		knownValidatorsByIndex:  make(map[uint64]common.PubkeyHex),
 	}
@@ -190,7 +197,7 @@ func (ds *Datastore) SetKnownValidator(pubkeyHex common.PubkeyHex, index uint64)
 
 // GetCachedValidatorRegistration returns a validator registration from local cache or Redis
 // If not found, it returns (nil, nil)
-func (ds *Datastore) GetCachedValidatorRegistration(proposerPubkey common.PubkeyHex) (*builderApiV1.ValidatorRegistration, error) {
+func (ds *Datastore) GetCachedValidatorRegistration(proposerPubkey common.PubkeyHex) (*CachedValidatorRegistration, error) {
 	var err error
 
 	// acquire read lock and read
@@ -203,24 +210,41 @@ func (ds *Datastore) GetCachedValidatorRegistration(proposerPubkey common.Pubkey
 
 	// if not, try to get it from Redis
 	cachedRegistrationData, err := ds.redis.GetValidatorRegistrationData(proposerPubkey)
-	if err == nil && cachedRegistrationData != nil {
-		// save in local cache
-		ds.saveValidatorRegistrationInLocalCache(*cachedRegistrationData)
+	if err != nil || cachedRegistrationData == nil {
+		return nil, err
 	}
-	return cachedRegistrationData, err
+
+	// Use stored insertion time for freshness checks.
+	insertedAtUnix, err := ds.redis.GetValidatorRegistrationTimestamp(proposerPubkey)
+	if err != nil {
+		return nil, err
+	}
+	insertedAt := time.Unix(int64(insertedAtUnix), 0).UTC()
+	if insertedAtUnix == 0 {
+		// Fallback: treat registration timestamp as insertion time if the cache is missing it.
+		insertedAt = cachedRegistrationData.Timestamp.UTC()
+	}
+
+	ds.saveValidatorRegistrationInLocalCache(*cachedRegistrationData, insertedAt)
+	return &CachedValidatorRegistration{ValidatorRegistration: *cachedRegistrationData, InsertedAt: insertedAt}, nil
 }
 
-func (ds *Datastore) saveValidatorRegistrationInLocalCache(entry builderApiV1.ValidatorRegistration) {
+func (ds *Datastore) saveValidatorRegistrationInLocalCache(entry builderApiV1.ValidatorRegistration, insertedAt time.Time) {
 	ds.validatorRegistrationLock.Lock()
-	ds.validatorRegistrations[common.NewPubkeyHex(entry.Pubkey.String())] = entry
+	ds.validatorRegistrations[common.NewPubkeyHex(entry.Pubkey.String())] = CachedValidatorRegistration{
+		ValidatorRegistration: entry,
+		InsertedAt:             insertedAt,
+	}
 	ds.validatorRegistrationLock.Unlock()
 }
 
 // SaveValidatorRegistration saves a validator registration into local cache, Redis and the database
 // Note that this function is called synchronously, so no need to lock the cache
 func (ds *Datastore) SaveValidatorRegistration(entry builderApiV1.SignedValidatorRegistration) error {
+	insertedAt := time.Now().UTC()
+
 	// Save in local cache
-	ds.saveValidatorRegistrationInLocalCache(*entry.Message)
+	ds.saveValidatorRegistrationInLocalCache(*entry.Message, insertedAt)
 
 	// Save in the database
 	err := ds.db.SaveValidatorRegistration(database.SignedValidatorRegistrationToEntry(entry))
@@ -232,6 +256,13 @@ func (ds *Datastore) SaveValidatorRegistration(entry builderApiV1.SignedValidato
 	err = ds.redis.SetValidatorRegistrationData(entry.Message)
 	if err != nil {
 		return errors.Wrap(err, "failed saving validator registration to redis")
+	}
+
+	// Save insertion time proxy used for freshness checks
+	pkHex := common.NewPubkeyHex(entry.Message.Pubkey.String())
+	err = ds.redis.SetValidatorRegistrationTimestampIfNewer(pkHex, uint64(insertedAt.Unix())) //nolint:gosec
+	if err != nil {
+		return errors.Wrap(err, "failed saving validator registration inserted_at to redis")
 	}
 
 	return nil
