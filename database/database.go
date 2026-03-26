@@ -175,6 +175,12 @@ func (s *DatabaseService) SaveValidatorRegistration(entry ValidatorRegistrationE
 	if _, err = tx.NamedExec(insertQuery, entry); err != nil {
 		return err
 	}
+
+	cleanupQuery := `DELETE FROM ` + vars.TableValidatorRegistration + ` WHERE pubkey=:pubkey AND timestamp < :timestamp;`
+	if _, err = tx.NamedExec(cleanupQuery, entry); err != nil {
+		return err
+	}
+
 	return nil
 }
 
