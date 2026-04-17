@@ -123,6 +123,7 @@ var (
 	exchangeLoginPrivateKey = GetEnvStr("EXCHANGE_LOGIN_PRIVATE_KEY", "5eae315483f028b5cdd5d1090ff0c7618b18737ea9bf3c35047189db22835c48")
 	defaultBuilder          = GetEnvStr("DEFAULT_BUILDER_PUBKEY", "0xa1885d66bef164889a2e35845c3b626545d7b0e513efe335e97c3a45e534013fa3bc38c3b7e6143695aecc4872ac52c4")
 	defaultFeeRecipient     = GetEnvStr("DEFAULT_FEE_RECIPIENT", "0x7566b700c0eaac88b521536f4e4e1b5b9afe6fe1")
+	realTimeBidMultiplier   = GetEnvStr("REALTIME_BID_MULTIPLIER", "1")
 
 	// various timings
 	timeoutGetPayloadRetryMs       = cli.GetEnvInt("GETPAYLOAD_RETRY_TIMEOUT_MS", 100)
@@ -185,6 +186,30 @@ func GetEnvStr(key, defaultValue string) string {
 		return value
 	}
 	return defaultValue
+}
+
+func applyBidMultiplier(value *uint256.Int, multiplier string) (*uint256.Int, error) {
+	if value == nil {
+		return nil, errors.New("bid value is nil")
+	}
+
+	ratio, ok := new(big.Rat).SetString(multiplier)
+	if !ok {
+		return nil, fmt.Errorf("invalid REALTIME_BID_MULTIPLIER: %q", multiplier)
+	}
+	if ratio.Sign() < 0 {
+		return nil, fmt.Errorf("REALTIME_BID_MULTIPLIER must be non-negative: %q", multiplier)
+	}
+
+	scaledValue := new(big.Int).Mul(value.ToBig(), ratio.Num())
+	scaledValue.Quo(scaledValue, ratio.Denom())
+
+	adjustedValue := new(uint256.Int)
+	if overflow := adjustedValue.SetFromBig(scaledValue); overflow {
+		return nil, fmt.Errorf("REALTIME_BID_MULTIPLIER produced value overflow")
+	}
+
+	return adjustedValue, nil
 }
 
 // ApiClient represents the client for interacting with the API
@@ -250,6 +275,7 @@ type WholeBlockMarket struct {
 	UpdateDate       int64  `json:"updateDate"`
 	OFAC             bool   `json:"ofac"`
 	MultiRelay       bool   `json:"multiRelay"`
+	RealTime         bool   `json:"realtime"`
 }
 
 // Define the slotBundle type at the top of the file
@@ -1910,13 +1936,17 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 	}
 
 	var multiRelay bool
+	var realTime bool
+
 	market, marketErr := api.getMarketForSlot(slot)
 	if marketErr != nil {
 		log.WithError(marketErr).Warn("failed to fetch market info; defaulting to single relay behavior")
-	} else if market != nil && market.MultiRelay {
-		multiRelay = true
+	} else if market != nil {
+		multiRelay = market.MultiRelay
+		realTime = market.RealTime
 	}
 	log = log.WithField("multiRelay", multiRelay)
+	log = log.WithField("realTime", realTime)
 
 	// if bid == nil || bid.IsEmpty() {
 	// 	// Check cache first
@@ -1954,10 +1984,19 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 	// HARDCODE to modify the bid value to force validator select our block
 	if !multiRelay {
 		if bid.Capella != nil {
-			baseValue := uint256.MustFromDecimal("11000000000000000000000") // Base value (11000 ETH)
-			acualValue := bid.Capella.Message.Value
-			totalValue := new(uint256.Int).Add(baseValue, acualValue) // Add base value and requestTime
-			bid.Capella.Message.Value = totalValue                    // Set the new value
+			actualValue := bid.Capella.Message.Value
+			totalValue := actualValue
+			if realTime {
+				totalValue, err = applyBidMultiplier(actualValue, realTimeBidMultiplier)
+				if err != nil {
+					log.WithError(err).Warn("failed to apply realtime bid multiplier, using actual bid value")
+					totalValue = actualValue
+				}
+			} else {
+				baseValue := uint256.MustFromDecimal("11000000000000000000000") // Base value (11000 ETH)
+				totalValue = new(uint256.Int).Add(baseValue, actualValue)
+			}
+			bid.Capella.Message.Value = totalValue
 
 			bid.Capella.Message.Pubkey = *api.publicKey
 
@@ -1988,9 +2027,18 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 			copy(bid.Capella.Signature[:], signatureBytes)
 
 		} else if bid.Deneb != nil {
-			baseValue := uint256.MustFromDecimal("11000000000000000000000") // Base value (11000 ETH)
-			acualValue := bid.Deneb.Message.Value
-			totalValue := new(uint256.Int).Add(baseValue, acualValue) // Add base value and requestTime
+			actualValue := bid.Deneb.Message.Value
+			totalValue := actualValue
+			if realTime {
+				totalValue, err = applyBidMultiplier(actualValue, realTimeBidMultiplier)
+				if err != nil {
+					log.WithError(err).Warn("failed to apply realtime bid multiplier, using actual bid value")
+					totalValue = actualValue
+				}
+			} else {
+				baseValue := uint256.MustFromDecimal("11000000000000000000000") // Base value (11000 ETH)
+				totalValue = new(uint256.Int).Add(baseValue, actualValue)
+			}
 			bid.Deneb.Message.Value = totalValue
 			bid.Deneb.Message.Pubkey = *api.publicKey
 
@@ -2018,9 +2066,18 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 			// Assign the signature
 			copy(bid.Deneb.Signature[:], signatureBytes)
 		} else if bid.Electra != nil {
-			baseValue := uint256.MustFromDecimal("11000000000000000000000") // Base value (11000 ETH)
-			acualValue := bid.Electra.Message.Value
-			totalValue := new(uint256.Int).Add(baseValue, acualValue) // Add base value and requestTime
+			actualValue := bid.Electra.Message.Value
+			totalValue := actualValue
+			if realTime {
+				totalValue, err = applyBidMultiplier(actualValue, realTimeBidMultiplier)
+				if err != nil {
+					log.WithError(err).Warn("failed to apply realtime bid multiplier, using actual bid value")
+					totalValue = actualValue
+				}
+			} else {
+				baseValue := uint256.MustFromDecimal("11000000000000000000000") // Base value (11000 ETH)
+				totalValue = new(uint256.Int).Add(baseValue, actualValue)
+			}
 			bid.Electra.Message.Value = totalValue
 			bid.Electra.Message.Pubkey = *api.publicKey
 
@@ -2051,9 +2108,18 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 			copy(bid.Electra.Signature[:], signatureBytes)
 
 		} else if bid.Fulu != nil {
-			baseValue := uint256.MustFromDecimal("11000000000000000000000") // Base value (11000 ETH)
-			acualValue := bid.Fulu.Message.Value
-			totalValue := new(uint256.Int).Add(baseValue, acualValue) // Add base value and requestTime
+			actualValue := bid.Fulu.Message.Value
+			totalValue := actualValue
+			if realTime {
+				totalValue, err = applyBidMultiplier(actualValue, realTimeBidMultiplier)
+				if err != nil {
+					log.WithError(err).Warn("failed to apply realtime bid multiplier, using actual bid value")
+					totalValue = actualValue
+				}
+			} else {
+				baseValue := uint256.MustFromDecimal("11000000000000000000000") // Base value (11000 ETH)
+				totalValue = new(uint256.Int).Add(baseValue, actualValue)
+			}
 			bid.Fulu.Message.Value = totalValue
 			bid.Fulu.Message.Pubkey = *api.publicKey
 
