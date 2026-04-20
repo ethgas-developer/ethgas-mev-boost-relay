@@ -123,6 +123,7 @@ var (
 	exchangeLoginPrivateKey = GetEnvStr("EXCHANGE_LOGIN_PRIVATE_KEY", "5eae315483f028b5cdd5d1090ff0c7618b18737ea9bf3c35047189db22835c48")
 	defaultBuilder          = GetEnvStr("DEFAULT_BUILDER_PUBKEY", "0xa1885d66bef164889a2e35845c3b626545d7b0e513efe335e97c3a45e534013fa3bc38c3b7e6143695aecc4872ac52c4")
 	defaultFeeRecipient     = GetEnvStr("DEFAULT_FEE_RECIPIENT", "0x7566b700c0eaac88b521536f4e4e1b5b9afe6fe1")
+	realTimeBidMultiplier   = GetEnvStr("REALTIME_BID_MULTIPLIER", "1")
 
 	// various timings
 	timeoutGetPayloadRetryMs       = cli.GetEnvInt("GETPAYLOAD_RETRY_TIMEOUT_MS", 100)
@@ -149,6 +150,10 @@ var (
 
 	// maximum payload bytes for a block submission to be fast-tracked (large payloads slow down other fast-tracked requests!)
 	fastTrackPayloadSizeLimit = cli.GetEnvInt("FAST_TRACK_PAYLOAD_SIZE_LIMIT", 230_000)
+
+	// validator registration freshness checks for the data API
+	validatorDateRegistrationWindow      = time.Duration(cli.GetEnvInt("VALIDATOR_DATE_REGISTRATION_WINDOW_SEC", int((72*time.Hour)/time.Second))) * time.Second
+	enableValidatorDateRegistrationCheck = os.Getenv("ENABLE_VALIDATOR_DATE_REGISTRATION_CHECK") == "1"
 
 	//proxy mode
 	proxyMode = os.Getenv("IS_PROXY_RELAY") == "true"
@@ -250,6 +255,7 @@ type WholeBlockMarket struct {
 	UpdateDate       int64  `json:"updateDate"`
 	OFAC             bool   `json:"ofac"`
 	MultiRelay       bool   `json:"multiRelay"`
+	RealTime         bool   `json:"realtime"`
 }
 
 // Define the slotBundle type at the top of the file
@@ -1910,13 +1916,17 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 	}
 
 	var multiRelay bool
+	var realTime bool
+
 	market, marketErr := api.getMarketForSlot(slot)
 	if marketErr != nil {
 		log.WithError(marketErr).Warn("failed to fetch market info; defaulting to single relay behavior")
-	} else if market != nil && market.MultiRelay {
-		multiRelay = true
+	} else if market != nil {
+		multiRelay = market.MultiRelay
+		realTime = market.RealTime
 	}
 	log = log.WithField("multiRelay", multiRelay)
+	log = log.WithField("realTime", realTime)
 
 	// if bid == nil || bid.IsEmpty() {
 	// 	// Check cache first
@@ -4071,8 +4081,6 @@ type ValidatorRegistration struct {
 	FeeRecipient string `json:"fee_recipient"`
 }
 
-const validatorDataRegistrationWindow = 72 * time.Hour
-
 func (api *RelayAPI) handleDataValidatorsRegistration(w http.ResponseWriter, req *http.Request) {
 	// Define request structure
 	type ValidatorsRequest struct {
@@ -4136,13 +4144,11 @@ func (api *RelayAPI) handleDataValidatorsRegistration(w http.ResponseWriter, req
 	}
 
 	// Build response with only registered validators that are fresh enough
-	cutoff := time.Now().Add(-validatorDataRegistrationWindow).Unix()
+	cutoff := time.Now().Add(-validatorDateRegistrationWindow)
 	var registrations []ValidatorRegistration
 	for _, pubkey := range request.Pubkeys {
 		if registration, exists := registrationMap[pubkey]; exists {
-			log.Println("registration.InsertedAt", registration.InsertedAt)
-			log.Println("cutoff", cutoff)
-			if registration.InsertedAt.Unix() < cutoff {
+			if enableValidatorDateRegistrationCheck && registration.InsertedAt.Before(cutoff) {
 				continue
 			}
 			// Only include registered validators
