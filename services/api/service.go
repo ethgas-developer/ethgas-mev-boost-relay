@@ -192,6 +192,30 @@ func GetEnvStr(key, defaultValue string) string {
 	return defaultValue
 }
 
+func applyBidMultiplier(value *uint256.Int, multiplier string) (*uint256.Int, error) {
+	if value == nil {
+		return nil, errors.New("bid value is nil")
+	}
+
+	ratio, ok := new(big.Rat).SetString(multiplier)
+	if !ok {
+		return nil, fmt.Errorf("invalid REALTIME_BID_MULTIPLIER: %q", multiplier)
+	}
+	if ratio.Sign() < 0 {
+		return nil, fmt.Errorf("REALTIME_BID_MULTIPLIER must be non-negative: %q", multiplier)
+	}
+
+	scaledValue := new(big.Int).Mul(value.ToBig(), ratio.Num())
+	scaledValue.Quo(scaledValue, ratio.Denom())
+
+	adjustedValue := new(uint256.Int)
+	if overflow := adjustedValue.SetFromBig(scaledValue); overflow {
+		return nil, fmt.Errorf("REALTIME_BID_MULTIPLIER produced value overflow")
+	}
+
+	return adjustedValue, nil
+}
+
 // ApiClient represents the client for interacting with the API
 type ApiClient struct {
 	APIURL       string
@@ -1964,10 +1988,19 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 	// HARDCODE to modify the bid value to force validator select our block
 	if !multiRelay {
 		if bid.Capella != nil {
-			baseValue := uint256.MustFromDecimal("11000000000000000000000") // Base value (11000 ETH)
-			acualValue := bid.Capella.Message.Value
-			totalValue := new(uint256.Int).Add(baseValue, acualValue) // Add base value and requestTime
-			bid.Capella.Message.Value = totalValue                    // Set the new value
+			actualValue := bid.Capella.Message.Value
+			totalValue := actualValue
+			if realTime {
+				totalValue, err = applyBidMultiplier(actualValue, realTimeBidMultiplier)
+				if err != nil {
+					log.WithError(err).Warn("failed to apply realtime bid multiplier, using actual bid value")
+					totalValue = actualValue
+				}
+			} else {
+				baseValue := uint256.MustFromDecimal("11000000000000000000000") // Base value (11000 ETH)
+				totalValue = new(uint256.Int).Add(baseValue, actualValue)
+			}
+			bid.Capella.Message.Value = totalValue
 
 			bid.Capella.Message.Pubkey = *api.publicKey
 
@@ -1998,9 +2031,18 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 			copy(bid.Capella.Signature[:], signatureBytes)
 
 		} else if bid.Deneb != nil {
-			baseValue := uint256.MustFromDecimal("11000000000000000000000") // Base value (11000 ETH)
-			acualValue := bid.Deneb.Message.Value
-			totalValue := new(uint256.Int).Add(baseValue, acualValue) // Add base value and requestTime
+			actualValue := bid.Deneb.Message.Value
+			totalValue := actualValue
+			if realTime {
+				totalValue, err = applyBidMultiplier(actualValue, realTimeBidMultiplier)
+				if err != nil {
+					log.WithError(err).Warn("failed to apply realtime bid multiplier, using actual bid value")
+					totalValue = actualValue
+				}
+			} else {
+				baseValue := uint256.MustFromDecimal("11000000000000000000000") // Base value (11000 ETH)
+				totalValue = new(uint256.Int).Add(baseValue, actualValue)
+			}
 			bid.Deneb.Message.Value = totalValue
 			bid.Deneb.Message.Pubkey = *api.publicKey
 
@@ -2028,9 +2070,18 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 			// Assign the signature
 			copy(bid.Deneb.Signature[:], signatureBytes)
 		} else if bid.Electra != nil {
-			baseValue := uint256.MustFromDecimal("11000000000000000000000") // Base value (11000 ETH)
-			acualValue := bid.Electra.Message.Value
-			totalValue := new(uint256.Int).Add(baseValue, acualValue) // Add base value and requestTime
+			actualValue := bid.Electra.Message.Value
+			totalValue := actualValue
+			if realTime {
+				totalValue, err = applyBidMultiplier(actualValue, realTimeBidMultiplier)
+				if err != nil {
+					log.WithError(err).Warn("failed to apply realtime bid multiplier, using actual bid value")
+					totalValue = actualValue
+				}
+			} else {
+				baseValue := uint256.MustFromDecimal("11000000000000000000000") // Base value (11000 ETH)
+				totalValue = new(uint256.Int).Add(baseValue, actualValue)
+			}
 			bid.Electra.Message.Value = totalValue
 			bid.Electra.Message.Pubkey = *api.publicKey
 
@@ -2061,9 +2112,18 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 			copy(bid.Electra.Signature[:], signatureBytes)
 
 		} else if bid.Fulu != nil {
-			baseValue := uint256.MustFromDecimal("11000000000000000000000") // Base value (11000 ETH)
-			acualValue := bid.Fulu.Message.Value
-			totalValue := new(uint256.Int).Add(baseValue, acualValue) // Add base value and requestTime
+			actualValue := bid.Fulu.Message.Value
+			totalValue := actualValue
+			if realTime {
+				totalValue, err = applyBidMultiplier(actualValue, realTimeBidMultiplier)
+				if err != nil {
+					log.WithError(err).Warn("failed to apply realtime bid multiplier, using actual bid value")
+					totalValue = actualValue
+				}
+			} else {
+				baseValue := uint256.MustFromDecimal("11000000000000000000000") // Base value (11000 ETH)
+				totalValue = new(uint256.Int).Add(baseValue, actualValue)
+			}
 			bid.Fulu.Message.Value = totalValue
 			bid.Fulu.Message.Pubkey = *api.publicKey
 
