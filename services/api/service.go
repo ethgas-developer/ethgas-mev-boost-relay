@@ -65,16 +65,16 @@ import (
 type HandleGetPayloadVersion string
 
 const (
-	ErrBlockAlreadyKnown   = "simulation failed: block already known"
-	ErrBlockIsTooOld       = "block is too old"
-	ErrBlockParentNotFound = "parent block not found"
-	ErrBlockRequiresReorg  = "simulation failed: block requires a reorg"
-	ErrMissingTrieNode     = "missing trie node"
-	ErrClientTimeout       = "Client.Timeout exceeded while awaiting headers"
-
-	HeaderAccept              = "Accept"
-	HeaderContentType         = "Content-Type"
-	HeaderEthConsensusVersion = "Eth-Consensus-Version"
+	ErrBlockAlreadyKnown       = "simulation failed: block already known"
+	ErrBlockIsTooOld           = "block is too old"
+	ErrBlockParentNotFound     = "parent block not found"
+	ErrBlockRequiresReorg      = "simulation failed: block requires a reorg"
+	ErrMissingTrieNode         = "missing trie node"
+	ErrClientTimeout           = "Client.Timeout exceeded while awaiting headers"
+	ErrClientConnectionRefused = "connection refused"
+	HeaderAccept               = "Accept"
+	HeaderContentType          = "Content-Type"
+	HeaderEthConsensusVersion  = "Eth-Consensus-Version"
 
 	HandleGetPayloadVersionV1 HandleGetPayloadVersion = "V1"
 	HandleGetPayloadVersionV2 HandleGetPayloadVersion = "V2"
@@ -1129,7 +1129,8 @@ func isIgnorableError(err error) bool {
 	return strings.Contains(errStr, ErrBlockParentNotFound) ||
 		strings.Contains(errStr, ErrBlockIsTooOld) ||
 		strings.Contains(errStr, ErrMissingTrieNode) ||
-		strings.Contains(errStr, ErrClientTimeout)
+		strings.Contains(errStr, ErrClientTimeout) ||
+		strings.Contains(errStr, ErrClientConnectionRefused)
 }
 
 func (api *RelayAPI) demoteBuilder(pubkey string, req *common.VersionedSubmitBlockRequest, simError error) {
