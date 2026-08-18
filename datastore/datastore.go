@@ -3,6 +3,7 @@ package datastore
 
 import (
 	"database/sql"
+	"fmt"
 	"strconv"
 	"strings"
 	"sync"
@@ -124,13 +125,13 @@ func (ds *Datastore) RefreshKnownValidators(log *logrus.Entry, beaconClient beac
 func (ds *Datastore) RefreshKnownValidatorsWithoutChecks(log *logrus.Entry, beaconClient beaconclient.IMultiBeaconClient, slot uint64) {
 	log.Info("Querying validators from beacon node... (this may take a while)")
 	timeStartFetching := time.Now()
-	validators, err := beaconClient.GetStateValidators(beaconclient.StateIDHead) // head is fastest
+	knownValidatorsByPubkey, knownValidatorsByIndex, err := fetchKnownValidators(log, beaconClient)
 	if err != nil {
 		log.WithError(err).Error("failed to fetch validators from all beacon nodes")
 		return
 	}
 
-	numValidators := len(validators.Data)
+	numValidators := len(knownValidatorsByIndex)
 	log = log.WithFields(logrus.Fields{
 		"numKnownValidators":        numValidators,
 		"durationFetchValidatorsMs": time.Since(timeStartFetching).Milliseconds(),
@@ -145,15 +146,6 @@ func (ds *Datastore) RefreshKnownValidatorsWithoutChecks(log *logrus.Entry, beac
 	// At this point, consider the update successful
 	ds.knownValidatorsLastSlot.Store(slot)
 
-	knownValidatorsByPubkey := make(map[common.PubkeyHex]uint64)
-	knownValidatorsByIndex := make(map[uint64]common.PubkeyHex)
-
-	for _, valEntry := range validators.Data {
-		pk := common.NewPubkeyHex(valEntry.Validator.Pubkey)
-		knownValidatorsByPubkey[pk] = valEntry.Index
-		knownValidatorsByIndex[valEntry.Index] = pk
-	}
-
 	ds.knownValidatorsLock.Lock()
 	ds.knownValidatorsByPubkey = knownValidatorsByPubkey
 	ds.knownValidatorsByIndex = knownValidatorsByIndex
@@ -161,6 +153,32 @@ func (ds *Datastore) RefreshKnownValidatorsWithoutChecks(log *logrus.Entry, beac
 
 	ds.KnownValidatorsWasUpdated.Store(true)
 	log.Infof("known validators updated")
+}
+
+// SetInitialKnownValidators seeds the known-validators cache directly from a
+// caller-provided list of pubkeys. Intended for devnets to skip the multi-minute
+// cold start while the api waits for the first natural RefreshKnownValidators
+// trigger. Assigns synthetic incrementing indices since the real validator
+// indices are only known after the first beacon query.
+func (ds *Datastore) SetInitialKnownValidators(pubkeys []string, slot uint64) error {
+	byPubkey := make(map[common.PubkeyHex]uint64, len(pubkeys))
+	byIndex := make(map[uint64]common.PubkeyHex, len(pubkeys))
+	for i, p := range pubkeys {
+		pk := common.NewPubkeyHex(strings.TrimSpace(p))
+		if len(pk.String()) != 98 {
+			return fmt.Errorf("invalid pubkey at index %d: %q", i, p)
+		}
+		idx := uint64(i)
+		byPubkey[pk] = idx
+		byIndex[idx] = pk
+	}
+	ds.knownValidatorsLock.Lock()
+	ds.knownValidatorsByPubkey = byPubkey
+	ds.knownValidatorsByIndex = byIndex
+	ds.knownValidatorsLock.Unlock()
+	ds.knownValidatorsLastSlot.Store(slot)
+	ds.KnownValidatorsWasUpdated.Store(true)
+	return nil
 }
 
 func (ds *Datastore) IsKnownValidator(pubkeyHex common.PubkeyHex) bool {
@@ -233,7 +251,7 @@ func (ds *Datastore) saveValidatorRegistrationInLocalCache(entry builderApiV1.Va
 	ds.validatorRegistrationLock.Lock()
 	ds.validatorRegistrations[common.NewPubkeyHex(entry.Pubkey.String())] = CachedValidatorRegistration{
 		ValidatorRegistration: entry,
-		InsertedAt:             insertedAt,
+		InsertedAt:            insertedAt,
 	}
 	ds.validatorRegistrationLock.Unlock()
 }
