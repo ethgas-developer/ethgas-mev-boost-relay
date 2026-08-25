@@ -119,6 +119,7 @@ var (
 
 	// API URL
 	exchangeAPIURL          = GetEnvStr("EXCHANGE_API_URL", "http://localhost:3210")
+	disableEthgasMarketAPI  = os.Getenv("DISABLE_ETHGAS_MARKET_API") == "1"
 	chainID                 = GetEnvStr("CHAIN_ID", "7e7e")
 	exchangeLoginPrivateKey = GetEnvStr("EXCHANGE_LOGIN_PRIVATE_KEY", "5eae315483f028b5cdd5d1090ff0c7618b18737ea9bf3c35047189db22835c48")
 	defaultBuilder          = GetEnvStr("DEFAULT_BUILDER_PUBKEY", "0xa1885d66bef164889a2e35845c3b626545d7b0e513efe335e97c3a45e534013fa3bc38c3b7e6143695aecc4872ac52c4")
@@ -382,11 +383,12 @@ type RelayAPIOpts struct {
 	// Network specific variables
 	EthNetDetails common.EthNetworkDetails
 
+	PprofListenAddr string
+
 	// APIs to enable
 	ProposerAPI     bool
 	BlockBuilderAPI bool
 	DataAPI         bool
-	PprofAPI        bool
 	InternalAPI     bool
 
 	// InitialKnownValidators seeds the known-validators cache at startup so the
@@ -795,7 +797,9 @@ func NewRelayAPI(opts RelayAPIOpts) (api *RelayAPI, err error) {
 		api.log.Warn("env: DISABLE_BUILDER_DEMOTION - builders are never demoted")
 		api.ffDisableDemotion = true
 	}
-	go InitLoginAndStartTokenRefresh()
+	if !disableEthgasMarketAPI {
+		go InitLoginAndStartTokenRefresh()
+	}
 
 	// Start the exchange API health check
 	// api.startExchangeAPIHealthCheck()
@@ -842,12 +846,6 @@ func (api *RelayAPI) getRouter() http.Handler {
 		r.HandleFunc(pathDataValidatorRegistration, api.handleDataValidatorRegistration).Methods(http.MethodGet)
 		r.HandleFunc(pathDataValidatorsRegistration, api.handleDataValidatorsRegistration).Methods(http.MethodPost)
 
-	}
-
-	// Pprof
-	if api.opts.PprofAPI {
-		api.log.Info("pprof API enabled")
-		r.PathPrefix("/debug/pprof/").Handler(http.DefaultServeMux)
 	}
 
 	// /internal/...
@@ -999,6 +997,17 @@ func (api *RelayAPI) StartServer() (err error) {
 			api.processNewSlot(headEvent.Slot)
 		}
 	}()
+
+	if api.opts.PprofListenAddr != "" {
+		api.log.Info("pprof API is listening on", api.opts.PprofListenAddr)
+		go func() {
+			//nolint:gosec // we should not expose pprof externally anyway
+			err := http.ListenAndServe(api.opts.PprofListenAddr, http.DefaultServeMux)
+			if err != nil && !errors.Is(err, http.ErrServerClosed) {
+				api.log.WithError(err).Fatal("failed to start pprof API")
+			}
+		}()
+	}
 
 	// create and start HTTP server
 	api.srv = &http.Server{
@@ -1973,15 +1982,16 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	var multiRelay bool
-	var realTime bool
+	var multiRelay, realTime bool
 
-	market, marketErr := api.getMarketForSlot(slot)
-	if marketErr != nil {
-		log.WithError(marketErr).Warn("failed to fetch market info; defaulting to single relay behavior")
-	} else if market != nil {
-		multiRelay = market.MultiRelay
-		realTime = market.RealTime
+	if !disableEthgasMarketAPI {
+		market, marketErr := api.getMarketForSlot(slot)
+		if marketErr != nil {
+			log.WithError(marketErr).Warn("failed to fetch market info; defaulting to single relay behavior")
+		} else if market != nil {
+			multiRelay = market.MultiRelay
+			realTime = market.RealTime
+		}
 	}
 	log = log.WithField("multiRelay", multiRelay)
 	log = log.WithField("realTime", realTime)
@@ -2020,7 +2030,7 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 	// }
 
 	// HARDCODE to modify the bid value to force validator select our block
-	if !multiRelay {
+	if !disableEthgasMarketAPI && !multiRelay {
 		if bid.Capella != nil {
 			actualValue := bid.Capella.Message.Value
 			totalValue := actualValue
@@ -2188,6 +2198,8 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 			copy(bid.Fulu.Signature[:], signatureBytes)
 
 		}
+	} else if disableEthgasMarketAPI {
+		log.Debug("ETHGas market API disabled; bid value left unchanged")
 	} else {
 		log.Debug("multiRelay market enabled; bid value left unchanged")
 	}
@@ -3196,12 +3208,12 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	//get header: 1. builder + true, 2. fallback builder + true, 3. builder + false 4. fallback builder + false 5. other builder
 	isValidPreconf := "" // empty string means valid
 	feeRecipient := ""
-	if msIntoSlot < int64(getExchangeFinalizedCutoffMs) {
+	if !disableEthgasMarketAPI && msIntoSlot < int64(getExchangeFinalizedCutoffMs) {
 		api.log.Info("handleSubmitNewBlock sent too early, wait for exchange finalized")
 		isValidPreconf = "submission too early, before exchange finalization cutoff"
 		api.RespondError(w, http.StatusBadRequest, "Submission is too early, before the exchange finalization cutoff time (T-4)")
 		return
-	} else if msIntoSlot >= int64(getExchangeMarketCloseCutoffMs) {
+	} else if !disableEthgasMarketAPI && msIntoSlot >= int64(getExchangeMarketCloseCutoffMs) {
 		slot := submission.BidTrace.Slot
 		var builderResp *BuilderResponse
 		if cachedBuilder, ok := api.builderCache.Load(slot); ok {
