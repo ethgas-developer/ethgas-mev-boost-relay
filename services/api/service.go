@@ -466,6 +466,7 @@ type RelayAPI struct {
 
 	// used to wait on any active getPayload calls on shutdown
 	getPayloadCallsInFlight sync.WaitGroup
+	payloadSavesWG          sync.WaitGroup
 
 	// Feature flags
 	ffForceGetHeader204          bool
@@ -1069,8 +1070,20 @@ func (api *RelayAPI) StopServer() (err error) {
 	// wait for any active getPayload call to finish
 	api.getPayloadCallsInFlight.Wait()
 
-	// shutdown
-	return api.srv.Shutdown(context.Background())
+	// Drain HTTP handlers before waiting, so no new payload saves can be added.
+	err = api.srv.Shutdown(context.Background())
+	api.payloadSavesWG.Wait()
+	return err
+}
+
+// runBackgroundPayloadSave keeps persistence off the response path while allowing
+// graceful shutdown to wait for pending writes. Call from an HTTP handler.
+func (api *RelayAPI) runBackgroundPayloadSave(save func()) {
+	api.payloadSavesWG.Add(1)
+	go func() {
+		defer api.payloadSavesWG.Done()
+		save()
+	}()
 }
 
 func (api *RelayAPI) ValidatorUpdateCh() chan struct{} {
@@ -2520,8 +2533,10 @@ func (api *RelayAPI) innerHandleGetPayload(w http.ResponseWriter, req *http.Requ
 	var getPayloadResp *builderApi.VersionedSubmitBlindedBlockResponse
 	var msNeededForPublishing uint64
 
-	// Save information about delivered payload
-	defer func() {
+	// Start persistence after the handler finishes populating the response data.
+	defer api.runBackgroundPayloadSave(func() {
+		// Keep refund logging local to this goroutine.
+		log := log
 		bidTrace, err := api.redis.GetBidTrace(uint64(slot), proposerPubkey.String(), blockHash.String())
 		if err != nil {
 			log.WithError(err).Info("failed to get bidTrace for delivered payload from redis")
@@ -2569,7 +2584,6 @@ func (api *RelayAPI) innerHandleGetPayload(w http.ResponseWriter, req *http.Requ
 		signedBeaconBlock, err := common.SignedBlindedBeaconBlockToBeaconBlock(payload, getPayloadResp)
 		if err != nil {
 			log.WithError(err).Error("failed to convert signed blinded beacon block to beacon block")
-			api.RespondError(w, http.StatusInternalServerError, "failed to convert signed blinded beacon block to beacon block")
 			return
 		}
 
@@ -2599,7 +2613,7 @@ func (api *RelayAPI) innerHandleGetPayload(w http.ResponseWriter, req *http.Requ
 				"signedRegistration":     signedRegistration,
 			}).WithError(err).Error("unable to update builder demotion with refund justification")
 		}
-	}()
+	})
 
 	// Get the response - from Redis, Memcache or DB
 	// note that recent mev-boost versions only send getPayload to relays that provided the bid
@@ -3275,7 +3289,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 			if !exists {
 				// url := fmt.Sprintf("%s/api/slot/bundles?slot=%d", client.APIURL, submission.BidTrace.Slot)
 				url := fmt.Sprintf("%s/api/v1/slot/bundles?slot=%d", client.APIURL, submission.BidTrace.Slot)
-				log.Printf(url)
+				log.Print(url)
 				req, err := http.NewRequest("GET", url, nil)
 				if err != nil {
 					log.Printf("cannot fetch preconf requests from preconf server, %v", err)
@@ -3617,8 +3631,9 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	pf.AboveFloorBid = true
 	log = log.WithField("timestampAfterCheckingFloorBid", time.Now().UTC().UnixMilli())
 
-	// Deferred saving of the builder submission to database (whenever this function ends)
-	defer func() {
+	// Start persistence on return, using the final profile and eligibility time.
+	// Waiting for an optimistic simulation and writing to the DB must not delay HTTP.
+	defer api.runBackgroundPayloadSave(func() {
 		savePayloadToDatabase := !api.ffDisablePayloadDBStorage
 		var simResult *blockSimResult
 		select {
@@ -3646,7 +3661,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		if err != nil {
 			log.WithError(err).Error("failed to upsert block-builder-entry")
 		}
-	}()
+	})
 
 	// ---------------------------------
 	// THE BID WILL BE SIMULATED SHORTLY
@@ -3792,12 +3807,12 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 
 		// Save to memcache in the background
 		if api.memcached != nil {
-			go func() {
-				err = api.memcached.SaveExecutionPayload(submission.BidTrace.Slot, submission.BidTrace.ProposerPubkey.String(), submission.BidTrace.BlockHash.String(), getPayloadResponse)
+			go func(log *logrus.Entry) {
+				err := api.memcached.SaveExecutionPayload(submission.BidTrace.Slot, submission.BidTrace.ProposerPubkey.String(), submission.BidTrace.BlockHash.String(), getPayloadResponse)
 				if err != nil {
 					log.WithError(err).Error("failed saving execution payload in memcached")
 				}
-			}()
+			}(log)
 		}
 	}
 
