@@ -3701,7 +3701,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	// With sufficient collateral, process the block optimistically. When
 	// ENABLE_OPTIMISTIC_ALL_SLOTS is set, force the optimistic path for every
 	// submission with no pessimistic warmup.
-	optimistic := api.ffOptimisticAllSlots ||
+	optimistic := (api.ffOptimisticAllSlots && builderEntry.status.IsOptimistic) ||
 		(builderEntry.status.IsOptimistic &&
 			builderEntry.collateral.Cmp(submission.BidTrace.Value.ToBig()) >= 0 &&
 			submission.BidTrace.Slot == api.optimisticSlot.Load())
