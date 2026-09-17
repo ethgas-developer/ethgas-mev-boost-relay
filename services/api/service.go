@@ -1404,21 +1404,10 @@ func (api *RelayAPI) UpdateProposerDutiesWithoutChecks(headSlot uint64) {
 	}
 
 	for index := range duties {
-		feeRecipient := duties[index].Entry.Message.FeeRecipient.String()
-		// Allowed fee recipients (normalized to lowercase)
-		var allowed = map[string]struct{}{
-			"0x27a75b4e4425313eeab0685aba66fe4557e79c10": {},
-			"0x150bcf49ee8e2bd9f59e991821de5b74c6d876aa": {},
-			"0x534c2a2d94723ea1fca81d1e8b174751a8f9e705": {},
-			"0xe94f1fa4f27d9d288ffea234bb62e1fbc086ca0c": {},
-			"0x0077732907bfc6208933cfd2a51afb8f33ca5958": {},
-			"0xbe6932de5de6e7f8fae2d9f013321aec36997a30": {},
-		}
-		if _, ok := allowed[strings.ToLower(feeRecipient)]; ok {
-			filtering := "ofac"
-			duties[index].Preferences = &common.Preferences{
-				Filtering: &filtering,
-			}
+		// OFAC filtering is required for every proposer duty.
+		filtering := "ofac"
+		duties[index].Preferences = &common.Preferences{
+			Filtering: &filtering,
 		}
 	}
 
