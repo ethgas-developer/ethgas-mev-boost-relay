@@ -2031,12 +2031,12 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 	// 	}
 	// }
 
-	// HARDCODE to modify the bid value to force validator select our block
-	if !disableEthgasMarketAPI && !multiRelay {
+	// Single-relay markets add 11000 ETH; realtime multi-relay markets apply the multiplier.
+	if !disableEthgasMarketAPI && (!multiRelay || realTime) {
 		if bid.Capella != nil {
 			actualValue := bid.Capella.Message.Value
 			totalValue := actualValue
-			if realTime {
+			if multiRelay {
 				totalValue, err = applyBidMultiplier(actualValue, realTimeBidMultiplier)
 				if err != nil {
 					log.WithError(err).Warn("failed to apply realtime bid multiplier, using actual bid value")
@@ -2079,7 +2079,7 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 		} else if bid.Deneb != nil {
 			actualValue := bid.Deneb.Message.Value
 			totalValue := actualValue
-			if realTime {
+			if multiRelay {
 				totalValue, err = applyBidMultiplier(actualValue, realTimeBidMultiplier)
 				if err != nil {
 					log.WithError(err).Warn("failed to apply realtime bid multiplier, using actual bid value")
@@ -2118,7 +2118,7 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 		} else if bid.Electra != nil {
 			actualValue := bid.Electra.Message.Value
 			totalValue := actualValue
-			if realTime {
+			if multiRelay {
 				totalValue, err = applyBidMultiplier(actualValue, realTimeBidMultiplier)
 				if err != nil {
 					log.WithError(err).Warn("failed to apply realtime bid multiplier, using actual bid value")
@@ -2160,7 +2160,7 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 		} else if bid.Fulu != nil {
 			actualValue := bid.Fulu.Message.Value
 			totalValue := actualValue
-			if realTime {
+			if multiRelay {
 				totalValue, err = applyBidMultiplier(actualValue, realTimeBidMultiplier)
 				if err != nil {
 					log.WithError(err).Warn("failed to apply realtime bid multiplier, using actual bid value")
@@ -2203,7 +2203,7 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 	} else if disableEthgasMarketAPI {
 		log.Debug("ETHGas market API disabled; bid value left unchanged")
 	} else {
-		log.Debug("multiRelay market enabled; bid value left unchanged")
+		log.Debug("non-realtime multiRelay market; bid value left unchanged")
 	}
 
 	value, err := bid.Value()
