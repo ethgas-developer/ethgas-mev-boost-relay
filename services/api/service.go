@@ -3280,61 +3280,54 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 			preconfCacheMutex.RUnlock()
 
 			if !exists {
-				// url := fmt.Sprintf("%s/api/slot/bundles?slot=%d", client.APIURL, submission.BidTrace.Slot)
+				// Bound the lookup so an exchange outage does not consume the bidding window.
+				ctx, cancel := context.WithTimeout(req.Context(), 500*time.Millisecond)
 				url := fmt.Sprintf("%s/api/v1/slot/bundles?slot=%d", client.APIURL, submission.BidTrace.Slot)
-				log.Print(url)
-				req, err := http.NewRequest("GET", url, nil)
-				if err != nil {
-					log.Printf("cannot fetch preconf requests from preconf server, %v", err)
-					return
-				}
-				header := fmt.Sprintf("Bearer %s", client.AccessToken)
-				req.Header.Set("AUTHORIZATION", header)
-
-				resp, err := client.Client.Do(req)
-				if err != nil {
-					log.Printf("cannot fetch preconf requests from preconf server, %v", err)
-					return
-				}
-				defer resp.Body.Close()
-
+				bundleReq, fetchErr := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 				var apiResponse ApiResponse
-				err = json.NewDecoder(resp.Body).Decode(&apiResponse)
-				if err != nil {
-					log.Printf("Failed to fetch preconf request: %v", err)
-					return
+				if fetchErr == nil {
+					bundleReq.Header.Set("Authorization", "Bearer "+client.AccessToken)
+					var resp *http.Response
+					resp, fetchErr = client.Client.Do(bundleReq)
+					if fetchErr == nil {
+						if resp.StatusCode != http.StatusOK {
+							fetchErr = fmt.Errorf("slot bundles returned HTTP %d", resp.StatusCode)
+						} else {
+							fetchErr = json.NewDecoder(resp.Body).Decode(&apiResponse)
+						}
+						resp.Body.Close()
+					}
 				}
+				cancel()
 
-				if !apiResponse.Success {
-					log.Printf("Failed to fetch inclusion preconf from server: %v", apiResponse)
-					return
+				if fetchErr == nil && !apiResponse.Success {
+					fetchErr = errors.New("slot bundles response indicates failure")
 				}
-
-				// Log the raw data before unmarshaling
-				log.Printf("Raw preconf bundles data: %s", string(apiResponse.Data))
-
-				var preconfBundles PreconfBundles
-				err = json.Unmarshal(apiResponse.Data, &preconfBundles)
-				if err != nil {
-					log.Printf("Failed to unmarshal preconf bundles: %v, raw data: %s", err, string(apiResponse.Data))
-					return
+				var preconfBundles *PreconfBundles
+				if fetchErr == nil {
+					fetchErr = json.Unmarshal(apiResponse.Data, &preconfBundles)
+					if fetchErr == nil && preconfBundles == nil {
+						fetchErr = errors.New("slot bundles response has no data")
+					}
 				}
-
-				// Log the successfully unmarshaled data
-				log.Printf("Successfully unmarshaled preconf bundles: %+v", preconfBundles)
-
-				// Store in cache
-				preconfCacheMutex.Lock()
-				preconfCache[submission.BidTrace.Slot] = preconfBundles
-				preconfCacheMutex.Unlock()
-
-				cachedPreconfs = preconfBundles
+				if fetchErr != nil {
+					// Fail open without caching an empty response, so later submissions
+					// retry the exchange and enforce its constraints once it recovers.
+					log.WithError(fetchErr).WithField("slot", submission.BidTrace.Slot).
+						Warn("slot bundles unavailable; continuing bid without exchange bundle checks")
+				} else {
+					preconfCacheMutex.Lock()
+					preconfCache[submission.BidTrace.Slot] = *preconfBundles
+					preconfCacheMutex.Unlock()
+					cachedPreconfs = *preconfBundles
+					exists = true
+				}
 			}
-			if cachedPreconfs.FeeRecipient != "" {
+			if exists && cachedPreconfs.FeeRecipient != "" {
 				feeRecipient = cachedPreconfs.FeeRecipient
 			}
 
-			if !skipPreconfCheck {
+			if exists && !skipPreconfCheck {
 
 				// Transaction checking logic
 				// Convert all block transactions to lowercase for case-insensitive comparison
@@ -3457,7 +3450,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 					// Remains empty string for valid case
 				}
 			}
-			if !skipEmptySpaceCheck {
+			if exists && !skipEmptySpaceCheck {
 				//check remain empty space
 				if cachedPreconfs.EmptySpace > 0 { // Check if EmptySpace is greater than 0
 					//empty space === -1 = full block empty submission.BidTrace.GasLimit
