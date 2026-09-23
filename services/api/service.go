@@ -259,7 +259,7 @@ type ApiResponse struct {
 }
 
 type WholeBlockMarketResponse struct {
-	Markets WholeBlockMarket `json:"markets"`
+	Markets *WholeBlockMarket `json:"markets"`
 }
 
 type WholeBlockMarket struct {
@@ -1984,19 +1984,21 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	var multiRelay, realTime bool
+	var marketAvailable, multiRelay, realTime bool
 
 	if !disableEthgasMarketAPI {
 		market, marketErr := api.getMarketForSlot(slot)
 		if marketErr != nil {
-			log.WithError(marketErr).Warn("failed to fetch market info; defaulting to single relay behavior")
+			log.WithError(marketErr).Warn("failed to fetch market info; bid value left unchanged")
 		} else if market != nil {
+			marketAvailable = true
 			multiRelay = market.MultiRelay
 			realTime = market.RealTime
 		}
 	}
 	log = log.WithField("multiRelay", multiRelay)
 	log = log.WithField("realTime", realTime)
+	log = log.WithField("marketAvailable", marketAvailable)
 
 	// if bid == nil || bid.IsEmpty() {
 	// 	// Check cache first
@@ -2032,7 +2034,7 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 	// }
 
 	// Single-relay markets add 11000 ETH; realtime multi-relay markets apply the multiplier.
-	if !disableEthgasMarketAPI && (!multiRelay || realTime) {
+	if !disableEthgasMarketAPI && marketAvailable && (!multiRelay || realTime) {
 		if bid.Capella != nil {
 			actualValue := bid.Capella.Message.Value
 			totalValue := actualValue
@@ -2202,6 +2204,8 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 		}
 	} else if disableEthgasMarketAPI {
 		log.Debug("ETHGas market API disabled; bid value left unchanged")
+	} else if !marketAvailable {
+		log.Debug("market info unavailable; bid value left unchanged")
 	} else {
 		log.Debug("non-realtime multiRelay market; bid value left unchanged")
 	}
@@ -4438,8 +4442,13 @@ func requestWholeBlockMarket(apiURL string, slot uint64) (*WholeBlockMarket, int
 		return nil, resp.StatusCode, fmt.Errorf("failed to decode market data: %w", err)
 	}
 
-	m := marketResp.Markets
-	return &m, resp.StatusCode, nil
+	if marketResp.Markets == nil || marketResp.Markets.Slot == 0 {
+		return nil, resp.StatusCode, nil
+	}
+	if marketResp.Markets.Slot != slot {
+		return nil, resp.StatusCode, fmt.Errorf("market response slot %d does not match requested slot %d", marketResp.Markets.Slot, slot)
+	}
+	return marketResp.Markets, resp.StatusCode, nil
 }
 func (c *ApiClient) Login(privateKey string) (string, string, error) {
 	// Check cache first
@@ -4891,16 +4900,12 @@ func (api *RelayAPI) getMarketForSlot(slot uint64) (*WholeBlockMarket, error) {
 
 	market, err := FetchWholeBlockMarket(exchangeAPIURL, slot)
 	cacheDuration := time.Duration(common.SecondsPerSlot) * time.Second
-	defaultEntry := &marketCacheEntry{
-		value: &WholeBlockMarket{
-			Slot:       slot,
-			MultiRelay: false,
-		},
-		expiration: time.Now().Add(cacheDuration),
-	}
 	if err != nil || market == nil {
-		api.marketCache.Store(slot, defaultEntry)
-		return defaultEntry.value, err
+		// Cache absence without inventing a single-relay market.
+		api.marketCache.Store(slot, &marketCacheEntry{
+			expiration: time.Now().Add(cacheDuration),
+		})
+		return nil, err
 	}
 
 	api.marketCache.Store(slot, &marketCacheEntry{
