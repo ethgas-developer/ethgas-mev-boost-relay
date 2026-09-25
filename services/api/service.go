@@ -279,8 +279,8 @@ type WholeBlockMarket struct {
 	FinalityTime     int64  `json:"finalityTime"`
 	UpdateDate       int64  `json:"updateDate"`
 	OFAC             bool   `json:"ofac"`
-	MultiRelay       bool   `json:"multiRelay"`
-	RealTime         bool   `json:"realtime"`
+	MultiRelay       *bool  `json:"multiRelay"` // nil means the market mode is unknown.
+	RealTime         *bool  `json:"realtime"` // nil means the market mode is unknown.
 }
 
 // Define the slotBundle type at the top of the file
@@ -1990,10 +1990,10 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 		market, marketErr := api.getMarketForSlot(slot)
 		if marketErr != nil {
 			log.WithError(marketErr).Warn("failed to fetch market info; bid value left unchanged")
-		} else if market != nil {
+		} else if market != nil && market.MultiRelay != nil && market.RealTime != nil {
 			marketAvailable = true
-			multiRelay = market.MultiRelay
-			realTime = market.RealTime
+			multiRelay = *market.MultiRelay
+			realTime = *market.RealTime
 		}
 	}
 	log = log.WithField("multiRelay", multiRelay)
@@ -4440,6 +4440,12 @@ func requestWholeBlockMarket(apiURL string, slot uint64) (*WholeBlockMarket, int
 	}
 	if marketResp.Markets.Slot != slot {
 		return nil, resp.StatusCode, fmt.Errorf("market response slot %d does not match requested slot %d", marketResp.Markets.Slot, slot)
+	}
+	if marketResp.Markets.MultiRelay == nil {
+		return nil, resp.StatusCode, fmt.Errorf("market response for slot %d has unknown multiRelay mode", slot)
+	}
+	if marketResp.Markets.RealTime == nil {
+		return nil, resp.StatusCode, fmt.Errorf("market response for slot %d has unknown realtime mode", slot)
 	}
 	return marketResp.Markets, resp.StatusCode, nil
 }
