@@ -5002,9 +5002,15 @@ func (api *RelayAPI) processValidatorRegistrationsSSZ(regs []*builderApiV1.Signe
 			// See if we can discard (if no fields changed, or old timestamp)
 			isChangedFeeRecipient := cachedRegistrationData.FeeRecipient != signedValidatorRegistration.Message.FeeRecipient
 			isChangedGasLimit := cachedRegistrationData.GasLimit != signedValidatorRegistration.Message.GasLimit
+			isNewerTimestamp := signedValidatorRegistration.Message.Timestamp.After(cachedRegistrationData.Timestamp)
 			isTimestampStale := time.Now().UTC().Sub(cachedRegistrationData.InsertedAt) >= validatorRegistrationRefreshInterval
 			// If key fields haven't changed, can just discard without signature validation
 			if !isChangedFeeRecipient && !isChangedGasLimit && !isTimestampStale {
+				continue
+			}
+
+			// Ensure it's not a replay of an old registration, even when the cache is stale.
+			if !isNewerTimestamp {
 				continue
 			}
 		}

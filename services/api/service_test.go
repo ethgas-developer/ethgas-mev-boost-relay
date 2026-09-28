@@ -256,7 +256,7 @@ func TestGetHeader(t *testing.T) {
 		Version:        spec.DataVersionCapella,
 	}
 	payload, getPayloadResp, getHeaderResp := common.CreateTestBlockSubmission(t, builderPubkey, bidValue, &opts)
-	_, err := backend.redis.SaveBidAndUpdateTopBid(t.Context(), backend.redis.NewPipeline(), trace, payload, getPayloadResp, getHeaderResp, time.Now(), false, nil)
+	_, err := backend.redis.SaveBidAndUpdateTopBid(t.Context(), backend.redis.NewPipeline(), trace, payload, getPayloadResp, getHeaderResp, time.Now(), false, nil, true)
 	require.NoError(t, err)
 
 	// Check 1: regular capella request works and returns a bid
@@ -279,7 +279,7 @@ func TestGetHeader(t *testing.T) {
 		Version:        spec.DataVersionDeneb,
 	}
 	payload, getPayloadResp, getHeaderResp = common.CreateTestBlockSubmission(t, builderPubkey, bidValue, &opts)
-	_, err = backend.redis.SaveBidAndUpdateTopBid(t.Context(), backend.redis.NewPipeline(), trace, payload, getPayloadResp, getHeaderResp, time.Now(), false, nil)
+	_, err = backend.redis.SaveBidAndUpdateTopBid(t.Context(), backend.redis.NewPipeline(), trace, payload, getPayloadResp, getHeaderResp, time.Now(), false, nil, true)
 	require.NoError(t, err)
 
 	// Check 2: regular deneb request works and returns a bid
@@ -642,7 +642,7 @@ func TestCheckSubmissionFeeRecipient(t *testing.T) {
 			log := logrus.NewEntry(logger)
 			submission, err := common.GetBlockSubmissionInfo(tc.payload)
 			require.NoError(t, err)
-			gasLimit, ok := backend.relay.checkSubmissionFeeRecipient(w, log, submission.BidTrace)
+			gasLimit, ok := backend.relay.checkSubmissionFeeRecipient(w, log, submission.BidTrace, "", submission.BidTrace.BuilderPubkey.String())
 			require.Equal(t, tc.expectGasLimit, gasLimit)
 			require.Equal(t, tc.expectOk, ok)
 		})

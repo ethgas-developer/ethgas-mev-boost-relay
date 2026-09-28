@@ -199,3 +199,7 @@ func (db MockDB) InsertTooLateGetPayload(slot uint64, proposerPubkey, blockHash 
 func (db MockDB) InsertGetPayload(slot uint64, proposerPubkey, blockHash string, slotStart, requestTime, decodeTime, msIntoSlot uint64) error {
 	return nil
 }
+
+func (db MockDB) InsertBlockPublish(slot int64, beaconIP string, slotStartTimestamp, publishTimestamp, finishTimestamp int64, blockHash string, msIntoSlot int64) error {
+	return nil
+}
