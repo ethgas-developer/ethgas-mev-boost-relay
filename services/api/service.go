@@ -289,6 +289,7 @@ type WholeBlockMarket struct {
 // }
 
 type PreconfBundles struct {
+	Slot         *uint64         `json:"slot"`
 	Bundles      []PreconfBundle `json:"bundles"`
 	EmptySpace   int             `json:"emptySpace,omitempty"`
 	FeeRecipient string          `json:"feeRecipient,omitempty"`
@@ -3307,6 +3308,13 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 					if fetchErr == nil && preconfBundles == nil {
 						fetchErr = errors.New("slot bundles response has no data")
 					}
+					if fetchErr == nil {
+						if preconfBundles.Slot == nil {
+							fetchErr = errors.New("slot bundles response has no slot")
+						} else if *preconfBundles.Slot != submission.BidTrace.Slot {
+							fetchErr = fmt.Errorf("slot bundles response slot %d does not match requested slot %d", *preconfBundles.Slot, submission.BidTrace.Slot)
+						}
+					}
 				}
 				if fetchErr != nil {
 					// Fail open without caching an empty response, so later submissions
@@ -4347,6 +4355,12 @@ func FetchBuilderPubKey(apiURL string, slot uint64) (*BuilderResponse, error) {
 	}
 
 	// Validate required fields
+	if builderResp.Slot == 0 {
+		return nil, errors.New("builder response has no slot")
+	}
+	if builderResp.Slot != slot {
+		return nil, fmt.Errorf("builder response slot %d does not match requested slot %d", builderResp.Slot, slot)
+	}
 	if len(builderResp.Builders) == 0 && builderResp.FallbackBuilder == "" {
 		return nil, fmt.Errorf("invalid builder response: missing required fields")
 	}
