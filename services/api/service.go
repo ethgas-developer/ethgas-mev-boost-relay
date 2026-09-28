@@ -2971,8 +2971,6 @@ func (api *RelayAPI) checkFloorBidValue(opts bidFloorOpts) (*big.Int, bool) {
 	slotLastPayloadDelivered, err := api.redis.GetLastSlotDelivered(context.Background(), opts.tx)
 	if err != nil && !errors.Is(err, redis.Nil) {
 		opts.log.WithError(err).Error("failed to get delivered payload slot from redis")
-	} else if opts.submission.BidTrace.Slot == slotLastPayloadDelivered {
-		opts.log.Info("allow submission but payload for this slot was already delivered")
 	} else if opts.submission.BidTrace.Slot <= slotLastPayloadDelivered {
 		opts.log.Info("rejecting submission because payload for this slot was already delivered")
 		api.RespondError(opts.w, http.StatusBadRequest, "payload for this slot was already delivered")
@@ -3703,32 +3701,28 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 			builderEntry.collateral.Cmp(submission.BidTrace.Value.ToBig()) >= 0 &&
 			submission.BidTrace.Slot == api.optimisticSlot.Load())
 	pf.Optimistic = optimistic
-	slotLastPayloadDelivered, err := api.redis.GetLastSlotDelivered(context.Background(), tx)
-	//no need simulate if the block is already delivered
-	if (err != nil && !errors.Is(err, redis.Nil)) || submission.BidTrace.Slot != slotLastPayloadDelivered {
-		if optimistic {
-			go api.processOptimisticBlock(opts, simResultC)
-		} else {
-			// Simulate block (synchronously).
-			blockValue, requestErr, validationErr := api.simulateBlock(context.Background(), opts) // success/error logging happens inside
-			simResultC <- &blockSimResult{requestErr == nil, blockValue, false, requestErr, validationErr}
-			validationDurationMs := time.Since(timeBeforeValidation).Milliseconds()
-			log = log.WithFields(logrus.Fields{
-				"timestampAfterValidation": time.Now().UTC().UnixMilli(),
-				"validationDurationMs":     validationDurationMs,
-			})
-			if requestErr != nil { // Request error
-				if os.IsTimeout(requestErr) {
-					api.RespondError(w, http.StatusGatewayTimeout, "validation request timeout")
-				} else {
-					api.RespondError(w, http.StatusBadRequest, requestErr.Error())
-				}
-				return
+	if optimistic {
+		go api.processOptimisticBlock(opts, simResultC)
+	} else {
+		// Simulate block (synchronously).
+		blockValue, requestErr, validationErr := api.simulateBlock(context.Background(), opts) // success/error logging happens inside
+		simResultC <- &blockSimResult{requestErr == nil, blockValue, false, requestErr, validationErr}
+		validationDurationMs := time.Since(timeBeforeValidation).Milliseconds()
+		log = log.WithFields(logrus.Fields{
+			"timestampAfterValidation": time.Now().UTC().UnixMilli(),
+			"validationDurationMs":     validationDurationMs,
+		})
+		if requestErr != nil { // Request error
+			if os.IsTimeout(requestErr) {
+				api.RespondError(w, http.StatusGatewayTimeout, "validation request timeout")
 			} else {
-				if validationErr != nil {
-					api.RespondError(w, http.StatusBadRequest, validationErr.Error())
-					return
-				}
+				api.RespondError(w, http.StatusBadRequest, requestErr.Error())
+			}
+			return
+		} else {
+			if validationErr != nil {
+				api.RespondError(w, http.StatusBadRequest, validationErr.Error())
+				return
 			}
 		}
 	}
