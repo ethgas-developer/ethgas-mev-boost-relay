@@ -174,7 +174,7 @@ func TestBuilderBids(t *testing.T) {
 		}
 
 		// deleting a bid that doesn't exist should not error
-		err := cache.DelBuilderBid(t.Context(), cache.client.Pipeline(), slot, parentHash, proposerPubkey, bApubkey)
+		err := cache.DelBuilderBid(t.Context(), cache.client.Pipeline(), slot, parentHash, proposerPubkey, bApubkey, true)
 		require.NoError(t, err)
 
 		// submit ba1=10
@@ -189,7 +189,7 @@ func TestBuilderBids(t *testing.T) {
 		ensureBidFloor(10)
 
 		// deleting ba1
-		err = cache.DelBuilderBid(t.Context(), cache.client.Pipeline(), slot, parentHash, proposerPubkey, bApubkey)
+		err = cache.DelBuilderBid(t.Context(), cache.client.Pipeline(), slot, parentHash, proposerPubkey, bApubkey, true)
 		require.NoError(t, err)
 
 		// best bid and floor should still exist, because it was the floor bid

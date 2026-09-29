@@ -2963,6 +2963,7 @@ type bidFloorOpts struct {
 	tx                   redis.Pipeliner
 	log                  *logrus.Entry
 	cancellationsEnabled bool
+	isValidPreconf       bool
 	simResultC           chan *blockSimResult
 	submission           *common.BlockSubmissionInfo
 }
@@ -2994,7 +2995,11 @@ func (api *RelayAPI) checkFloorBidValue(opts bidFloorOpts) (*big.Int, bool) {
 	if opts.cancellationsEnabled && isBidBelowFloor { // with cancellations: if below floor -> delete previous bid
 		opts.simResultC <- &blockSimResult{false, nil, false, nil, nil}
 		opts.log.Info("submission below floor bid value, with cancellation")
-		err := api.redis.DelBuilderBid(context.Background(), opts.tx, opts.submission.BidTrace.Slot, opts.submission.BidTrace.ParentHash.String(), opts.submission.BidTrace.ProposerPubkey.String(), opts.submission.BidTrace.BuilderPubkey.String())
+		err := api.redis.DelBuilderBid(context.Background(), opts.tx, opts.submission.BidTrace.Slot, opts.submission.BidTrace.ParentHash.String(), opts.submission.BidTrace.ProposerPubkey.String(), opts.submission.BidTrace.BuilderPubkey.String(), opts.isValidPreconf)
+		if errors.Is(err, datastore.ErrInvalidPreconfReplacement) {
+			api.RespondError(opts.w, http.StatusBadRequest, err.Error())
+			return nil, false
+		}
 		if err != nil {
 			opts.log.WithError(err).Error("failed processing cancellable bid below floor")
 			api.RespondError(opts.w, http.StatusInternalServerError, "failed processing cancellable bid below floor")
@@ -3058,6 +3063,10 @@ func (api *RelayAPI) updateRedisBid(opts redisUpdateBidOpts) (*datastore.SaveBid
 	// Save to Redis
 	//
 	updateBidResult, err := api.redis.SaveBidAndUpdateTopBid(context.Background(), opts.tx, &bidTrace, opts.payload, getPayloadResponse, getHeaderResponse, opts.receivedAt, opts.cancellationsEnabled, opts.floorBidValue, opts.isValidPreconf)
+	if errors.Is(err, datastore.ErrInvalidPreconfReplacement) {
+		api.RespondError(opts.w, http.StatusBadRequest, err.Error())
+		return nil, nil, false
+	}
 	if err != nil {
 		opts.log.WithError(err).Error("could not save bid and update top bids")
 		api.RespondError(opts.w, http.StatusInternalServerError, "failed saving and updating bid")
@@ -3612,6 +3621,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		tx:                   tx,
 		log:                  log,
 		cancellationsEnabled: isCancellationEnabled,
+		isValidPreconf:       isValidPreconf == "",
 		simResultC:           simResultC,
 		submission:           submission,
 	}
