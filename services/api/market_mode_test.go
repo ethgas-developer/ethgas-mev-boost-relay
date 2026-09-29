@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -64,7 +65,13 @@ func TestGetHeaderMarketMode(t *testing.T) {
 		status       int
 		cachedMarket *WholeBlockMarket
 		wantValue    string
+		missingToken bool
+		transport    http.RoundTripper
 	}{
+		{name: "no exchange token", missingToken: true, transport: exchangeTestTransport(func(*http.Request) (*http.Response, error) { panic("request path must not attempt login") }), wantValue: "99"},
+		{name: "expired exchange token", status: http.StatusUnauthorized, body: `{}`, wantValue: "99"},
+		{name: "exchange connection refused", transport: exchangeTestTransport(func(*http.Request) (*http.Response, error) { return nil, errors.New("connection refused") }), wantValue: "99"},
+		{name: "exchange response stalls", transport: exchangeTestTransport(func(r *http.Request) (*http.Response, error) { <-r.Context().Done(); return nil, r.Context().Err() }), wantValue: "99"},
 		{name: "missing mode", body: `{"success":true,"data":{"markets":{"slot":42}}}`, wantValue: "99"},
 		{name: "null mode", body: `{"success":true,"data":{"markets":{"slot":42,"multiRelay":null,"realtime":true}}}`, wantValue: "99"},
 		{name: "unknown mode with realtime", body: `{"success":true,"data":{"markets":{"slot":42,"realtime":true}}}`, wantValue: "99"},
@@ -90,7 +97,14 @@ func TestGetHeaderMarketMode(t *testing.T) {
 			if status == 0 {
 				status = http.StatusOK
 			}
-			client = &ApiClient{AccessToken: "test-token", Client: &http.Client{Transport: marketModeTransport{status: status, body: tc.body}}}
+			transport := tc.transport
+			if transport == nil {
+				transport = marketModeTransport{status: status, body: tc.body}
+			}
+			client = &ApiClient{AccessToken: "test-token", Client: &http.Client{Transport: transport}}
+			if tc.missingToken {
+				client.AccessToken = ""
+			}
 			redisServer := miniredis.RunT(t)
 			cache, err := datastore.NewRedisCache("", redisServer.Addr(), "")
 			require.NoError(t, err)
@@ -118,7 +132,9 @@ func TestGetHeaderMarketMode(t *testing.T) {
 			req := mux.SetURLVars(httptest.NewRequest(http.MethodGet, "/eth/v1/builder/header/42/"+parent+"/"+proposer, nil), map[string]string{"slot": "42", "parent_hash": parent, "pubkey": proposer})
 			req.Header.Set("Accept", common.ApplicationJSON)
 			rr := httptest.NewRecorder()
+			start := time.Now()
 			api.handleGetHeader(rr, req)
+			require.Less(t, time.Since(start), 750*time.Millisecond, "exchange outages must not exhaust the proposer deadline")
 			require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
 			var response builderSpec.VersionedSignedBuilderBid
 			require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &response))

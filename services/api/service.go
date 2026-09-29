@@ -35,9 +35,6 @@ import (
 	"github.com/NYTimes/gziphandler"
 	"github.com/aohorodnyk/mimeheader"
 	builderApi "github.com/attestantio/go-builder-client/api"
-	builderApiCapella "github.com/attestantio/go-builder-client/api/capella"
-	builderApiDeneb "github.com/attestantio/go-builder-client/api/deneb"
-	builderApiElectra "github.com/attestantio/go-builder-client/api/electra"
 
 	builderApiV1 "github.com/attestantio/go-builder-client/api/v1"
 	"github.com/attestantio/go-eth2-client/spec"
@@ -81,14 +78,15 @@ const (
 )
 
 var (
-	ErrMissingLogOpt              = errors.New("log parameter is nil")
-	ErrMissingBeaconClientOpt     = errors.New("beacon-client is nil")
-	ErrMissingDatastoreOpt        = errors.New("proposer datastore is nil")
-	ErrRelayPubkeyMismatch        = errors.New("relay pubkey does not match existing one")
-	ErrServerAlreadyStarted       = errors.New("server was already started")
-	ErrBuilderAPIWithoutSecretKey = errors.New("cannot start builder API without secret key")
-	ErrNegativeTimestamp          = errors.New("timestamp cannot be negative")
-	ErrInvalidForkVersion         = errors.New("invalid fork version")
+	ErrMissingLogOpt                    = errors.New("log parameter is nil")
+	ErrMissingBeaconClientOpt           = errors.New("beacon-client is nil")
+	ErrMissingDatastoreOpt              = errors.New("proposer datastore is nil")
+	ErrRelayPubkeyMismatch              = errors.New("relay pubkey does not match existing one")
+	ErrServerAlreadyStarted             = errors.New("server was already started")
+	ErrBuilderAPIWithoutSecretKey       = errors.New("cannot start builder API without secret key")
+	ErrHeaderAdjustmentWithoutSecretKey = errors.New("cannot enable ETHGas header adjustments on proposer API without secret key")
+	ErrNegativeTimestamp                = errors.New("timestamp cannot be negative")
+	ErrInvalidForkVersion               = errors.New("invalid fork version")
 )
 
 var (
@@ -223,7 +221,10 @@ type ApiClient struct {
 	ChainID      string
 	Client       *http.Client
 	AccessToken  string
-	RefreshToken string // Keeping this as a field for storing the refresh token
+	RefreshToken string
+
+	tokenMutex sync.RWMutex
+	authOnce   sync.Once
 }
 
 // LoginResponse represents the login response structure
@@ -280,7 +281,7 @@ type WholeBlockMarket struct {
 	UpdateDate       int64  `json:"updateDate"`
 	OFAC             bool   `json:"ofac"`
 	MultiRelay       *bool  `json:"multiRelay"` // nil means the market mode is unknown.
-	RealTime         *bool  `json:"realtime"` // nil means the market mode is unknown.
+	RealTime         *bool  `json:"realtime"`   // nil means the market mode is unknown.
 }
 
 // Define the slotBundle type at the top of the file
@@ -703,14 +704,17 @@ func NewRelayAPI(opts RelayAPIOpts) (api *RelayAPI, err error) {
 		return nil, ErrMissingDatastoreOpt
 	}
 
-	// If block-builder API is enabled, then ensure secret key is all set
-	var publicKey phase0.BLSPubKey
-	if opts.BlockBuilderAPI {
-		if opts.SecretKey == nil {
-			return nil, ErrBuilderAPIWithoutSecretKey
-		}
+	// Both block submission and ETHGas header adjustment require a signing key.
+	if opts.BlockBuilderAPI && opts.SecretKey == nil {
+		return nil, ErrBuilderAPIWithoutSecretKey
+	}
+	if opts.ProposerAPI && !disableEthgasMarketAPI && opts.SecretKey == nil {
+		return nil, ErrHeaderAdjustmentWithoutSecretKey
+	}
 
-		// If using a secret key, ensure it's the correct one
+	var publicKey phase0.BLSPubKey
+	if opts.SecretKey != nil && (opts.BlockBuilderAPI || opts.ProposerAPI) {
+		// Initialize the identity in proposer-only processes as well.
 		blsPubkey, err := bls.PublicKeyFromSecretKey(opts.SecretKey)
 		if err != nil {
 			return nil, err
@@ -800,7 +804,7 @@ func NewRelayAPI(opts RelayAPIOpts) (api *RelayAPI, err error) {
 		api.ffDisableDemotion = true
 	}
 	if !disableEthgasMarketAPI {
-		go InitLoginAndStartTokenRefresh()
+		InitLoginAndStartTokenRefresh()
 	}
 
 	// Start the exchange API health check
@@ -2053,13 +2057,8 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 
 			bid.Capella.Message.Pubkey = *api.publicKey
 
-			builderBid := builderApiCapella.BuilderBid{
-				Value:  bid.Capella.Message.Value,
-				Header: bid.Capella.Message.Header,
-				Pubkey: *api.publicKey,
-			}
-
-			signature, err := ssz.SignMessage(&builderBid, api.opts.EthNetDetails.DomainBuilder, api.blsSk)
+			// Sign the exact outgoing message, including all fork-specific fields.
+			signature, err := ssz.SignMessage(bid.Capella.Message, api.opts.EthNetDetails.DomainBuilder, api.blsSk)
 
 			if err != nil {
 				log.WithError(err).Error("failed to signature bid")
@@ -2095,13 +2094,8 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 			bid.Deneb.Message.Value = totalValue
 			bid.Deneb.Message.Pubkey = *api.publicKey
 
-			builderBid := builderApiDeneb.BuilderBid{
-				Value:  bid.Deneb.Message.Value,
-				Header: bid.Deneb.Message.Header,
-				Pubkey: *api.publicKey,
-			}
-
-			signature, err := ssz.SignMessage(&builderBid, api.opts.EthNetDetails.DomainBuilder, api.blsSk)
+			// Sign the exact outgoing message, including all fork-specific fields.
+			signature, err := ssz.SignMessage(bid.Deneb.Message, api.opts.EthNetDetails.DomainBuilder, api.blsSk)
 			if err != nil {
 				log.WithError(err).Error("failed to signature bid")
 				api.RespondError(w, http.StatusInternalServerError, "failed to signature bid")
@@ -2134,15 +2128,8 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 			bid.Electra.Message.Value = totalValue
 			bid.Electra.Message.Pubkey = *api.publicKey
 
-			builderBid := builderApiElectra.BuilderBid{
-				Value:              bid.Electra.Message.Value,
-				Header:             bid.Electra.Message.Header,
-				ExecutionRequests:  bid.Electra.Message.ExecutionRequests,
-				BlobKZGCommitments: bid.Electra.Message.BlobKZGCommitments,
-				Pubkey:             *api.publicKey,
-			}
-
-			signature, err := ssz.SignMessage(&builderBid, api.opts.EthNetDetails.DomainBuilder, api.blsSk)
+			// Sign the exact outgoing message, including all fork-specific fields.
+			signature, err := ssz.SignMessage(bid.Electra.Message, api.opts.EthNetDetails.DomainBuilder, api.blsSk)
 			if err != nil {
 				log.WithError(err).Error("failed to signature bid")
 				api.RespondError(w, http.StatusInternalServerError, "failed to signature bid")
@@ -2176,15 +2163,8 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 			bid.Fulu.Message.Value = totalValue
 			bid.Fulu.Message.Pubkey = *api.publicKey
 
-			builderBid := builderApiElectra.BuilderBid{
-				Value:              bid.Fulu.Message.Value,
-				Header:             bid.Fulu.Message.Header,
-				ExecutionRequests:  bid.Fulu.Message.ExecutionRequests,
-				BlobKZGCommitments: bid.Fulu.Message.BlobKZGCommitments,
-				Pubkey:             *api.publicKey,
-			}
-
-			signature, err := ssz.SignMessage(&builderBid, api.opts.EthNetDetails.DomainBuilder, api.blsSk)
+			// Sign the exact outgoing message, including all fork-specific fields.
+			signature, err := ssz.SignMessage(bid.Fulu.Message, api.opts.EthNetDetails.DomainBuilder, api.blsSk)
 			if err != nil {
 				log.WithError(err).Error("failed to signature bid")
 				api.RespondError(w, http.StatusInternalServerError, "failed to signature bid")
@@ -3294,7 +3274,8 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 				bundleReq, fetchErr := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 				var apiResponse ApiResponse
 				if fetchErr == nil {
-					bundleReq.Header.Set("Authorization", "Bearer "+client.AccessToken)
+					accessToken, _ := client.tokens()
+					bundleReq.Header.Set("Authorization", "Bearer "+accessToken)
 					var resp *http.Response
 					resp, fetchErr = client.Client.Do(bundleReq)
 					if fetchErr == nil {
@@ -4378,49 +4359,56 @@ func FetchBuilderPubKey(apiURL string, slot uint64) (*BuilderResponse, error) {
 	return &builderResp, nil
 }
 
-func ensureExchangeClientLoggedIn() error {
-	if client.AccessToken != "" {
-		return nil
+// Market lookups share the proposer's short getHeader deadline. Authentication
+// retries belong to the background worker, never to this request path.
+const marketRequestTimeout = 200 * time.Millisecond
+
+func (c *ApiClient) tokens() (string, string) {
+	c.tokenMutex.RLock()
+	defer c.tokenMutex.RUnlock()
+	return c.AccessToken, c.RefreshToken
+}
+
+func (c *ApiClient) setTokens(accessToken, refreshToken string) {
+	c.tokenMutex.Lock()
+	defer c.tokenMutex.Unlock()
+	c.AccessToken, c.RefreshToken = accessToken, refreshToken
+}
+
+func (c *ApiClient) invalidateAccessToken(rejectedToken string) {
+	c.tokenMutex.Lock()
+	defer c.tokenMutex.Unlock()
+	// An in-flight request may have used a token that was already refreshed.
+	if c.AccessToken == rejectedToken {
+		c.AccessToken = ""
 	}
-	accessToken, refreshToken, err := client.Login(exchangeLoginPrivateKey)
-	if err != nil {
-		return fmt.Errorf("failed to login before fetching market data: %w", err)
-	}
-	if accessToken == "" || refreshToken == "" {
-		return fmt.Errorf("exchange login returned empty tokens")
-	}
-	return nil
 }
 
 func FetchWholeBlockMarket(apiURL string, slot uint64) (*WholeBlockMarket, error) {
-	if err := ensureExchangeClientLoggedIn(); err != nil {
-		return nil, err
+	c := client
+	accessToken, _ := c.tokens()
+	if accessToken == "" {
+		return nil, errors.New("exchange authentication unavailable; background login pending")
 	}
 
-	market, statusCode, err := requestWholeBlockMarket(apiURL, slot)
-	if err == nil || statusCode != http.StatusUnauthorized {
-		return market, err
+	ctx, cancel := context.WithTimeout(context.Background(), marketRequestTimeout)
+	defer cancel()
+	market, statusCode, err := c.requestWholeBlockMarket(ctx, apiURL, slot, accessToken)
+	if statusCode == http.StatusUnauthorized {
+		c.invalidateAccessToken(accessToken)
 	}
-
-	if err := client.RefreshAccessToken(); err != nil {
-		return nil, fmt.Errorf("failed to refresh access token while fetching market data: %w", err)
-	}
-
-	market, _, err = requestWholeBlockMarket(apiURL, slot)
 	return market, err
 }
 
-func requestWholeBlockMarket(apiURL string, slot uint64) (*WholeBlockMarket, int, error) {
+func (c *ApiClient) requestWholeBlockMarket(ctx context.Context, apiURL string, slot uint64, accessToken string) (*WholeBlockMarket, int, error) {
 	url := fmt.Sprintf("%s/api/v1/p/wholeblock/market?slot=%d", apiURL, slot)
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to create market request: %w", err)
 	}
-	if client.AccessToken != "" {
-		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", client.AccessToken))
-	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
 
-	resp, err := client.Client.Do(req)
+	resp, err := c.Client.Do(req)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to fetch market status: %w", err)
 	}
@@ -4476,6 +4464,7 @@ func (c *ApiClient) Login(privateKey string) (string, string, error) {
 			accessToken := loginCache.AccessToken
 			refreshToken := loginCache.RefreshToken
 			loginCache.mutex.RUnlock()
+			c.setTokens(accessToken, refreshToken)
 			return accessToken, refreshToken, nil
 		}
 	}
@@ -4606,9 +4595,12 @@ func (c *ApiClient) tryLogin(privateKey string) (string, string, error) {
 		return "", "", fmt.Errorf("failed to parse verify data: %w", err)
 	}
 
-	c.AccessToken = verifyData.AccessToken.Token
-	c.RefreshToken = c.extractRefreshToken(verifyResp)
-	return c.AccessToken, c.RefreshToken, nil
+	accessToken, refreshToken := verifyData.AccessToken.Token, c.extractRefreshToken(verifyResp)
+	if accessToken == "" || refreshToken == "" {
+		return "", "", errors.New("exchange login returned empty tokens")
+	}
+	c.setTokens(accessToken, refreshToken)
+	return accessToken, refreshToken, nil
 }
 
 // Update the RefreshAccessToken method to include retries
@@ -4632,7 +4624,8 @@ func (c *ApiClient) tryRefreshAccessToken() error {
 	refreshURL := fmt.Sprintf("%s/api/v1/user/login/refresh", c.APIURL)
 
 	formData := url.Values{}
-	formData.Set("refreshToken", c.RefreshToken)
+	_, refreshToken := c.tokens()
+	formData.Set("refreshToken", refreshToken)
 
 	req, err := http.NewRequest("POST", refreshURL, strings.NewReader(formData.Encode()))
 	if err != nil {
@@ -4667,8 +4660,10 @@ func (c *ApiClient) tryRefreshAccessToken() error {
 		return fmt.Errorf("failed to parse verify data: %w", err)
 	}
 
-	// Save new access token
-	c.AccessToken = verifyData.AccessToken.Token
+	if verifyData.AccessToken.Token == "" {
+		return errors.New("exchange refresh returned empty access token")
+	}
+	c.setTokens(verifyData.AccessToken.Token, refreshToken)
 	return nil
 }
 
@@ -4682,51 +4677,49 @@ func (c *ApiClient) extractRefreshToken(resp *http.Response) string {
 }
 
 func InitLoginAndStartTokenRefresh() {
-	// Perform the initial login to get tokens
-	// TODO config
-
-	// privateKey := "8ca6e6e33b2170de9e6ce76bbb5808f8d5ec3e112c2c72cd0b97614f00061f0e"
-
-	accessToken, refreshToken, err := client.Login(exchangeLoginPrivateKey)
-	if err != nil || accessToken == "" || refreshToken == "" {
-		log.Printf("Failed to login during initialization: %v", err)
-		return
-	}
-
-	// Start a goroutine to refresh the tokens every 30 minutes
-	go client.startTokenRefreshLoop()
-	go client.startDailyLoginLoop(exchangeLoginPrivateKey)
+	c, privateKey := client, exchangeLoginPrivateKey
+	c.authOnce.Do(func() {
+		go c.runExchangeAuthentication(context.Background(), privateKey)
+	})
 }
 
-// startTokenRefreshLoop refreshes access tokens every 30 minutes
-func (c *ApiClient) startTokenRefreshLoop() {
-	log.Println("Starting access token refresh loop...")
-	ticker := time.NewTicker(30 * time.Minute)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		err := c.RefreshAccessToken()
-		if err != nil {
-			log.Printf("Failed to refresh access token: %v", err)
+// A single worker owns login and refresh retries, including recovery after an
+// initial outage or a rejected access token. Readers only use ready tokens.
+func (c *ApiClient) runExchangeAuthentication(ctx context.Context, privateKey string) {
+	var nextRefresh, nextLogin time.Time
+	for {
+		accessToken, refreshToken := c.tokens()
+		if accessToken == "" || time.Now().After(nextRefresh) || time.Now().After(nextLogin) {
+			var err error
+			if refreshToken != "" && time.Now().Before(nextLogin) {
+				err = c.RefreshAccessToken()
+				if err != nil {
+					log.Printf("Failed to refresh exchange token: %v", err)
+					c.setTokens("", "")
+				}
+			}
+			if refreshToken == "" || err != nil || !time.Now().Before(nextLogin) {
+				// A failed refresh must not reload rejected tokens from the login cache.
+				if err != nil {
+					loginCache.mutex.Lock()
+					loginCache.AccessToken, loginCache.RefreshToken = "", ""
+					loginCache.mutex.Unlock()
+				}
+				_, _, err = c.Login(privateKey)
+				if err == nil {
+					nextLogin = time.Now().Add(24 * time.Hour)
+				}
+			}
+			if err != nil {
+				log.Printf("Failed to authenticate with exchange; will retry in background: %v", err)
+			} else {
+				nextRefresh = time.Now().Add(30 * time.Minute)
+			}
 		}
-	}
-}
-
-// Update the startDailyLoginLoop to handle failures better
-func (c *ApiClient) startDailyLoginLoop(privateKey string) {
-	log.Println("Starting daily login loop...")
-	ticker := time.NewTicker(24 * time.Hour)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		accessToken, refreshToken, err := c.Login(privateKey)
-		if err != nil {
-			log.Printf("Failed to login during daily refresh: %v", err)
-			continue
-		}
-		if accessToken == "" || refreshToken == "" {
-			log.Printf("Received empty tokens during daily refresh")
-			continue
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(retryDelay):
 		}
 	}
 }
