@@ -2505,6 +2505,7 @@ func (api *RelayAPI) innerHandleGetPayload(w http.ResponseWriter, req *http.Requ
 	log.Info("getPayload request received")
 
 	var getPayloadResp *builderApi.VersionedSubmitBlindedBlockResponse
+	var payloadRecovered bool
 	var msNeededForPublishing uint64
 
 	// Start persistence after the handler finishes populating the response data.
@@ -2553,6 +2554,13 @@ func (api *RelayAPI) innerHandleGetPayload(w http.ResponseWriter, req *http.Requ
 			"blockHash":     bidTrace.BlockHash,
 		})
 		log.Warn("demotion found in getPayload, inserting refund justification")
+
+		// Keep the demotion record for review when payload recovery failed.
+		// The deferred task also runs when getPayload returns an error.
+		if !payloadRecovered || getPayloadResp == nil {
+			log.WithField("incompleteRefundEvidence", true).Warn("skipping refund justification: execution payload was not recovered")
+			return
+		}
 
 		// Prepare refund data.
 		signedBeaconBlock, err := common.SignedBlindedBeaconBlockToBeaconBlock(payload, getPayloadResp)
@@ -2622,6 +2630,7 @@ func (api *RelayAPI) innerHandleGetPayload(w http.ResponseWriter, req *http.Requ
 	}
 
 	// Now we know this relay also has the payload
+	payloadRecovered = true
 	log = log.WithField("timestampAfterLoadResponse", time.Now().UTC().UnixMilli())
 
 	// Check whether getPayload has already been called -- TODO: do we need to allow multiple submissions of one blinded block?
