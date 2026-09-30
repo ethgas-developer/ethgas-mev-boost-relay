@@ -1885,7 +1885,7 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 	}
 
 	//Builder filter at submit block
-	// builderResp, err := FetchBuilderPubKey(exchangeAPIURL, slot)
+	// builderResp, err := FetchBuilderPubKey(req.Context(), exchangeAPIURL, slot)
 	// if err != nil {
 	// 	log.WithError(err).Error("failed to get builder id from API")
 	// 	builderResp = &BuilderResponse{
@@ -3233,7 +3233,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 
 		// If not in cache or expired, fetch the builder response
 		if builderResp == nil {
-			builderResp, err = FetchBuilderPubKey(exchangeAPIURL, slot)
+			builderResp, err = FetchBuilderPubKey(req.Context(), exchangeAPIURL, slot)
 			if err != nil {
 				log.WithError(err).Error("failed to get builder id from API")
 				builderResp = &BuilderResponse{
@@ -4303,14 +4303,21 @@ func (api *RelayAPI) handleReadyz(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
-// FetchBuilderPubKey fetches the builder and fallbackBuilder from the /builder/pubkey/:slot endpoint
-func FetchBuilderPubKey(apiURL string, slot uint64) (*BuilderResponse, error) {
-	// Construct the URL for the API request
-	// url := fmt.Sprintf("%s/api/p/builder/pubkey/%d", apiURL, slot)
+// Bound assignment lookups independently of the slot-bundle lookup that follows.
+const builderAssignmentRequestTimeout = 500 * time.Millisecond
+
+// FetchBuilderPubKey fetches the assigned builders within the submission context
+// and a fixed deadline, including reading the response body.
+func FetchBuilderPubKey(ctx context.Context, apiURL string, slot uint64) (*BuilderResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, builderAssignmentRequestTimeout)
+	defer cancel()
 	url := fmt.Sprintf("%s/api/v1/p/builder/%d", apiURL, slot)
 
-	// Send HTTP GET request
-	resp, err := http.Get(url)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create builder assignment request: %w", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch builder pubkey: %w", err)
 	}
