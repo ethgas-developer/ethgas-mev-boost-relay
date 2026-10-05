@@ -211,6 +211,51 @@ func TestMigrations(t *testing.T) {
 	require.Len(t, migrations.Migrations.Migrations, rowCount)
 }
 
+func TestExecutionPayloadUpsertPrefersCompleteGloas(t *testing.T) {
+	db := resetDatabase(t)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+
+	entry := ExecutionPayloadEntry{
+		Slot:           slot,
+		ProposerPubkey: "0xproposer",
+		BlockHash:      blockHashStr,
+	}
+	upsert := func(version, payload string) int64 {
+		t.Helper()
+		entry.Version = version
+		entry.Payload = payload
+		var id int64
+		require.NoError(t, db.nstmtInsertExecutionPayload.QueryRow(&entry).Scan(&id))
+		return id
+	}
+	assertStored := func(version, payload string) {
+		t.Helper()
+		stored, err := db.GetExecutionPayloadEntryBySlotPkHash(entry.Slot, entry.ProposerPubkey, entry.BlockHash)
+		require.NoError(t, err)
+		require.Equal(t, version, stored.Version)
+		require.JSONEq(t, payload, stored.Payload)
+	}
+
+	fuluPayload := `{"stage":"fulu"}`
+	firstID := upsert(common.ForkVersionStringFulu, fuluPayload)
+	assertStored(common.ForkVersionStringFulu, fuluPayload)
+
+	// A Gloas submission upgrades a compatibility payload with the complete V6
+	// representation, including all five execution-request lists.
+	firstGloasPayload := `{"stage":"gloas-invalid-retry","execution_requests":{"builder_deposits":[],"builder_exits":[]}}`
+	require.Equal(t, firstID, upsert(common.ForkVersionStringGloas, firstGloasPayload))
+	assertStored(common.ForkVersionStringGloas, firstGloasPayload)
+
+	// A later compatibility write must not discard the complete Gloas payload.
+	require.Equal(t, firstID, upsert(common.ForkVersionStringFulu, `{"stage":"late-fulu"}`))
+	assertStored(common.ForkVersionStringGloas, firstGloasPayload)
+
+	// A same-Gloas retry refreshes an earlier rejected/incomplete submission.
+	completeGloasPayload := `{"stage":"gloas-valid-retry","execution_requests":{"builder_deposits":[{"amount":"1"}],"builder_exits":[]}}`
+	require.Equal(t, firstID, upsert(common.ForkVersionStringGloas, completeGloasPayload))
+	assertStored(common.ForkVersionStringGloas, completeGloasPayload)
+}
+
 func TestSetBlockBuilderStatus(t *testing.T) {
 	db := resetDatabase(t)
 	// Four test builders, 2 with matching builder id, 2 with no builder id.

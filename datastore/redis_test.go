@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math/big"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -32,6 +33,55 @@ func setupTestRedis(t *testing.T) *RedisCache {
 	require.NoError(t, err)
 
 	return redisService
+}
+
+func TestGloasPayloadPersistence(t *testing.T) {
+	cache := setupTestRedis(t)
+	payload, _, _ := common.CreateTestBlockSubmission(t, common.ValidPayloadRegisterValidator.Message.Pubkey.String(), uint256.NewInt(10), &common.CreateTestBlockSubmissionOpts{
+		Slot:    42,
+		Version: spec.DataVersionFulu,
+	})
+	gloasPayload, err := common.NewExecutionPayloadGloas(payload.Fulu.ExecutionPayload, []byte{0xc0}, 42)
+	require.NoError(t, err)
+	executionRequests := common.NewExecutionRequestsGloas(payload.Fulu.ExecutionRequests)
+	executionRequests.BuilderDeposits = []*common.BuilderDepositRequestGloas{{Amount: 1}}
+	executionRequests.BuilderExits = []*common.BuilderExitRequestGloas{{}}
+	submission, err := common.GetBlockSubmissionInfo(payload)
+	require.NoError(t, err)
+	entry := &common.GloasPayloadCacheEntry{
+		Slot:         42,
+		BlockHash:    gloasPayload.BlockHash,
+		FeeRecipient: submission.BidTrace.ProposerFeeRecipient,
+		BidTrace: &common.BidTraceV2WithBlobFields{
+			BidTrace:    *submission.BidTrace,
+			BlockNumber: submission.BlockNumber,
+		},
+		Contents: &common.GloasPayloadContents{
+			ExecutionPayload:  gloasPayload,
+			BlobsBundle:       payload.Fulu.BlobsBundle,
+			ExecutionRequests: executionRequests,
+		},
+	}
+	require.NoError(t, cache.SaveGloasPayload(entry))
+
+	stored, err := cache.GetGloasPayload(42, strings.ToUpper(gloasPayload.BlockHash.String()))
+	require.NoError(t, err)
+	require.Equal(t, entry, stored)
+	require.Equal(t, common.HexBytes{0xc0}, stored.Contents.ExecutionPayload.BlockAccessList)
+	require.Equal(t, phase0.Slot(42), stored.Contents.ExecutionPayload.SlotNumber)
+	require.Equal(t, executionRequests, stored.Contents.ExecutionRequests)
+
+	selection := &common.GloasSelectedPayloadCacheEntry{
+		BlockHash: gloasPayload.BlockHash,
+		Bid: &common.SignedExecutionPayloadBid{Message: &common.ExecutionPayloadBid{
+			BlockHash: gloasPayload.BlockHash,
+			Slot:      42,
+		}},
+	}
+	require.NoError(t, cache.SaveGloasSelectedPayload(42, selection))
+	storedSelection, err := cache.GetGloasSelectedPayload(42)
+	require.NoError(t, err)
+	require.Equal(t, selection, storedSelection)
 }
 
 func TestRedisValidatorRegistration(t *testing.T) {

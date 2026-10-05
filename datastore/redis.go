@@ -96,9 +96,11 @@ type RedisCache struct {
 	prefixTopBidValue                 string
 	prefixFloorBid                    string
 	prefixFloorBidValue               string
+	prefixGloasPayload                string
+	prefixGloasSelectedPayload        string
 
 	// keys
-	keyValidatorRegistrationData string
+	keyValidatorRegistrationData      string
 	keyValidatorRegistrationTimestamp string
 
 	keyRelayConfig        string
@@ -140,10 +142,12 @@ func NewRedisCache(prefix, redisURI, readonlyURI string) (*RedisCache, error) {
 		prefixTopBidValue:                 fmt.Sprintf("%s/%s:top-bid-value", redisPrefix, prefix),                  // prefix:slot_parentHash_proposerPubkey
 		prefixFloorBid:                    fmt.Sprintf("%s/%s:bid-floor", redisPrefix, prefix),                      // prefix:slot_parentHash_proposerPubkey
 		prefixFloorBidValue:               fmt.Sprintf("%s/%s:bid-floor-value", redisPrefix, prefix),                // prefix:slot_parentHash_proposerPubkey
+		prefixGloasPayload:                fmt.Sprintf("%s/%s:gloas-payload", redisPrefix, prefix),
+		prefixGloasSelectedPayload:        fmt.Sprintf("%s/%s:gloas-selected-payload", redisPrefix, prefix),
 
-		keyValidatorRegistrationData: fmt.Sprintf("%s/%s:validator-registration-data", redisPrefix, prefix),
+		keyValidatorRegistrationData:      fmt.Sprintf("%s/%s:validator-registration-data", redisPrefix, prefix),
 		keyValidatorRegistrationTimestamp: fmt.Sprintf("%s/%s:validator-registration-timestamp", redisPrefix, prefix),
-		keyRelayConfig:               fmt.Sprintf("%s/%s:relay-config", redisPrefix, prefix),
+		keyRelayConfig:                    fmt.Sprintf("%s/%s:relay-config", redisPrefix, prefix),
 
 		keyStats:              fmt.Sprintf("%s/%s:stats", redisPrefix, prefix),
 		keyProposerDuties:     fmt.Sprintf("%s/%s:proposer-duties", redisPrefix, prefix),
@@ -205,6 +209,14 @@ func (r *RedisCache) keyFloorBid(slot uint64, parentHash, proposerPubkey string)
 // keyFloorBidValue returns the key for the highest non-cancellable value of a given slot+parentHash+proposerPubkey
 func (r *RedisCache) keyFloorBidValue(slot uint64, parentHash, proposerPubkey string) string {
 	return fmt.Sprintf("%s:%d_%s_%s", r.prefixFloorBidValue, slot, parentHash, proposerPubkey)
+}
+
+func (r *RedisCache) keyGloasPayload(slot uint64, blockHash string) string {
+	return fmt.Sprintf("%s:%d_%s", r.prefixGloasPayload, slot, strings.ToLower(blockHash))
+}
+
+func (r *RedisCache) keyGloasSelectedPayload(slot uint64) string {
+	return fmt.Sprintf("%s:%d", r.prefixGloasSelectedPayload, slot)
 }
 
 func (r *RedisCache) GetObj(key string, obj any) (err error) {
@@ -408,6 +420,44 @@ func (r *RedisCache) GetBestBid(slot uint64, parentHash, proposerPubkey string) 
 		return nil, nil
 	}
 	return resp, err
+}
+
+func (r *RedisCache) SaveGloasPayload(entry *common.GloasPayloadCacheEntry) error {
+	if entry == nil || entry.Contents == nil || entry.Contents.ExecutionPayload == nil || entry.BidTrace == nil {
+		return errors.New("incomplete Gloas payload cache entry")
+	}
+	return r.SetObj(r.keyGloasPayload(entry.Slot, entry.BlockHash.String()), entry, expiryBidCache)
+}
+
+func (r *RedisCache) GetGloasPayload(slot uint64, blockHash string) (*common.GloasPayloadCacheEntry, error) {
+	entry := new(common.GloasPayloadCacheEntry)
+	err := r.GetObj(r.keyGloasPayload(slot, blockHash), entry)
+	if errors.Is(err, redis.Nil) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return entry, nil
+}
+
+func (r *RedisCache) SaveGloasSelectedPayload(slot uint64, entry *common.GloasSelectedPayloadCacheEntry) error {
+	if entry == nil || entry.Bid == nil || entry.Bid.Message == nil {
+		return errors.New("incomplete selected Gloas payload cache entry")
+	}
+	return r.SetObj(r.keyGloasSelectedPayload(slot), entry, expiryBidCache)
+}
+
+func (r *RedisCache) GetGloasSelectedPayload(slot uint64) (*common.GloasSelectedPayloadCacheEntry, error) {
+	entry := new(common.GloasSelectedPayloadCacheEntry)
+	err := r.GetObj(r.keyGloasSelectedPayload(slot), entry)
+	if errors.Is(err, redis.Nil) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return entry, nil
 }
 
 func (r *RedisCache) GetPayloadContents(slot uint64, proposerPubkey, blockHash string) (*builderApi.VersionedSubmitBlindedBlockResponse, error) {

@@ -19,42 +19,50 @@ func PayloadToExecPayloadEntry(payload *common.VersionedSubmitBlockRequest) (*Ex
 	var version string
 	var err error
 
-	switch payload.Version {
-	case spec.DataVersionCapella:
-		_payload, err = json.Marshal(payload.Capella.ExecutionPayload)
+	if payload.Gloas != nil {
+		_payload, err = json.Marshal(payload.Gloas)
 		if err != nil {
 			return nil, err
 		}
-		version = common.ForkVersionStringCapella
-	case spec.DataVersionDeneb:
-		_payload, err = json.Marshal(builderApiDeneb.ExecutionPayloadAndBlobsBundle{
-			ExecutionPayload: payload.Deneb.ExecutionPayload,
-			BlobsBundle:      payload.Deneb.BlobsBundle,
-		})
-		if err != nil {
-			return nil, err
+		version = common.ForkVersionStringGloas
+	} else {
+		switch payload.Version {
+		case spec.DataVersionCapella:
+			_payload, err = json.Marshal(payload.Capella.ExecutionPayload)
+			if err != nil {
+				return nil, err
+			}
+			version = common.ForkVersionStringCapella
+		case spec.DataVersionDeneb:
+			_payload, err = json.Marshal(builderApiDeneb.ExecutionPayloadAndBlobsBundle{
+				ExecutionPayload: payload.Deneb.ExecutionPayload,
+				BlobsBundle:      payload.Deneb.BlobsBundle,
+			})
+			if err != nil {
+				return nil, err
+			}
+			version = common.ForkVersionStringDeneb
+		case spec.DataVersionElectra:
+			_payload, err = json.Marshal(builderApiDeneb.ExecutionPayloadAndBlobsBundle{
+				ExecutionPayload: payload.Electra.ExecutionPayload,
+				BlobsBundle:      payload.Electra.BlobsBundle,
+			})
+			if err != nil {
+				return nil, err
+			}
+			version = common.ForkVersionStringElectra
+		case spec.DataVersionFulu:
+			_payload, err = json.Marshal(builderApiFulu.ExecutionPayloadAndBlobsBundle{
+				ExecutionPayload: payload.Fulu.ExecutionPayload,
+				BlobsBundle:      payload.Fulu.BlobsBundle,
+			})
+			if err != nil {
+				return nil, err
+			}
+			version = common.ForkVersionStringFulu
+		case spec.DataVersionUnknown, spec.DataVersionPhase0, spec.DataVersionAltair, spec.DataVersionBellatrix:
+			return nil, ErrUnsupportedExecutionPayload
 		}
-		version = common.ForkVersionStringDeneb
-	case spec.DataVersionElectra:
-		_payload, err = json.Marshal(builderApiDeneb.ExecutionPayloadAndBlobsBundle{
-			ExecutionPayload: payload.Electra.ExecutionPayload,
-			BlobsBundle:      payload.Electra.BlobsBundle,
-		})
-		if err != nil {
-			return nil, err
-		}
-		version = common.ForkVersionStringElectra
-	case spec.DataVersionFulu:
-		_payload, err = json.Marshal(builderApiFulu.ExecutionPayloadAndBlobsBundle{
-			ExecutionPayload: payload.Fulu.ExecutionPayload,
-			BlobsBundle:      payload.Fulu.BlobsBundle,
-		})
-		if err != nil {
-			return nil, err
-		}
-		version = common.ForkVersionStringFulu
-	case spec.DataVersionUnknown, spec.DataVersionPhase0, spec.DataVersionAltair, spec.DataVersionBellatrix:
-		return nil, ErrUnsupportedExecutionPayload
 	}
 
 	submission, err := common.GetBlockSubmissionInfo(payload)
@@ -116,6 +124,26 @@ func BuilderSubmissionEntryToBidTraceV2WithTimestampJSON(payload *BuilderBlockSu
 
 func ExecutionPayloadEntryToExecutionPayload(executionPayloadEntry *ExecutionPayloadEntry) (payload *builderApi.VersionedSubmitBlindedBlockResponse, err error) {
 	payloadVersion := executionPayloadEntry.Version
+	if payloadVersion == common.ForkVersionStringGloas {
+		contents := new(common.GloasPayloadContents)
+		if err := json.Unmarshal([]byte(executionPayloadEntry.Payload), contents); err != nil {
+			return nil, err
+		}
+		if contents.ExecutionPayload == nil || contents.BlobsBundle == nil {
+			return nil, ErrUnsupportedExecutionPayload
+		}
+		executionPayload, err := contents.ExecutionPayload.AsDeneb()
+		if err != nil {
+			return nil, err
+		}
+		return &builderApi.VersionedSubmitBlindedBlockResponse{
+			Version: spec.DataVersionFulu,
+			Fulu: &builderApiFulu.ExecutionPayloadAndBlobsBundle{
+				ExecutionPayload: executionPayload,
+				BlobsBundle:      contents.BlobsBundle,
+			},
+		}, nil
+	}
 	if payloadVersion == common.ForkVersionStringFulu {
 		executionPayload := new(builderApiFulu.ExecutionPayloadAndBlobsBundle)
 		err = json.Unmarshal([]byte(executionPayloadEntry.Payload), executionPayload)

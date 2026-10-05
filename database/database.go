@@ -115,7 +115,18 @@ func (s *DatabaseService) prepareNamedQueries() (err error) {
 	query := `INSERT INTO ` + vars.TableExecutionPayload + `
 	(slot, proposer_pubkey, block_hash, version, payload) VALUES
 	(:slot, :proposer_pubkey, :block_hash, :version, :payload)
-	ON CONFLICT (slot, proposer_pubkey, block_hash) DO UPDATE SET slot=:slot
+	ON CONFLICT (slot, proposer_pubkey, block_hash) DO UPDATE SET
+		slot = EXCLUDED.slot,
+		version = CASE
+			WHEN EXCLUDED.version = 'gloas' OR ` + vars.TableExecutionPayload + `.version <> 'gloas'
+			THEN EXCLUDED.version
+			ELSE ` + vars.TableExecutionPayload + `.version
+		END,
+		payload = CASE
+			WHEN EXCLUDED.version = 'gloas' OR ` + vars.TableExecutionPayload + `.version <> 'gloas'
+			THEN EXCLUDED.payload
+			ELSE ` + vars.TableExecutionPayload + `.payload
+		END
 	RETURNING id`
 	s.nstmtInsertExecutionPayload, err = s.DB.PrepareNamed(query)
 	if err != nil {
