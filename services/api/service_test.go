@@ -33,6 +33,7 @@ import (
 	"github.com/flashbots/go-boost-utils/utils"
 	"github.com/holiman/uint256"
 	bitfield "github.com/prysmaticlabs/go-bitfield"
+	"github.com/redis/go-redis/v9"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 )
@@ -302,7 +303,7 @@ func TestGetHeader(t *testing.T) {
 		Version:        spec.DataVersionCapella,
 	}
 	payload, getPayloadResp, getHeaderResp := common.CreateTestBlockSubmission(t, builderPubkey, bidValue, &opts)
-	_, err := backend.redis.SaveBidAndUpdateTopBid(t.Context(), backend.redis.NewPipeline(), trace, payload, getPayloadResp, getHeaderResp, time.Now(), false, nil, false)
+	_, err := backend.redis.SaveBidAndUpdateTopBid(t.Context(), backend.redis.NewPipeline(), trace, payload, getPayloadResp, getHeaderResp, time.Now(), false, nil, true)
 	require.NoError(t, err)
 
 	// Check 1: regular capella request works and returns a bid
@@ -325,7 +326,7 @@ func TestGetHeader(t *testing.T) {
 		Version:        spec.DataVersionDeneb,
 	}
 	payload, getPayloadResp, getHeaderResp = common.CreateTestBlockSubmission(t, builderPubkey, bidValue, &opts)
-	_, err = backend.redis.SaveBidAndUpdateTopBid(t.Context(), backend.redis.NewPipeline(), trace, payload, getPayloadResp, getHeaderResp, time.Now(), false, nil, false)
+	_, err = backend.redis.SaveBidAndUpdateTopBid(t.Context(), backend.redis.NewPipeline(), trace, payload, getPayloadResp, getHeaderResp, time.Now(), false, nil, true)
 	require.NoError(t, err)
 	backend.relay.genesisInfo.Data.GenesisTime = uint64(time.Now().UTC().Unix()) - (slot+1)*common.SecondsPerSlot //nolint:gosec
 
@@ -346,6 +347,7 @@ func TestGetHeader(t *testing.T) {
 }
 
 func TestGetExecutionPayloadBid(t *testing.T) {
+	explicitFalse, explicitTrue := false, true
 	previousDisableEthgasMarketAPI := disableEthgasMarketAPI
 	disableEthgasMarketAPI = false
 	t.Cleanup(func() {
@@ -356,8 +358,8 @@ func TestGetExecutionPayloadBid(t *testing.T) {
 	backend.relay.marketCache.Store(testSlot, &marketCacheEntry{
 		value: &WholeBlockMarket{
 			Slot:       testSlot,
-			MultiRelay: false,
-			RealTime:   false,
+			MultiRelay: &explicitFalse,
+			RealTime:   &explicitFalse,
 		},
 		expiration: time.Now().Add(time.Minute),
 	})
@@ -548,7 +550,7 @@ func TestGetExecutionPayloadBid(t *testing.T) {
 			disableEthgasMarketAPI, realTimeBidMultiplier = tc.disabled, tc.multiplier
 			backend.relay.marketCache.Store(testSlot, &marketCacheEntry{
 				value: &WholeBlockMarket{
-					Slot: testSlot, MultiRelay: tc.multiRelay, RealTime: tc.realTime,
+					Slot: testSlot, MultiRelay: &tc.multiRelay, RealTime: &tc.realTime,
 				},
 				expiration: time.Now().Add(time.Minute),
 			})
@@ -574,6 +576,9 @@ func TestGetExecutionPayloadBid(t *testing.T) {
 		{"null market", http.StatusOK, `{"success":true,"data":{"markets":null}}`},
 		{"empty market", http.StatusOK, `{"success":true,"data":{"markets":{}}}`},
 		{"wrong slot", http.StatusOK, `{"success":true,"data":{"markets":{"slot":43}}}`},
+		{"unknown modes", http.StatusOK, `{"success":true,"data":{"markets":{"slot":42}}}`},
+		{"unknown multi relay", http.StatusOK, `{"success":true,"data":{"markets":{"slot":42,"realtime":true}}}`},
+		{"unknown realtime", http.StatusOK, `{"success":true,"data":{"markets":{"slot":42,"multiRelay":false}}}`},
 		{"failed lookup", http.StatusBadGateway, `upstream unavailable`},
 		{"unsuccessful lookup", http.StatusOK, `{"success":false}`},
 		{"invalid response", http.StatusOK, `invalid JSON`},
@@ -614,12 +619,29 @@ func TestGetExecutionPayloadBid(t *testing.T) {
 		})
 	}
 
+	for _, tc := range []struct {
+		name   string
+		market *WholeBlockMarket
+	}{
+		{"cached unknown multi relay", &WholeBlockMarket{Slot: testSlot, RealTime: &explicitTrue}},
+		{"cached unknown realtime", &WholeBlockMarket{Slot: testSlot, MultiRelay: &explicitFalse}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			backend.relay.marketCache.Store(testSlot, &marketCacheEntry{value: tc.market, expiration: time.Now().Add(time.Minute)})
+			rr := backend.requestBytes(http.MethodPost, path, authJSON, headers)
+			require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+			result := new(common.VersionedSignedExecutionPayloadBidResponse)
+			require.NoError(t, json.Unmarshal(rr.Body.Bytes(), result))
+			require.Equal(t, phase0.Gwei(11), result.Data.Message.ExecutionPayment)
+		})
+	}
+
 	// Non-realtime multi-relay markets expose the builder's actual value.
 	backend.relay.marketCache.Store(testSlot, &marketCacheEntry{
 		value: &WholeBlockMarket{
 			Slot:       testSlot,
-			MultiRelay: true,
-			RealTime:   false,
+			MultiRelay: &explicitTrue,
+			RealTime:   &explicitFalse,
 		},
 		expiration: time.Now().Add(time.Minute),
 	})
@@ -739,12 +761,23 @@ func TestGetExecutionPayloadBid(t *testing.T) {
 	// payload must be recovered from Redis rather than process memory.
 	backend.relay.gloasPayloads = make(map[string]*gloasPayloadContext)
 	backend.relay.gloasSelectedPayloads = make(map[uint64]*gloasSelectedPayloadContext)
+	// Broadcast-only envelopes do not mark the slot as delivered.
+	mockBeacon.PublishEnvelopeCode = http.StatusAccepted
+	rr = backend.requestBytes(http.MethodPost, pathSubmitSignedBeaconBlock, []byte(signedBlockBody), headers)
+	require.Equal(t, http.StatusBadGateway, rr.Code, rr.Body.String())
+	require.Nil(t, deliveryDB.record)
+	_, err = backend.redis.GetLastSlotDelivered(t.Context(), backend.redis.NewPipeline())
+	require.ErrorIs(t, err, redis.Nil)
+	mockBeacon.PublishEnvelopeCode = http.StatusOK
 	rr = backend.requestBytes(http.MethodPost, pathSubmitSignedBeaconBlock, []byte(signedBlockBody), headers)
 	require.Equal(t, http.StatusAccepted, rr.Code, rr.Body.String())
 	require.NotNil(t, deliveryDB.record)
 	require.Equal(t, gloasPayload.BlockHash, deliveryDB.record.bidTrace.BlockHash)
 	require.WithinDuration(t, time.Now(), deliveryDB.record.signedAt, time.Second)
 	require.JSONEq(t, signedBlockBody, string(deliveryDB.record.signedBeaconBlock.(json.RawMessage)))
+	deliveredSlot, err := backend.redis.GetLastSlotDelivered(t.Context(), backend.redis.NewPipeline())
+	require.NoError(t, err)
+	require.Equal(t, uint64(testSlot), deliveredSlot)
 	published, ok := mockBeacon.PublishedEnvelope.(*common.SignedExecutionPayloadEnvelope)
 	require.True(t, ok)
 	beaconBlockRootHash, err := utils.HexToHash(beaconBlockRoot)
@@ -1278,7 +1311,7 @@ func TestCheckSubmissionFeeRecipient(t *testing.T) {
 			log := logrus.NewEntry(logger)
 			submission, err := common.GetBlockSubmissionInfo(tc.payload)
 			require.NoError(t, err)
-			gasLimit, ok := backend.relay.checkSubmissionFeeRecipient(w, log, submission.BidTrace, "", "")
+			gasLimit, ok := backend.relay.checkSubmissionFeeRecipient(w, log, submission.BidTrace, "", submission.BidTrace.BuilderPubkey.String())
 			require.Equal(t, tc.expectGasLimit, gasLimit)
 			require.Equal(t, tc.expectOk, ok)
 		})

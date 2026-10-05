@@ -36,8 +36,6 @@ import (
 	"github.com/NYTimes/gziphandler"
 	"github.com/aohorodnyk/mimeheader"
 	builderApi "github.com/attestantio/go-builder-client/api"
-	builderApiCapella "github.com/attestantio/go-builder-client/api/capella"
-	builderApiDeneb "github.com/attestantio/go-builder-client/api/deneb"
 	builderApiElectra "github.com/attestantio/go-builder-client/api/electra"
 	builderApiFulu "github.com/attestantio/go-builder-client/api/fulu"
 
@@ -84,17 +82,18 @@ const (
 )
 
 var (
-	ErrMissingLogOpt               = errors.New("log parameter is nil")
-	ErrMissingBeaconClientOpt      = errors.New("beacon-client is nil")
-	ErrMissingDatastoreOpt         = errors.New("proposer datastore is nil")
-	ErrRelayPubkeyMismatch         = errors.New("relay pubkey does not match existing one")
-	ErrServerAlreadyStarted        = errors.New("server was already started")
-	ErrBuilderAPIWithoutSecretKey  = errors.New("cannot start builder API without secret key")
-	ErrNegativeTimestamp           = errors.New("timestamp cannot be negative")
-	ErrInvalidForkVersion          = errors.New("invalid fork version")
-	ErrGloasBuilderWithoutKey      = errors.New("Gloas builder index requires a secret key")
-	ErrGloasBuilderWithoutFork     = errors.New("Gloas builder index requires GLOAS_FORK_VERSION")
-	ErrGloasBuilderWithoutAuthData = errors.New("Gloas builder index requires request auth data")
+	ErrMissingLogOpt                    = errors.New("log parameter is nil")
+	ErrMissingBeaconClientOpt           = errors.New("beacon-client is nil")
+	ErrMissingDatastoreOpt              = errors.New("proposer datastore is nil")
+	ErrRelayPubkeyMismatch              = errors.New("relay pubkey does not match existing one")
+	ErrServerAlreadyStarted             = errors.New("server was already started")
+	ErrBuilderAPIWithoutSecretKey       = errors.New("cannot start builder API without secret key")
+	ErrHeaderAdjustmentWithoutSecretKey = errors.New("cannot enable ETHGas header adjustments on proposer API without secret key")
+	ErrNegativeTimestamp                = errors.New("timestamp cannot be negative")
+	ErrInvalidForkVersion               = errors.New("invalid fork version")
+	ErrGloasBuilderWithoutKey           = errors.New("Gloas builder index requires a secret key")
+	ErrGloasBuilderWithoutFork          = errors.New("Gloas builder index requires GLOAS_FORK_VERSION")
+	ErrGloasBuilderWithoutAuthData      = errors.New("Gloas builder index requires request auth data")
 )
 
 var (
@@ -244,7 +243,10 @@ type ApiClient struct {
 	ChainID      string
 	Client       *http.Client
 	AccessToken  string
-	RefreshToken string // Keeping this as a field for storing the refresh token
+	RefreshToken string
+
+	tokenMutex sync.RWMutex
+	authOnce   sync.Once
 }
 
 // LoginResponse represents the login response structure
@@ -300,8 +302,8 @@ type WholeBlockMarket struct {
 	FinalityTime     int64  `json:"finalityTime"`
 	UpdateDate       int64  `json:"updateDate"`
 	OFAC             bool   `json:"ofac"`
-	MultiRelay       bool   `json:"multiRelay"`
-	RealTime         bool   `json:"realtime"`
+	MultiRelay       *bool  `json:"multiRelay"` // nil means the market mode is unknown.
+	RealTime         *bool  `json:"realtime"`   // nil means the market mode is unknown.
 }
 
 // Define the slotBundle type at the top of the file
@@ -310,6 +312,7 @@ type WholeBlockMarket struct {
 // }
 
 type PreconfBundles struct {
+	Slot         *uint64         `json:"slot"`
 	Bundles      []PreconfBundle `json:"bundles"`
 	EmptySpace   int             `json:"emptySpace,omitempty"`
 	FeeRecipient string          `json:"feeRecipient,omitempty"`
@@ -802,15 +805,17 @@ func NewRelayAPI(opts RelayAPIOpts) (api *RelayAPI, err error) {
 		opts.Log.WithField("builderIndex", *opts.GloasBuilderIndex).Info("Gloas builder identity enabled")
 	}
 
-	// If either builder-facing submissions or Gloas bid responses are enabled,
-	// ensure the relay signing key is ready.
-	var publicKey phase0.BLSPubKey
-	if opts.BlockBuilderAPI || opts.GloasBuilderIndex != nil {
-		if opts.SecretKey == nil {
-			return nil, ErrBuilderAPIWithoutSecretKey
-		}
+	// Both block submission and ETHGas header adjustment require a signing key.
+	if opts.BlockBuilderAPI && opts.SecretKey == nil {
+		return nil, ErrBuilderAPIWithoutSecretKey
+	}
+	if opts.ProposerAPI && !disableEthgasMarketAPI && opts.SecretKey == nil {
+		return nil, ErrHeaderAdjustmentWithoutSecretKey
+	}
 
-		// If using a secret key, ensure it's the correct one
+	var publicKey phase0.BLSPubKey
+	if opts.SecretKey != nil && (opts.BlockBuilderAPI || opts.ProposerAPI || opts.GloasBuilderIndex != nil) {
+		// Initialize the identity in proposer-only processes as well.
 		blsPubkey, err := bls.PublicKeyFromSecretKey(opts.SecretKey)
 		if err != nil {
 			return nil, err
@@ -902,7 +907,7 @@ func NewRelayAPI(opts RelayAPIOpts) (api *RelayAPI, err error) {
 		api.ffDisableDemotion = true
 	}
 	if !disableEthgasMarketAPI {
-		go InitLoginAndStartTokenRefresh()
+		InitLoginAndStartTokenRefresh()
 	}
 
 	// Start the exchange API health check
@@ -2028,10 +2033,10 @@ func (api *RelayAPI) handleGetExecutionPayloadBid(w http.ResponseWriter, req *ht
 		market, marketErr := api.getMarketForSlot(slot)
 		if marketErr != nil {
 			log.WithError(marketErr).Warn("failed to fetch market info; bid value left unchanged")
-		} else if market != nil {
+		} else if market != nil && market.MultiRelay != nil && market.RealTime != nil {
 			marketAvailable = true
-			multiRelay = market.MultiRelay
-			realTime = market.RealTime
+			multiRelay = *market.MultiRelay
+			realTime = *market.RealTime
 		}
 	}
 	if !disableEthgasMarketAPI && marketAvailable && (!multiRelay || realTime) {
@@ -2341,6 +2346,11 @@ func (api *RelayAPI) handleSubmitSignedBeaconBlock(w http.ResponseWriter, req *h
 		log.WithError(err).WithField("statusCode", statusCode).Error("failed to publish Gloas execution payload envelope")
 		api.RespondError(w, http.StatusBadGateway, "beacon node rejected execution payload envelope")
 		return
+	}
+	// Gloas delivery must update the same marker as legacy getPayload, so the
+	// shared submission gate rejects bids for a slot already delivered.
+	if err := api.redis.CheckAndSetLastSlotAndHashDelivered(slot, payloadContext.blockHash.String()); err != nil {
+		log.WithError(err).Error("failed to record delivered Gloas payload in Redis")
 	}
 	if payloadContext.bidTrace == nil {
 		log.Error("cannot save delivered Gloas payload without its bid trace")
@@ -2678,7 +2688,7 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 	}
 
 	//Builder filter at submit block
-	// builderResp, err := FetchBuilderPubKey(exchangeAPIURL, slot)
+	// builderResp, err := FetchBuilderPubKey(req.Context(), exchangeAPIURL, slot)
 	// if err != nil {
 	// 	log.WithError(err).Error("failed to get builder id from API")
 	// 	builderResp = &BuilderResponse{
@@ -2788,10 +2798,10 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 		market, marketErr := api.getMarketForSlot(slot)
 		if marketErr != nil {
 			log.WithError(marketErr).Warn("failed to fetch market info; bid value left unchanged")
-		} else if market != nil {
+		} else if market != nil && market.MultiRelay != nil && market.RealTime != nil {
 			marketAvailable = true
-			multiRelay = market.MultiRelay
-			realTime = market.RealTime
+			multiRelay = *market.MultiRelay
+			realTime = *market.RealTime
 		}
 	}
 	log = log.WithField("multiRelay", multiRelay)
@@ -2850,13 +2860,8 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 
 			bid.Capella.Message.Pubkey = *api.publicKey
 
-			builderBid := builderApiCapella.BuilderBid{
-				Value:  bid.Capella.Message.Value,
-				Header: bid.Capella.Message.Header,
-				Pubkey: *api.publicKey,
-			}
-
-			signature, err := ssz.SignMessage(&builderBid, api.opts.EthNetDetails.DomainBuilder, api.blsSk)
+			// Sign the exact outgoing message, including all fork-specific fields.
+			signature, err := ssz.SignMessage(bid.Capella.Message, api.opts.EthNetDetails.DomainBuilder, api.blsSk)
 
 			if err != nil {
 				log.WithError(err).Error("failed to signature bid")
@@ -2892,13 +2897,8 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 			bid.Deneb.Message.Value = totalValue
 			bid.Deneb.Message.Pubkey = *api.publicKey
 
-			builderBid := builderApiDeneb.BuilderBid{
-				Value:  bid.Deneb.Message.Value,
-				Header: bid.Deneb.Message.Header,
-				Pubkey: *api.publicKey,
-			}
-
-			signature, err := ssz.SignMessage(&builderBid, api.opts.EthNetDetails.DomainBuilder, api.blsSk)
+			// Sign the exact outgoing message, including all fork-specific fields.
+			signature, err := ssz.SignMessage(bid.Deneb.Message, api.opts.EthNetDetails.DomainBuilder, api.blsSk)
 			if err != nil {
 				log.WithError(err).Error("failed to signature bid")
 				api.RespondError(w, http.StatusInternalServerError, "failed to signature bid")
@@ -2931,15 +2931,8 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 			bid.Electra.Message.Value = totalValue
 			bid.Electra.Message.Pubkey = *api.publicKey
 
-			builderBid := builderApiElectra.BuilderBid{
-				Value:              bid.Electra.Message.Value,
-				Header:             bid.Electra.Message.Header,
-				ExecutionRequests:  bid.Electra.Message.ExecutionRequests,
-				BlobKZGCommitments: bid.Electra.Message.BlobKZGCommitments,
-				Pubkey:             *api.publicKey,
-			}
-
-			signature, err := ssz.SignMessage(&builderBid, api.opts.EthNetDetails.DomainBuilder, api.blsSk)
+			// Sign the exact outgoing message, including all fork-specific fields.
+			signature, err := ssz.SignMessage(bid.Electra.Message, api.opts.EthNetDetails.DomainBuilder, api.blsSk)
 			if err != nil {
 				log.WithError(err).Error("failed to signature bid")
 				api.RespondError(w, http.StatusInternalServerError, "failed to signature bid")
@@ -2973,15 +2966,8 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 			bid.Fulu.Message.Value = totalValue
 			bid.Fulu.Message.Pubkey = *api.publicKey
 
-			builderBid := builderApiElectra.BuilderBid{
-				Value:              bid.Fulu.Message.Value,
-				Header:             bid.Fulu.Message.Header,
-				ExecutionRequests:  bid.Fulu.Message.ExecutionRequests,
-				BlobKZGCommitments: bid.Fulu.Message.BlobKZGCommitments,
-				Pubkey:             *api.publicKey,
-			}
-
-			signature, err := ssz.SignMessage(&builderBid, api.opts.EthNetDetails.DomainBuilder, api.blsSk)
+			// Sign the exact outgoing message, including all fork-specific fields.
+			signature, err := ssz.SignMessage(bid.Fulu.Message, api.opts.EthNetDetails.DomainBuilder, api.blsSk)
 			if err != nil {
 				log.WithError(err).Error("failed to signature bid")
 				api.RespondError(w, http.StatusInternalServerError, "failed to signature bid")
@@ -3322,6 +3308,7 @@ func (api *RelayAPI) innerHandleGetPayload(w http.ResponseWriter, req *http.Requ
 	log.Info("getPayload request received")
 
 	var getPayloadResp *builderApi.VersionedSubmitBlindedBlockResponse
+	var payloadRecovered bool
 	var msNeededForPublishing uint64
 
 	// Start persistence after the handler finishes populating the response data.
@@ -3370,6 +3357,13 @@ func (api *RelayAPI) innerHandleGetPayload(w http.ResponseWriter, req *http.Requ
 			"blockHash":     bidTrace.BlockHash,
 		})
 		log.Warn("demotion found in getPayload, inserting refund justification")
+
+		// Keep the demotion record for review when payload recovery failed.
+		// The deferred task also runs when getPayload returns an error.
+		if !payloadRecovered || getPayloadResp == nil {
+			log.WithField("incompleteRefundEvidence", true).Warn("skipping refund justification: execution payload was not recovered")
+			return
+		}
 
 		// Prepare refund data.
 		signedBeaconBlock, err := common.SignedBlindedBeaconBlockToBeaconBlock(payload, getPayloadResp)
@@ -3439,6 +3433,7 @@ func (api *RelayAPI) innerHandleGetPayload(w http.ResponseWriter, req *http.Requ
 	}
 
 	// Now we know this relay also has the payload
+	payloadRecovered = true
 	log = log.WithField("timestampAfterLoadResponse", time.Now().UTC().UnixMilli())
 
 	// Check whether getPayload has already been called -- TODO: do we need to allow multiple submissions of one blinded block?
@@ -3760,6 +3755,7 @@ type bidFloorOpts struct {
 	tx                   redis.Pipeliner
 	log                  *logrus.Entry
 	cancellationsEnabled bool
+	isValidPreconf       bool
 	simResultC           chan *blockSimResult
 	submission           *common.BlockSubmissionInfo
 }
@@ -3769,8 +3765,6 @@ func (api *RelayAPI) checkFloorBidValue(opts bidFloorOpts) (*big.Int, bool) {
 	slotLastPayloadDelivered, err := api.redis.GetLastSlotDelivered(context.Background(), opts.tx)
 	if err != nil && !errors.Is(err, redis.Nil) {
 		opts.log.WithError(err).Error("failed to get delivered payload slot from redis")
-	} else if opts.submission.BidTrace.Slot == slotLastPayloadDelivered {
-		opts.log.Info("allow submission but payload for this slot was already delivered")
 	} else if opts.submission.BidTrace.Slot <= slotLastPayloadDelivered {
 		opts.log.Info("rejecting submission because payload for this slot was already delivered")
 		api.RespondError(opts.w, http.StatusBadRequest, "payload for this slot was already delivered")
@@ -3793,7 +3787,11 @@ func (api *RelayAPI) checkFloorBidValue(opts bidFloorOpts) (*big.Int, bool) {
 	if opts.cancellationsEnabled && isBidBelowFloor { // with cancellations: if below floor -> delete previous bid
 		opts.simResultC <- &blockSimResult{false, nil, false, nil, nil}
 		opts.log.Info("submission below floor bid value, with cancellation")
-		err := api.redis.DelBuilderBid(context.Background(), opts.tx, opts.submission.BidTrace.Slot, opts.submission.BidTrace.ParentHash.String(), opts.submission.BidTrace.ProposerPubkey.String(), opts.submission.BidTrace.BuilderPubkey.String())
+		err := api.redis.DelBuilderBid(context.Background(), opts.tx, opts.submission.BidTrace.Slot, opts.submission.BidTrace.ParentHash.String(), opts.submission.BidTrace.ProposerPubkey.String(), opts.submission.BidTrace.BuilderPubkey.String(), opts.isValidPreconf)
+		if errors.Is(err, datastore.ErrInvalidPreconfReplacement) {
+			api.RespondError(opts.w, http.StatusBadRequest, err.Error())
+			return nil, false
+		}
 		if err != nil {
 			opts.log.WithError(err).Error("failed processing cancellable bid below floor")
 			api.RespondError(opts.w, http.StatusInternalServerError, "failed processing cancellable bid below floor")
@@ -3857,6 +3855,10 @@ func (api *RelayAPI) updateRedisBid(opts redisUpdateBidOpts) (*datastore.SaveBid
 	// Save to Redis
 	//
 	updateBidResult, err := api.redis.SaveBidAndUpdateTopBid(context.Background(), opts.tx, &bidTrace, opts.payload, getPayloadResponse, getHeaderResponse, opts.receivedAt, opts.cancellationsEnabled, opts.floorBidValue, opts.isValidPreconf)
+	if errors.Is(err, datastore.ErrInvalidPreconfReplacement) {
+		api.RespondError(opts.w, http.StatusBadRequest, err.Error())
+		return nil, nil, false
+	}
 	if err != nil {
 		opts.log.WithError(err).Error("could not save bid and update top bids")
 		api.RespondError(opts.w, http.StatusInternalServerError, "failed saving and updating bid")
@@ -4069,7 +4071,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 
 		// If not in cache or expired, fetch the builder response
 		if builderResp == nil {
-			builderResp, err = FetchBuilderPubKey(exchangeAPIURL, slot)
+			builderResp, err = FetchBuilderPubKey(req.Context(), exchangeAPIURL, slot)
 			if err != nil {
 				log.WithError(err).Error("failed to get builder id from API")
 				builderResp = &BuilderResponse{
@@ -4089,7 +4091,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 			log.Info("Builder pubkey matches FallbackBuilder or one of the Builders")
 		} else {
 			log.Info("Builder pubkey does not match FallbackBuilder or any of the Builders", " pubkey:", builderPubkey)
-			api.RespondError(w, http.StatusBadRequest, "Block Owner haven't deletaged your builder pubkey")
+			api.RespondError(w, http.StatusBadRequest, "Block Owner hasn't deletaged your builder pubkey")
 			return
 		}
 
@@ -4119,7 +4121,8 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 				bundleReq, fetchErr := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 				var apiResponse ApiResponse
 				if fetchErr == nil {
-					bundleReq.Header.Set("Authorization", "Bearer "+client.AccessToken)
+					accessToken, _ := client.tokens()
+					bundleReq.Header.Set("Authorization", "Bearer "+accessToken)
 					var resp *http.Response
 					resp, fetchErr = client.Client.Do(bundleReq)
 					if fetchErr == nil {
@@ -4141,6 +4144,13 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 					fetchErr = json.Unmarshal(apiResponse.Data, &preconfBundles)
 					if fetchErr == nil && preconfBundles == nil {
 						fetchErr = errors.New("slot bundles response has no data")
+					}
+					if fetchErr == nil {
+						if preconfBundles.Slot == nil {
+							fetchErr = errors.New("slot bundles response has no slot")
+						} else if *preconfBundles.Slot != submission.BidTrace.Slot {
+							fetchErr = fmt.Errorf("slot bundles response slot %d does not match requested slot %d", *preconfBundles.Slot, submission.BidTrace.Slot)
+						}
 					}
 				}
 				if fetchErr != nil {
@@ -4472,6 +4482,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		tx:                   tx,
 		log:                  log,
 		cancellationsEnabled: isCancellationEnabled,
+		isValidPreconf:       isValidPreconf == "",
 		simResultC:           simResultC,
 		submission:           submission,
 	}
@@ -4570,32 +4581,28 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 			builderEntry.collateral.Cmp(submission.BidTrace.Value.ToBig()) >= 0 &&
 			submission.BidTrace.Slot == api.optimisticSlot.Load())
 	pf.Optimistic = optimistic
-	slotLastPayloadDelivered, err := api.redis.GetLastSlotDelivered(context.Background(), tx)
-	//no need simulate if the block is already delivered
-	if (err != nil && !errors.Is(err, redis.Nil)) || submission.BidTrace.Slot != slotLastPayloadDelivered {
-		if optimistic {
-			go api.processOptimisticBlock(opts, simResultC)
-		} else {
-			// Simulate block (synchronously).
-			blockValue, requestErr, validationErr := api.simulateBlock(context.Background(), opts) // success/error logging happens inside
-			simResultC <- &blockSimResult{requestErr == nil, blockValue, false, requestErr, validationErr}
-			validationDurationMs := time.Since(timeBeforeValidation).Milliseconds()
-			log = log.WithFields(logrus.Fields{
-				"timestampAfterValidation": time.Now().UTC().UnixMilli(),
-				"validationDurationMs":     validationDurationMs,
-			})
-			if requestErr != nil { // Request error
-				if os.IsTimeout(requestErr) {
-					api.RespondError(w, http.StatusGatewayTimeout, "validation request timeout")
-				} else {
-					api.RespondError(w, http.StatusBadRequest, requestErr.Error())
-				}
-				return
+	if optimistic {
+		go api.processOptimisticBlock(opts, simResultC)
+	} else {
+		// Simulate block (synchronously).
+		blockValue, requestErr, validationErr := api.simulateBlock(context.Background(), opts) // success/error logging happens inside
+		simResultC <- &blockSimResult{requestErr == nil, blockValue, false, requestErr, validationErr}
+		validationDurationMs := time.Since(timeBeforeValidation).Milliseconds()
+		log = log.WithFields(logrus.Fields{
+			"timestampAfterValidation": time.Now().UTC().UnixMilli(),
+			"validationDurationMs":     validationDurationMs,
+		})
+		if requestErr != nil { // Request error
+			if os.IsTimeout(requestErr) {
+				api.RespondError(w, http.StatusGatewayTimeout, "validation request timeout")
 			} else {
-				if validationErr != nil {
-					api.RespondError(w, http.StatusBadRequest, validationErr.Error())
-					return
-				}
+				api.RespondError(w, http.StatusBadRequest, requestErr.Error())
+			}
+			return
+		} else {
+			if validationErr != nil {
+				api.RespondError(w, http.StatusBadRequest, validationErr.Error())
+				return
 			}
 		}
 	}
@@ -4645,14 +4652,6 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 			executionRequests: payload.Gloas.ExecutionRequests,
 			blobsBundle:       gloasSubmission.BlobsBundle,
 		}
-		if err := api.redis.SaveGloasPayload(gloasContext.cacheEntry()); err != nil {
-			log.WithError(err).Error("failed to persist complete Gloas reveal payload")
-			api.RespondError(w, http.StatusInternalServerError, "failed to persist complete Gloas reveal payload")
-			return
-		}
-		api.gloasPayloadsLock.Lock()
-		api.gloasPayloads[gloasPayloadKey(gloasContext.slot, gloasContext.blockHash)] = gloasContext
-		api.gloasPayloadsLock.Unlock()
 	}
 
 	redisOpts := redisUpdateBidOpts{
@@ -4699,6 +4698,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 
 		if gloasContext != nil {
 			api.gloasPayloadsLock.Lock()
+			api.gloasPayloads[gloasPayloadKey(gloasContext.slot, gloasContext.blockHash)] = gloasContext
 			for storedKey, stored := range api.gloasPayloads {
 				if stored.slot+2 < gloasContext.slot {
 					delete(api.gloasPayloads, storedKey)
@@ -5207,14 +5207,21 @@ func (api *RelayAPI) handleReadyz(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
-// FetchBuilderPubKey fetches the builder and fallbackBuilder from the /builder/pubkey/:slot endpoint
-func FetchBuilderPubKey(apiURL string, slot uint64) (*BuilderResponse, error) {
-	// Construct the URL for the API request
-	// url := fmt.Sprintf("%s/api/p/builder/pubkey/%d", apiURL, slot)
+// Bound assignment lookups independently of the slot-bundle lookup that follows.
+const builderAssignmentRequestTimeout = 500 * time.Millisecond
+
+// FetchBuilderPubKey fetches the assigned builders within the submission context
+// and a fixed deadline, including reading the response body.
+func FetchBuilderPubKey(ctx context.Context, apiURL string, slot uint64) (*BuilderResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, builderAssignmentRequestTimeout)
+	defer cancel()
 	url := fmt.Sprintf("%s/api/v1/p/builder/%d", apiURL, slot)
 
-	// Send HTTP GET request
-	resp, err := http.Get(url)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create builder assignment request: %w", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch builder pubkey: %w", err)
 	}
@@ -5259,6 +5266,12 @@ func FetchBuilderPubKey(apiURL string, slot uint64) (*BuilderResponse, error) {
 	}
 
 	// Validate required fields
+	if builderResp.Slot == 0 {
+		return nil, errors.New("builder response has no slot")
+	}
+	if builderResp.Slot != slot {
+		return nil, fmt.Errorf("builder response slot %d does not match requested slot %d", builderResp.Slot, slot)
+	}
 	if len(builderResp.Builders) == 0 && builderResp.FallbackBuilder == "" {
 		return nil, fmt.Errorf("invalid builder response: missing required fields")
 	}
@@ -5266,49 +5279,56 @@ func FetchBuilderPubKey(apiURL string, slot uint64) (*BuilderResponse, error) {
 	return &builderResp, nil
 }
 
-func ensureExchangeClientLoggedIn() error {
-	if client.AccessToken != "" {
-		return nil
+// Market lookups share the proposer's short getHeader deadline. Authentication
+// retries belong to the background worker, never to this request path.
+const marketRequestTimeout = 200 * time.Millisecond
+
+func (c *ApiClient) tokens() (string, string) {
+	c.tokenMutex.RLock()
+	defer c.tokenMutex.RUnlock()
+	return c.AccessToken, c.RefreshToken
+}
+
+func (c *ApiClient) setTokens(accessToken, refreshToken string) {
+	c.tokenMutex.Lock()
+	defer c.tokenMutex.Unlock()
+	c.AccessToken, c.RefreshToken = accessToken, refreshToken
+}
+
+func (c *ApiClient) invalidateAccessToken(rejectedToken string) {
+	c.tokenMutex.Lock()
+	defer c.tokenMutex.Unlock()
+	// An in-flight request may have used a token that was already refreshed.
+	if c.AccessToken == rejectedToken {
+		c.AccessToken = ""
 	}
-	accessToken, refreshToken, err := client.Login(exchangeLoginPrivateKey)
-	if err != nil {
-		return fmt.Errorf("failed to login before fetching market data: %w", err)
-	}
-	if accessToken == "" || refreshToken == "" {
-		return fmt.Errorf("exchange login returned empty tokens")
-	}
-	return nil
 }
 
 func FetchWholeBlockMarket(apiURL string, slot uint64) (*WholeBlockMarket, error) {
-	if err := ensureExchangeClientLoggedIn(); err != nil {
-		return nil, err
+	c := client
+	accessToken, _ := c.tokens()
+	if accessToken == "" {
+		return nil, errors.New("exchange authentication unavailable; background login pending")
 	}
 
-	market, statusCode, err := requestWholeBlockMarket(apiURL, slot)
-	if err == nil || statusCode != http.StatusUnauthorized {
-		return market, err
+	ctx, cancel := context.WithTimeout(context.Background(), marketRequestTimeout)
+	defer cancel()
+	market, statusCode, err := c.requestWholeBlockMarket(ctx, apiURL, slot, accessToken)
+	if statusCode == http.StatusUnauthorized {
+		c.invalidateAccessToken(accessToken)
 	}
-
-	if err := client.RefreshAccessToken(); err != nil {
-		return nil, fmt.Errorf("failed to refresh access token while fetching market data: %w", err)
-	}
-
-	market, _, err = requestWholeBlockMarket(apiURL, slot)
 	return market, err
 }
 
-func requestWholeBlockMarket(apiURL string, slot uint64) (*WholeBlockMarket, int, error) {
+func (c *ApiClient) requestWholeBlockMarket(ctx context.Context, apiURL string, slot uint64, accessToken string) (*WholeBlockMarket, int, error) {
 	url := fmt.Sprintf("%s/api/v1/p/wholeblock/market?slot=%d", apiURL, slot)
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to create market request: %w", err)
 	}
-	if client.AccessToken != "" {
-		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", client.AccessToken))
-	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
 
-	resp, err := client.Client.Do(req)
+	resp, err := c.Client.Do(req)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to fetch market status: %w", err)
 	}
@@ -5347,6 +5367,12 @@ func requestWholeBlockMarket(apiURL string, slot uint64) (*WholeBlockMarket, int
 	if marketResp.Markets.Slot != slot {
 		return nil, resp.StatusCode, fmt.Errorf("market response slot %d does not match requested slot %d", marketResp.Markets.Slot, slot)
 	}
+	if marketResp.Markets.MultiRelay == nil {
+		return nil, resp.StatusCode, fmt.Errorf("market response for slot %d has unknown multiRelay mode", slot)
+	}
+	if marketResp.Markets.RealTime == nil {
+		return nil, resp.StatusCode, fmt.Errorf("market response for slot %d has unknown realtime mode", slot)
+	}
 	return marketResp.Markets, resp.StatusCode, nil
 }
 func (c *ApiClient) Login(privateKey string) (string, string, error) {
@@ -5358,6 +5384,7 @@ func (c *ApiClient) Login(privateKey string) (string, string, error) {
 			accessToken := loginCache.AccessToken
 			refreshToken := loginCache.RefreshToken
 			loginCache.mutex.RUnlock()
+			c.setTokens(accessToken, refreshToken)
 			return accessToken, refreshToken, nil
 		}
 	}
@@ -5488,9 +5515,12 @@ func (c *ApiClient) tryLogin(privateKey string) (string, string, error) {
 		return "", "", fmt.Errorf("failed to parse verify data: %w", err)
 	}
 
-	c.AccessToken = verifyData.AccessToken.Token
-	c.RefreshToken = c.extractRefreshToken(verifyResp)
-	return c.AccessToken, c.RefreshToken, nil
+	accessToken, refreshToken := verifyData.AccessToken.Token, c.extractRefreshToken(verifyResp)
+	if accessToken == "" || refreshToken == "" {
+		return "", "", errors.New("exchange login returned empty tokens")
+	}
+	c.setTokens(accessToken, refreshToken)
+	return accessToken, refreshToken, nil
 }
 
 // Update the RefreshAccessToken method to include retries
@@ -5514,7 +5544,8 @@ func (c *ApiClient) tryRefreshAccessToken() error {
 	refreshURL := fmt.Sprintf("%s/api/v1/user/login/refresh", c.APIURL)
 
 	formData := url.Values{}
-	formData.Set("refreshToken", c.RefreshToken)
+	_, refreshToken := c.tokens()
+	formData.Set("refreshToken", refreshToken)
 
 	req, err := http.NewRequest("POST", refreshURL, strings.NewReader(formData.Encode()))
 	if err != nil {
@@ -5549,8 +5580,10 @@ func (c *ApiClient) tryRefreshAccessToken() error {
 		return fmt.Errorf("failed to parse verify data: %w", err)
 	}
 
-	// Save new access token
-	c.AccessToken = verifyData.AccessToken.Token
+	if verifyData.AccessToken.Token == "" {
+		return errors.New("exchange refresh returned empty access token")
+	}
+	c.setTokens(verifyData.AccessToken.Token, refreshToken)
 	return nil
 }
 
@@ -5564,51 +5597,49 @@ func (c *ApiClient) extractRefreshToken(resp *http.Response) string {
 }
 
 func InitLoginAndStartTokenRefresh() {
-	// Perform the initial login to get tokens
-	// TODO config
-
-	// privateKey := "8ca6e6e33b2170de9e6ce76bbb5808f8d5ec3e112c2c72cd0b97614f00061f0e"
-
-	accessToken, refreshToken, err := client.Login(exchangeLoginPrivateKey)
-	if err != nil || accessToken == "" || refreshToken == "" {
-		log.Printf("Failed to login during initialization: %v", err)
-		return
-	}
-
-	// Start a goroutine to refresh the tokens every 30 minutes
-	go client.startTokenRefreshLoop()
-	go client.startDailyLoginLoop(exchangeLoginPrivateKey)
+	c, privateKey := client, exchangeLoginPrivateKey
+	c.authOnce.Do(func() {
+		go c.runExchangeAuthentication(context.Background(), privateKey)
+	})
 }
 
-// startTokenRefreshLoop refreshes access tokens every 30 minutes
-func (c *ApiClient) startTokenRefreshLoop() {
-	log.Println("Starting access token refresh loop...")
-	ticker := time.NewTicker(30 * time.Minute)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		err := c.RefreshAccessToken()
-		if err != nil {
-			log.Printf("Failed to refresh access token: %v", err)
+// A single worker owns login and refresh retries, including recovery after an
+// initial outage or a rejected access token. Readers only use ready tokens.
+func (c *ApiClient) runExchangeAuthentication(ctx context.Context, privateKey string) {
+	var nextRefresh, nextLogin time.Time
+	for {
+		accessToken, refreshToken := c.tokens()
+		if accessToken == "" || time.Now().After(nextRefresh) || time.Now().After(nextLogin) {
+			var err error
+			if refreshToken != "" && time.Now().Before(nextLogin) {
+				err = c.RefreshAccessToken()
+				if err != nil {
+					log.Printf("Failed to refresh exchange token: %v", err)
+					c.setTokens("", "")
+				}
+			}
+			if refreshToken == "" || err != nil || !time.Now().Before(nextLogin) {
+				// A failed refresh must not reload rejected tokens from the login cache.
+				if err != nil {
+					loginCache.mutex.Lock()
+					loginCache.AccessToken, loginCache.RefreshToken = "", ""
+					loginCache.mutex.Unlock()
+				}
+				_, _, err = c.Login(privateKey)
+				if err == nil {
+					nextLogin = time.Now().Add(24 * time.Hour)
+				}
+			}
+			if err != nil {
+				log.Printf("Failed to authenticate with exchange; will retry in background: %v", err)
+			} else {
+				nextRefresh = time.Now().Add(30 * time.Minute)
+			}
 		}
-	}
-}
-
-// Update the startDailyLoginLoop to handle failures better
-func (c *ApiClient) startDailyLoginLoop(privateKey string) {
-	log.Println("Starting daily login loop...")
-	ticker := time.NewTicker(24 * time.Hour)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		accessToken, refreshToken, err := c.Login(privateKey)
-		if err != nil {
-			log.Printf("Failed to login during daily refresh: %v", err)
-			continue
-		}
-		if accessToken == "" || refreshToken == "" {
-			log.Printf("Received empty tokens during daily refresh")
-			continue
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(retryDelay):
 		}
 	}
 }
@@ -5902,9 +5933,15 @@ func (api *RelayAPI) processValidatorRegistrationsSSZ(regs []*builderApiV1.Signe
 			// See if we can discard (if no fields changed, or old timestamp)
 			isChangedFeeRecipient := cachedRegistrationData.FeeRecipient != signedValidatorRegistration.Message.FeeRecipient
 			isChangedGasLimit := cachedRegistrationData.GasLimit != signedValidatorRegistration.Message.GasLimit
+			isNewerTimestamp := signedValidatorRegistration.Message.Timestamp.After(cachedRegistrationData.Timestamp)
 			isTimestampStale := time.Now().UTC().Sub(cachedRegistrationData.InsertedAt) >= validatorRegistrationRefreshInterval
 			// If key fields haven't changed, can just discard without signature validation
 			if !isChangedFeeRecipient && !isChangedGasLimit && !isTimestampStale {
+				continue
+			}
+
+			// Ensure it's not a replay of an old registration, even when the cache is stale.
+			if !isNewerTimestamp {
 				continue
 			}
 		}

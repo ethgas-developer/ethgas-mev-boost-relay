@@ -251,6 +251,12 @@ func BuilderBlockRequestToSignedBuilderBid(payload *VersionedSubmitBlockRequest,
 }
 
 func SignedBlindedBeaconBlockToBeaconBlock(signedBlindedBeaconBlock *VersionedSignedBlindedBeaconBlock, blockPayload *builderApi.VersionedSubmitBlindedBlockResponse) (*VersionedSignedProposal, error) {
+	if signedBlindedBeaconBlock == nil || blockPayload == nil {
+		return nil, errors.New("missing blinded block or execution payload")
+	}
+	if signedBlindedBeaconBlock.Version != blockPayload.Version {
+		return nil, errors.New("blinded block and execution payload versions do not match")
+	}
 	signedBeaconBlock := VersionedSignedProposal{
 		eth2Api.VersionedSignedProposal{ //nolint:exhaustruct
 			Version: signedBlindedBeaconBlock.Version,
@@ -259,21 +265,45 @@ func SignedBlindedBeaconBlockToBeaconBlock(signedBlindedBeaconBlock *VersionedSi
 	switch signedBlindedBeaconBlock.Version {
 	case spec.DataVersionCapella:
 		capellaBlindedBlock := signedBlindedBeaconBlock.Capella
+		if capellaBlindedBlock == nil || capellaBlindedBlock.Message == nil || capellaBlindedBlock.Message.Body == nil {
+			return nil, errors.New("missing capella blinded block data")
+		}
+		if blockPayload.Capella == nil {
+			return nil, errors.New("missing capella execution payload data")
+		}
 		signedBeaconBlock.Capella = CapellaUnblindSignedBlock(capellaBlindedBlock, blockPayload.Capella)
 	case spec.DataVersionDeneb:
 		denebBlindedBlock := signedBlindedBeaconBlock.Deneb
+		if denebBlindedBlock == nil || denebBlindedBlock.Message == nil || denebBlindedBlock.Message.Body == nil {
+			return nil, errors.New("missing deneb blinded block data")
+		}
+		if blockPayload.Deneb == nil || blockPayload.Deneb.ExecutionPayload == nil || blockPayload.Deneb.BlobsBundle == nil {
+			return nil, errors.New("missing deneb execution payload data")
+		}
 		if len(denebBlindedBlock.Message.Body.BlobKZGCommitments) != len(blockPayload.Deneb.BlobsBundle.Blobs) {
 			return nil, errors.New("number of blinded blobs does not match blobs bundle length")
 		}
 		signedBeaconBlock.Deneb = DenebUnblindSignedBlock(denebBlindedBlock, blockPayload.Deneb)
 	case spec.DataVersionElectra:
 		electraBlindedBlock := signedBlindedBeaconBlock.Electra
+		if electraBlindedBlock == nil || electraBlindedBlock.Message == nil || electraBlindedBlock.Message.Body == nil {
+			return nil, errors.New("missing electra blinded block data")
+		}
+		if blockPayload.Electra == nil || blockPayload.Electra.ExecutionPayload == nil || blockPayload.Electra.BlobsBundle == nil {
+			return nil, errors.New("missing electra execution payload data")
+		}
 		if len(electraBlindedBlock.Message.Body.BlobKZGCommitments) != len(blockPayload.Electra.BlobsBundle.Blobs) {
 			return nil, errors.New("number of blinded blobs does not match blobs bundle length")
 		}
 		signedBeaconBlock.Electra = ElectraUnblindSignedBlock(electraBlindedBlock, blockPayload.Electra)
 	case spec.DataVersionFulu:
 		fuluBlindedBlock := signedBlindedBeaconBlock.Fulu
+		if fuluBlindedBlock == nil || fuluBlindedBlock.Message == nil || fuluBlindedBlock.Message.Body == nil {
+			return nil, errors.New("missing fulu blinded block data")
+		}
+		if blockPayload.Fulu == nil || blockPayload.Fulu.ExecutionPayload == nil || blockPayload.Fulu.BlobsBundle == nil {
+			return nil, errors.New("missing fulu execution payload data")
+		}
 		if len(fuluBlindedBlock.Message.Body.BlobKZGCommitments) != len(blockPayload.Fulu.BlobsBundle.Blobs) {
 			return nil, errors.New("number of blinded blobs does not match blobs bundle length")
 		}

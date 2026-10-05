@@ -36,6 +36,7 @@ var (
 	ErrAnotherPayloadAlreadyDeliveredForSlot = errors.New("another payload block hash for slot was already delivered")
 	ErrPastSlotAlreadyDelivered              = errors.New("payload for past slot was already delivered")
 	ErrGloasProposerPreferencesConflict      = errors.New("conflicting Gloas proposer preferences for the same duty and dependent root")
+	ErrInvalidPreconfReplacement             = errors.New("invalid preconf not allowed when valid preconf exists")
 
 	// Docs about redis settings: https://redis.io/docs/reference/clients/
 	redisConnectionPoolSize = cli.GetEnvInt("REDIS_CONNECTION_POOL_SIZE", 0) // 0 means use default (10 per CPU)
@@ -833,62 +834,85 @@ func (r *RedisCache) SaveBidAndUpdateTopBid(ctx context.Context, pipeliner redis
 	state.TimePrep = nextTime.Sub(prevTime)
 	prevTime = nextTime
 
-	//
-	// Time to save things in Redis
-	//
-	// 1. Save the execution payload
-	switch payload.Version {
-	case spec.DataVersionCapella:
-		err = r.SaveExecutionPayloadCapella(ctx, pipeliner, submission.BidTrace.Slot, submission.BidTrace.ProposerPubkey.String(), submission.BidTrace.BlockHash.String(), getPayloadResponse.Capella)
-		if err != nil {
-			return state, err
+	// Persist the bid and its validity together. WATCH makes the transition check
+	// effective across relay processes, including submissions already simulating
+	// when another request saves a valid bid.
+	keyIsValidPreconf := r.keyIsValidPreconf(submission.BidTrace.Slot, submission.BidTrace.ParentHash.String(), submission.BidTrace.ProposerPubkey.String(), submission.BidTrace.BuilderPubkey.String())
+	err = r.withPreconfGuard(ctx, keyIsValidPreconf, isValidPreconf, func(pipeliner redis.Pipeliner) error {
+		// Keep native reveal contents in the guarded transaction too. Rejected
+		// replacements must not overwrite the Gloas payload for an accepted bid.
+		if payload.Gloas != nil {
+			entry := &common.GloasPayloadCacheEntry{
+				Slot:         submission.BidTrace.Slot,
+				BlockHash:    submission.BidTrace.BlockHash,
+				FeeRecipient: submission.BidTrace.ProposerFeeRecipient,
+				BidTrace:     trace,
+				Contents:     payload.Gloas,
+			}
+			if err := r.SetObjPipelined(ctx, pipeliner, r.keyGloasPayload(entry.Slot, entry.BlockHash.String()), entry, expiryBidCache); err != nil {
+				return err
+			}
 		}
-	case spec.DataVersionDeneb:
-		err = r.SavePayloadContentsDeneb(ctx, pipeliner, submission.BidTrace.Slot, submission.BidTrace.ProposerPubkey.String(), submission.BidTrace.BlockHash.String(), getPayloadResponse.Deneb)
-		if err != nil {
-			return state, err
+		// 1. Save the execution payload
+		switch payload.Version {
+		case spec.DataVersionCapella:
+			err = r.SaveExecutionPayloadCapella(ctx, pipeliner, submission.BidTrace.Slot, submission.BidTrace.ProposerPubkey.String(), submission.BidTrace.BlockHash.String(), getPayloadResponse.Capella)
+			if err != nil {
+				return err
+			}
+		case spec.DataVersionDeneb:
+			err = r.SavePayloadContentsDeneb(ctx, pipeliner, submission.BidTrace.Slot, submission.BidTrace.ProposerPubkey.String(), submission.BidTrace.BlockHash.String(), getPayloadResponse.Deneb)
+			if err != nil {
+				return err
+			}
+		case spec.DataVersionElectra:
+			err = r.SavePayloadContentsElectra(ctx, pipeliner, submission.BidTrace.Slot, submission.BidTrace.ProposerPubkey.String(), submission.BidTrace.BlockHash.String(), getPayloadResponse.Electra)
+			if err != nil {
+				return err
+			}
+		case spec.DataVersionFulu:
+			err = r.SavePayloadContentsFulu(ctx, pipeliner, submission.BidTrace.Slot, submission.BidTrace.ProposerPubkey.String(), submission.BidTrace.BlockHash.String(), getPayloadResponse.Fulu)
+			if err != nil {
+				return err
+			}
+		case spec.DataVersionUnknown, spec.DataVersionPhase0, spec.DataVersionAltair, spec.DataVersionBellatrix:
+			return fmt.Errorf("unsupported payload version: %s", payload.Version) //nolint:goerr113
 		}
-	case spec.DataVersionElectra:
-		err = r.SavePayloadContentsElectra(ctx, pipeliner, submission.BidTrace.Slot, submission.BidTrace.ProposerPubkey.String(), submission.BidTrace.BlockHash.String(), getPayloadResponse.Electra)
-		if err != nil {
-			return state, err
-		}
-	case spec.DataVersionFulu:
-		err = r.SavePayloadContentsFulu(ctx, pipeliner, submission.BidTrace.Slot, submission.BidTrace.ProposerPubkey.String(), submission.BidTrace.BlockHash.String(), getPayloadResponse.Fulu)
-		if err != nil {
-			return state, err
-		}
-	case spec.DataVersionUnknown, spec.DataVersionPhase0, spec.DataVersionAltair, spec.DataVersionBellatrix:
-		return state, fmt.Errorf("unsupported payload version: %s", payload.Version) //nolint:goerr113
-	}
 
-	// Record time needed to save payload
-	nextTime = time.Now().UTC()
-	state.TimeSavePayload = nextTime.Sub(prevTime)
-	prevTime = nextTime
+		// Record time needed to save payload
+		nextTime = time.Now().UTC()
+		state.TimeSavePayload = nextTime.Sub(prevTime)
+		prevTime = nextTime
 
-	// 2. Save latest bid for this builder
-	err = r.SaveBuilderBid(ctx, pipeliner, submission.BidTrace.Slot, submission.BidTrace.ParentHash.String(), submission.BidTrace.ProposerPubkey.String(), submission.BidTrace.BuilderPubkey.String(), reqReceivedAt, getHeaderResponse)
+		// 2. Save latest bid for this builder
+		err = r.SaveBuilderBid(ctx, pipeliner, submission.BidTrace.Slot, submission.BidTrace.ParentHash.String(), submission.BidTrace.ProposerPubkey.String(), submission.BidTrace.BuilderPubkey.String(), reqReceivedAt, getHeaderResponse)
+		if err != nil {
+			return err
+		}
+
+		// Record time needed to save bid
+		nextTime = time.Now().UTC()
+		state.TimeSaveBid = nextTime.Sub(prevTime)
+		prevTime = nextTime
+
+		// 3. Save the bid trace
+		err = r.SaveBidTrace(ctx, pipeliner, trace)
+		if err != nil {
+			return err
+		}
+
+		// Record time needed to save trace
+		nextTime = time.Now().UTC()
+		state.TimeSaveTrace = nextTime.Sub(prevTime)
+		prevTime = nextTime
+
+		return pipeliner.Set(ctx, keyIsValidPreconf, strconv.FormatBool(isValidPreconf), expiryBidCache).Err()
+	})
 	if err != nil {
 		return state, err
 	}
+	state.WasBidSaved = true
 	builderBids.bidValues[submission.BidTrace.BuilderPubkey.String()] = submission.BidTrace.Value.ToBig()
-
-	// Record time needed to save bid
-	nextTime = time.Now().UTC()
-	state.TimeSaveBid = nextTime.Sub(prevTime)
-	prevTime = nextTime
-
-	// 3. Save the bid trace
-	err = r.SaveBidTrace(ctx, pipeliner, trace)
-	if err != nil {
-		return state, err
-	}
-
-	// Record time needed to save trace
-	nextTime = time.Now().UTC()
-	state.TimeSaveTrace = nextTime.Sub(prevTime)
-	prevTime = nextTime
 
 	// If top bid value hasn't changed, abort now
 	_, state.TopBidValue = builderBids.getTopBid()
@@ -902,8 +926,6 @@ func (r *RedisCache) SaveBidAndUpdateTopBid(ctx context.Context, pipeliner redis
 		return state, err
 	}
 	state.IsNewTopBid = submission.BidTrace.Value.ToBig().Cmp(state.TopBidValue) == 0
-	// An Exec happens in _updateTopBid.
-	state.WasBidSaved = true
 
 	// Record time needed to update top bid
 	nextTime = time.Now().UTC()
@@ -943,13 +965,6 @@ func (r *RedisCache) SaveBidAndUpdateTopBid(ctx context.Context, pipeliner redis
 		return state, err
 	}
 
-	keyIsValidPreconf := fmt.Sprintf("%s:%d_%s_%s/%s:isValidPreconf", r.prefixBlockBuilderLatestBids, trace.Slot, trace.ParentHash, trace.ProposerPubkey, trace.BuilderPubkey)
-
-	// Set isValidPreconf value
-	err = pipeliner.Set(ctx, keyIsValidPreconf, strconv.FormatBool(isValidPreconf), expiryBidCache).Err()
-	if err != nil {
-		return state, err
-	}
 	// Execute setting the floor bid
 	_, err = pipeliner.Exec(ctx)
 
@@ -1071,18 +1086,18 @@ func (r *RedisCache) GetBuilderLatestValue(slot uint64, parentHash, proposerPubk
 	return topBidValue, nil
 }
 
-// DelBuilderBid removes a builders most recent bid
-func (r *RedisCache) DelBuilderBid(ctx context.Context, pipeliner redis.Pipeliner, slot uint64, parentHash, proposerPubkey, builderPubkey string) (err error) {
-	// delete the value
-	keyLatestValue := r.keyBlockBuilderLatestBidsValue(slot, parentHash, proposerPubkey)
-	err = r.client.HDel(ctx, keyLatestValue, builderPubkey).Err()
-	if err != nil && !errors.Is(err, redis.Nil) {
-		return err
-	}
-
-	// delete the time
-	keyLatestBidsTime := r.keyBlockBuilderLatestBidsTime(slot, parentHash, proposerPubkey)
-	err = r.client.HDel(ctx, keyLatestBidsTime, builderPubkey).Err()
+// DelBuilderBid removes a builder's most recent bid for a below-floor cancellation.
+func (r *RedisCache) DelBuilderBid(ctx context.Context, pipeliner redis.Pipeliner, slot uint64, parentHash, proposerPubkey, builderPubkey string, isValidPreconf bool) (err error) {
+	key := r.keyIsValidPreconf(slot, parentHash, proposerPubkey, builderPubkey)
+	err = r.withPreconfGuard(ctx, key, isValidPreconf, func(pipe redis.Pipeliner) error {
+		keyLatestValue := r.keyBlockBuilderLatestBidsValue(slot, parentHash, proposerPubkey)
+		if err := pipe.HDel(ctx, keyLatestValue, builderPubkey).Err(); err != nil {
+			return err
+		}
+		keyLatestBidsTime := r.keyBlockBuilderLatestBidsTime(slot, parentHash, proposerPubkey)
+		// Preserve the validity marker: cancellation must not reset the guard.
+		return pipe.HDel(ctx, keyLatestBidsTime, builderPubkey).Err()
+	})
 	if err != nil {
 		return err
 	}
@@ -1121,9 +1136,37 @@ func (r *RedisCache) SetFloorBidValue(slot uint64, parentHash, proposerPubkey, v
 	return err
 }
 
+// withPreconfGuard checks commitment validity atomically with the bid mutation.
+// Retry a conflicting transaction so a newly saved valid bid rejects an invalid
+// replacement, even when both requests passed the API's earlier check.
+func (r *RedisCache) withPreconfGuard(ctx context.Context, key string, isValidPreconf bool, write func(redis.Pipeliner) error) error {
+	const maxAttempts = 5
+	var err error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		err = r.client.Watch(ctx, func(tx *redis.Tx) error {
+			wasValid, err := tx.Get(ctx, key).Bool()
+			if err != nil && !errors.Is(err, redis.Nil) {
+				return err
+			}
+			if wasValid && !isValidPreconf {
+				return ErrInvalidPreconfReplacement
+			}
+			_, err = tx.TxPipelined(ctx, write)
+			return err
+		}, key)
+		if !errors.Is(err, redis.TxFailedErr) {
+			return err
+		}
+	}
+	return err
+}
+
+func (r *RedisCache) keyIsValidPreconf(slot uint64, parentHash, proposerPubkey, builderPubkey string) string {
+	return fmt.Sprintf("%s:%d_%s_%s/%s:isValidPreconf", r.prefixBlockBuilderLatestBids, slot, parentHash, proposerPubkey, builderPubkey)
+}
+
 func (r *RedisCache) GetIsValidPreconf(slot uint64, parentHash, proposerPubkey, builderPubkey string) (bool, error) {
-	// Construct the key
-	key := fmt.Sprintf("%s:%d_%s_%s/%s:isValidPreconf", r.prefixBlockBuilderLatestBids, slot, parentHash, proposerPubkey, builderPubkey)
+	key := r.keyIsValidPreconf(slot, parentHash, proposerPubkey, builderPubkey)
 
 	// Get the value from Redis
 	val, err := r.client.Get(context.Background(), key).Result()
