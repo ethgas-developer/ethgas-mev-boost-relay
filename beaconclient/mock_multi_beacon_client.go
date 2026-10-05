@@ -5,10 +5,19 @@ import (
 	"github.com/attestantio/go-eth2-client/spec/capella"
 )
 
-type MockMultiBeaconClient struct{}
+type MockMultiBeaconClient struct {
+	HeaderForSlot             *GetHeaderResponse
+	HeaderForSlotErr          error
+	GloasBlockForSlot         *common.SignedBeaconBlockGloas
+	GloasBlockForSlotErr      error
+	PublishedEnvelope         any
+	PublishedBlobDataIncluded bool
+	PublishEnvelopeCode       int
+	PublishEnvelopeErr        error
+}
 
 func NewMockMultiBeaconClient() *MockMultiBeaconClient {
-	return &MockMultiBeaconClient{}
+	return &MockMultiBeaconClient{PublishEnvelopeCode: 200}
 }
 
 func (*MockMultiBeaconClient) BestSyncStatus() (*SyncStatusPayloadData, error) {
@@ -30,6 +39,20 @@ func (*MockMultiBeaconClient) GetProposerDuties(epoch uint64) (*ProposerDutiesRe
 
 func (*MockMultiBeaconClient) PublishBlock(block *common.VersionedSignedProposal) (code int, err error) {
 	return 0, nil
+}
+
+func (c *MockMultiBeaconClient) GetHeaderForSlot(slot uint64) (*GetHeaderResponse, error) {
+	return c.HeaderForSlot, c.HeaderForSlotErr
+}
+
+func (c *MockMultiBeaconClient) GetGloasSignedBeaconBlock(slot uint64, contentType string) (*common.SignedBeaconBlockGloas, error) {
+	return c.GloasBlockForSlot, c.GloasBlockForSlotErr
+}
+
+func (c *MockMultiBeaconClient) PublishExecutionPayloadEnvelope(envelope any, blobDataIncluded bool) (code int, err error) {
+	c.PublishedEnvelope = envelope
+	c.PublishedBlobDataIncluded = blobDataIncluded
+	return c.PublishEnvelopeCode, c.PublishEnvelopeErr
 }
 
 func (*MockMultiBeaconClient) GetGenesis() (*GetGenesisResponse, error) {

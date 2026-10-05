@@ -22,14 +22,17 @@ import (
 	builderApiV1 "github.com/attestantio/go-builder-client/api/v1"
 	builderSpec "github.com/attestantio/go-builder-client/spec"
 	"github.com/attestantio/go-eth2-client/spec"
+	"github.com/attestantio/go-eth2-client/spec/altair"
 	"github.com/attestantio/go-eth2-client/spec/bellatrix"
 	"github.com/attestantio/go-eth2-client/spec/capella"
 	"github.com/attestantio/go-eth2-client/spec/deneb"
+	"github.com/attestantio/go-eth2-client/spec/electra"
 	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/flashbots/go-boost-utils/bls"
 	"github.com/flashbots/go-boost-utils/ssz"
 	"github.com/flashbots/go-boost-utils/utils"
 	"github.com/holiman/uint256"
+	bitfield "github.com/prysmaticlabs/go-bitfield"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 )
@@ -53,6 +56,28 @@ type testBackend struct {
 	relay     *RelayAPI
 	datastore *datastore.Datastore
 	redis     *datastore.RedisCache
+}
+
+type gloasDeliveryRecord struct {
+	bidTrace          *common.BidTraceV2WithBlobFields
+	signedBeaconBlock any
+	signedAt          time.Time
+	publishMs         uint64
+}
+
+type recordingGloasDeliveryDB struct {
+	database.MockDB
+	record *gloasDeliveryRecord
+}
+
+func (db *recordingGloasDeliveryDB) SaveDeliveredPayloadGloas(bidTrace *common.BidTraceV2WithBlobFields, signedBeaconBlock any, signedAt time.Time, publishMs uint64) error {
+	db.record = &gloasDeliveryRecord{
+		bidTrace:          bidTrace,
+		signedBeaconBlock: signedBeaconBlock,
+		signedAt:          signedAt,
+		publishMs:         publishMs,
+	}
+	return nil
 }
 
 func newTestBackend(t require.TestingT, numBeaconNodes int) *testBackend {
@@ -615,6 +640,147 @@ func TestGetExecutionPayloadBid(t *testing.T) {
 	rr = backend.request(http.MethodGet, path, nil)
 	require.Equal(t, http.StatusMethodNotAllowed, rr.Code)
 
+	beaconBlockRoot := "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	mockBeacon := beaconclient.NewMockMultiBeaconClient()
+	mockBeacon.HeaderForSlot = &beaconclient.GetHeaderResponse{}
+	mockBeacon.HeaderForSlot.Data.Root = beaconBlockRoot
+	mockBeacon.HeaderForSlot.Data.Header.Message = &beaconclient.GetHeaderResponseMessage{
+		Slot:          testSlot,
+		ProposerIndex: 17,
+		ParentRoot:    parentRoot,
+		StateRoot:     phase0.Root{}.String(),
+	}
+	backend.relay.beaconClient = mockBeacon
+	deliveryDB := &recordingGloasDeliveryDB{}
+	backend.relay.db = deliveryDB
+	signedBlock := &common.SignedBeaconBlockGloas{
+		Message: &common.BeaconBlockGloas{
+			Slot:          phase0.Slot(testSlot),
+			ProposerIndex: 17,
+			ParentRoot:    parentBeaconRoot,
+			Body: &common.BeaconBlockBodyGloas{
+				ETH1Data:                  &phase0.ETH1Data{BlockHash: make([]byte, 32)},
+				ProposerSlashings:         []*phase0.ProposerSlashing{},
+				AttesterSlashings:         []*electra.AttesterSlashing{},
+				Attestations:              []*electra.Attestation{},
+				Deposits:                  []*phase0.Deposit{},
+				VoluntaryExits:            []*phase0.SignedVoluntaryExit{},
+				SyncAggregate:             &altair.SyncAggregate{SyncCommitteeBits: bitfield.Bitvector512(make([]byte, 64))},
+				BLSToExecutionChanges:     []*capella.SignedBLSToExecutionChange{},
+				SignedExecutionPayloadBid: cappedResponse.Data,
+				PayloadAttestations:       []*common.PayloadAttestationGloas{},
+				ParentExecutionRequests:   common.NewExecutionRequestsGloas(nil),
+			},
+		},
+	}
+	mockBeacon.GloasBlockForSlot = signedBlock
+	mockBeacon.HeaderForSlot.Data.Header.Signature = signedBlock.Signature.String()
+	signedBlockBytes, err := json.Marshal(signedBlock)
+	require.NoError(t, err)
+	signedBlockBody := string(signedBlockBytes)
+	mismatchedExecutionRequests := common.NewExecutionRequestsGloas(nil)
+	mismatchedExecutionRequests.BuilderExits = []*common.BuilderExitRequestGloas{{}}
+
+	t.Run("rejects process-local execution requests that do not match the selected bid", func(t *testing.T) {
+		backend.relay.gloasPayloadsLock.RLock()
+		selected := backend.relay.gloasSelectedPayloads[testSlot]
+		backend.relay.gloasPayloadsLock.RUnlock()
+		require.NotNil(t, selected)
+		require.NotNil(t, selected.payload)
+
+		backend.relay.gloasPayloadsLock.Lock()
+		originalExecutionRequests := selected.payload.executionRequests
+		selected.payload.executionRequests = mismatchedExecutionRequests
+		backend.relay.gloasPayloadsLock.Unlock()
+		t.Cleanup(func() {
+			backend.relay.gloasPayloadsLock.Lock()
+			selected.payload.executionRequests = originalExecutionRequests
+			backend.relay.gloasPayloadsLock.Unlock()
+		})
+
+		mockBeacon.PublishedEnvelope = nil
+		rr := backend.requestBytes(http.MethodPost, pathSubmitSignedBeaconBlock, []byte(signedBlockBody), headers)
+		require.Equal(t, http.StatusInternalServerError, rr.Code, rr.Body.String())
+		require.Contains(t, rr.Body.String(), "execution requests do not match bid")
+		require.Nil(t, mockBeacon.PublishedEnvelope)
+	})
+
+	t.Run("rejects Redis-recovered execution requests that do not match the selected bid", func(t *testing.T) {
+		cachedPayload, err := backend.redis.GetGloasPayload(testSlot, gloasPayload.BlockHash.String())
+		require.NoError(t, err)
+		require.NotNil(t, cachedPayload)
+		require.NotNil(t, cachedPayload.Contents)
+		originalExecutionRequests := cachedPayload.Contents.ExecutionRequests
+		cachedPayload.Contents.ExecutionRequests = mismatchedExecutionRequests
+		require.NoError(t, backend.redis.SaveGloasPayload(cachedPayload))
+		t.Cleanup(func() {
+			cachedPayload.Contents.ExecutionRequests = originalExecutionRequests
+			require.NoError(t, backend.redis.SaveGloasPayload(cachedPayload))
+			backend.relay.gloasPayloadsLock.Lock()
+			backend.relay.gloasPayloads = make(map[string]*gloasPayloadContext)
+			backend.relay.gloasSelectedPayloads = make(map[uint64]*gloasSelectedPayloadContext)
+			backend.relay.gloasPayloadsLock.Unlock()
+		})
+
+		backend.relay.gloasPayloadsLock.Lock()
+		backend.relay.gloasPayloads = make(map[string]*gloasPayloadContext)
+		backend.relay.gloasSelectedPayloads = make(map[uint64]*gloasSelectedPayloadContext)
+		backend.relay.gloasPayloadsLock.Unlock()
+		mockBeacon.PublishedEnvelope = nil
+		rr := backend.requestBytes(http.MethodPost, pathSubmitSignedBeaconBlock, []byte(signedBlockBody), headers)
+		require.Equal(t, http.StatusInternalServerError, rr.Code, rr.Body.String())
+		require.Contains(t, rr.Body.String(), "execution requests do not match bid")
+		require.Nil(t, mockBeacon.PublishedEnvelope)
+	})
+
+	rr = backend.requestBytes(http.MethodPost, pathSubmitSignedBeaconBlock, []byte(fmt.Sprintf(`{"message":{"slot":"%d"}}`, testSlot)), headers)
+	require.Equal(t, http.StatusBadRequest, rr.Code, rr.Body.String())
+	// Clear both maps before the valid request. The selected bid and complete V6
+	// payload must be recovered from Redis rather than process memory.
+	backend.relay.gloasPayloads = make(map[string]*gloasPayloadContext)
+	backend.relay.gloasSelectedPayloads = make(map[uint64]*gloasSelectedPayloadContext)
+	rr = backend.requestBytes(http.MethodPost, pathSubmitSignedBeaconBlock, []byte(signedBlockBody), headers)
+	require.Equal(t, http.StatusAccepted, rr.Code, rr.Body.String())
+	require.NotNil(t, deliveryDB.record)
+	require.Equal(t, gloasPayload.BlockHash, deliveryDB.record.bidTrace.BlockHash)
+	require.WithinDuration(t, time.Now(), deliveryDB.record.signedAt, time.Second)
+	require.JSONEq(t, signedBlockBody, string(deliveryDB.record.signedBeaconBlock.(json.RawMessage)))
+	published, ok := mockBeacon.PublishedEnvelope.(*common.SignedExecutionPayloadEnvelope)
+	require.True(t, ok)
+	beaconBlockRootHash, err := utils.HexToHash(beaconBlockRoot)
+	require.NoError(t, err)
+	require.Equal(t, phase0.Root(beaconBlockRootHash), published.Message.BeaconBlockRoot)
+	require.Equal(t, parentBeaconRoot, published.Message.ParentBeaconBlockRoot)
+	verified, err = ssz.VerifySignature(
+		published.Message,
+		backend.relay.opts.EthNetDetails.DomainBeaconBuilderGloas,
+		backend.relay.publicKey[:],
+		published.Signature[:],
+	)
+	require.NoError(t, err)
+	require.True(t, verified)
+
+	// The SSZ request is decoded into the same complete Gloas block and is
+	// checked against both the held bid and the canonical beacon-node block.
+	signedBlockSSZ, err := signedBlock.MarshalSSZ()
+	require.NoError(t, err)
+	rr = backend.requestBytes(http.MethodPost, pathSubmitSignedBeaconBlock, signedBlockSSZ, map[string]string{
+		HeaderEthConsensusVersion: "gloas",
+		HeaderContentType:         common.ApplicationOctetStream,
+	})
+	require.Equal(t, http.StatusAccepted, rr.Code, rr.Body.String())
+	require.NotNil(t, deliveryDB.record)
+	recordedSSZ, err := json.Marshal(deliveryDB.record.signedBeaconBlock)
+	require.NoError(t, err)
+	require.JSONEq(t, fmt.Sprintf(`{"version":"gloas","content_type":"application/octet-stream","data":"0x%x"}`, signedBlockSSZ), string(recordedSSZ))
+
+	// 202 means the envelope was broadcast but did not pass full validation; it
+	// must not be recorded as delivered or acknowledged to the validator.
+	deliveryDB.record = nil
+	mockBeacon.PublishEnvelopeCode = http.StatusAccepted
+	rr = backend.requestBytes(http.MethodPost, pathSubmitSignedBeaconBlock, []byte(signedBlockBody), headers)
+	require.Equal(t, http.StatusBadGateway, rr.Code, rr.Body.String())
+	require.Nil(t, deliveryDB.record)
 }
 
 func TestSubmitBuilderPreferences(t *testing.T) {

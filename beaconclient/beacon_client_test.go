@@ -2,13 +2,17 @@ package beaconclient
 
 import (
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
 	"bitbucket.org/infinity-exchange/mev-boost-relay/common"
+	"bitbucket.org/infinity-exchange/mev-boost-relay/database"
+	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/gorilla/mux"
+	"github.com/holiman/uint256"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -16,6 +20,54 @@ import (
 const testPubKey = "0x93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74a"
 
 var errTest = errors.New("test error")
+
+type blockPublishRecord struct {
+	slot               int64
+	beaconIP           string
+	slotStartTimestamp int64
+	publishTimestamp   int64
+	finishTimestamp    int64
+	blockHash          string
+	msIntoSlot         int64
+}
+
+type recordingBlockPublishDB struct {
+	database.MockDB
+	records chan blockPublishRecord
+}
+
+type recordingEnvelopeBeaconInstance struct {
+	*MockBeaconInstance
+	uri        string
+	calls      chan<- string
+	statusCode int
+	err        error
+}
+
+func (instance *recordingEnvelopeBeaconInstance) GetPublishURI() string {
+	return instance.uri
+}
+
+func (instance *recordingEnvelopeBeaconInstance) PublishExecutionPayloadEnvelope(envelope any, blobDataIncluded bool, broadcastMode BroadcastMode) (code int, err error) {
+	instance.calls <- instance.uri
+	if instance.statusCode == 0 {
+		instance.statusCode = http.StatusOK
+	}
+	return instance.statusCode, instance.err
+}
+
+func (db *recordingBlockPublishDB) InsertBlockPublish(slot int64, beaconIP string, slotStartTimestamp, publishTimestamp, finishTimestamp int64, blockHash string, msIntoSlot int64) error {
+	db.records <- blockPublishRecord{
+		slot:               slot,
+		beaconIP:           beaconIP,
+		slotStartTimestamp: slotStartTimestamp,
+		publishTimestamp:   publishTimestamp,
+		finishTimestamp:    finishTimestamp,
+		blockHash:          blockHash,
+		msIntoSlot:         msIntoSlot,
+	}
+	return nil
+}
 
 func validatorResponseEntryToMap(entries []ValidatorResponseEntry) map[string]ValidatorResponseEntry {
 	m := make(map[string]ValidatorResponseEntry)
@@ -80,6 +132,110 @@ func TestBeaconInstance(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, vals.Data, 1)
 	require.Contains(t, validatorResponseEntryToMap(vals.Data), "0x93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74a")
+}
+
+func TestPublishExecutionPayloadEnvelope(t *testing.T) {
+	r := mux.NewRouter()
+	srv := httptest.NewServer(r)
+	t.Cleanup(srv.Close)
+	r.HandleFunc("/eth/v1/beacon/genesis", func(w http.ResponseWriter, _ *http.Request) {
+		_, err := w.Write([]byte(`{"data":{"genesis_time":"1"}}`))
+		require.NoError(t, err)
+	}).Methods(http.MethodGet)
+	bc := NewProdBeaconInstance(common.TestLog, srv.URL, srv.URL)
+	publishDB := &recordingBlockPublishDB{records: make(chan blockPublishRecord, 1)}
+	bc.SetDB(publishDB)
+
+	blockHash := phase0.Hash32{1, 2, 3}
+	envelope := &common.SignedExecutionPayloadEnvelope{
+		Message: &common.ExecutionPayloadEnvelope{
+			Payload:      &common.ExecutionPayloadGloas{SlotNumber: 42, BlockHash: blockHash, BaseFeePerGas: uint256.NewInt(0)},
+			BuilderIndex: 7,
+		},
+	}
+
+	r.HandleFunc("/eth/v1/beacon/execution_payload_envelopes", func(w http.ResponseWriter, req *http.Request) {
+		require.Equal(t, http.MethodPost, req.Method)
+		require.Equal(t, "consensus", req.URL.Query().Get("broadcast_validation"))
+		require.Equal(t, "gloas", req.Header.Get("Eth-Consensus-Version"))
+		require.Equal(t, "true", req.Header.Get("Eth-Blob-Data-Included"))
+		require.Equal(t, "application/json", req.Header.Get("Content-Type"))
+		body, err := io.ReadAll(req.Body)
+		require.NoError(t, err)
+		require.Contains(t, string(body), `"builder_index":"7"`)
+		require.Contains(t, string(body), `"slot_number":"42"`)
+		require.Contains(t, string(body), blockHash.String())
+		w.WriteHeader(http.StatusOK)
+	}).Methods(http.MethodPost)
+
+	code, err := bc.PublishExecutionPayloadEnvelope(
+		envelope,
+		true,
+		Consensus,
+	)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, code)
+	select {
+	case record := <-publishDB.records:
+		require.Equal(t, int64(42), record.slot)
+		require.Equal(t, srv.URL, record.beaconIP)
+		require.Equal(t, int64(1+42*common.SecondsPerSlot), record.slotStartTimestamp)
+		require.Equal(t, blockHash.String(), record.blockHash)
+		require.LessOrEqual(t, record.publishTimestamp, record.finishTimestamp)
+		require.Equal(t, record.publishTimestamp-record.slotStartTimestamp*1000, record.msIntoSlot)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for block_publish record")
+	}
+}
+
+func TestMultiBeaconClientPublishesExecutionPayloadEnvelopeToEveryEndpoint(t *testing.T) {
+	calls := make(chan string, 2)
+	instances := []IBeaconInstance{
+		&recordingEnvelopeBeaconInstance{MockBeaconInstance: NewMockBeaconInstance(), uri: "beacon-a", calls: calls},
+		&recordingEnvelopeBeaconInstance{MockBeaconInstance: NewMockBeaconInstance(), uri: "beacon-b", calls: calls},
+	}
+	client := NewMultiBeaconClient(common.TestLog, instances)
+
+	code, err := client.PublishExecutionPayloadEnvelope(struct{}{}, false)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, code)
+
+	called := make(map[string]bool, len(instances))
+	for range instances {
+		select {
+		case uri := <-calls:
+			called[uri] = true
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for all beacon publication endpoints")
+		}
+	}
+	require.Equal(t, map[string]bool{"beacon-a": true, "beacon-b": true}, called)
+}
+
+func TestMultiBeaconClientExecutionPayloadEnvelopePublicationResults(t *testing.T) {
+	t.Run("all accepted responses are not integrated", func(t *testing.T) {
+		calls := make(chan string, 2)
+		client := NewMultiBeaconClient(common.TestLog, []IBeaconInstance{
+			&recordingEnvelopeBeaconInstance{MockBeaconInstance: NewMockBeaconInstance(), uri: "beacon-a", calls: calls, statusCode: http.StatusAccepted},
+			&recordingEnvelopeBeaconInstance{MockBeaconInstance: NewMockBeaconInstance(), uri: "beacon-b", calls: calls, statusCode: http.StatusAccepted},
+		})
+
+		code, err := client.PublishExecutionPayloadEnvelope(struct{}{}, false)
+		require.Equal(t, http.StatusAccepted, code)
+		require.ErrorIs(t, err, ErrExecutionPayloadEnvelope202)
+	})
+
+	t.Run("one integrated response succeeds", func(t *testing.T) {
+		calls := make(chan string, 2)
+		client := NewMultiBeaconClient(common.TestLog, []IBeaconInstance{
+			&recordingEnvelopeBeaconInstance{MockBeaconInstance: NewMockBeaconInstance(), uri: "beacon-a", calls: calls, statusCode: http.StatusAccepted},
+			&recordingEnvelopeBeaconInstance{MockBeaconInstance: NewMockBeaconInstance(), uri: "beacon-b", calls: calls, statusCode: http.StatusOK},
+		})
+
+		code, err := client.PublishExecutionPayloadEnvelope(struct{}{}, false)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusOK, code)
+	})
 }
 
 func TestGetSyncStatus(t *testing.T) {

@@ -18,6 +18,7 @@ import (
 	_ "net/http/pprof"
 	"net/url"
 	"os"
+	"reflect"
 	"slices"
 	"sort"
 	"strconv"
@@ -103,6 +104,7 @@ var (
 	pathGetHeader                = "/eth/v1/builder/header/{slot:[0-9]+}/{parent_hash:0x[a-fA-F0-9]+}/{pubkey:0x[a-fA-F0-9]+}"
 	pathSubmitBuilderPreferences = "/eth/v1/builder/builder_preferences/{proposer_pubkey:0x[a-fA-F0-9]+}"
 	pathGetExecutionPayloadBid   = "/eth/v1/builder/execution_payload_bid/{slot:[0-9]+}/{parent_hash:0x[a-fA-F0-9]+}/{parent_root:0x[a-fA-F0-9]+}/{proposer_pubkey:0x[a-fA-F0-9]+}"
+	pathSubmitSignedBeaconBlock  = "/eth/v1/builder/beacon_blocks"
 	// pathGetPayload        = "/eth/v1/builder/blinded_blocks"
 	pathGetPayloadV1 = "/eth/v1/builder/blinded_blocks"
 	pathGetPayloadV2 = "/eth/v2/builder/blinded_blocks"
@@ -930,6 +932,7 @@ func (api *RelayAPI) getRouter() http.Handler {
 		r.HandleFunc(pathGetHeader, api.handleGetHeader).Methods(http.MethodGet)
 		r.HandleFunc(pathSubmitBuilderPreferences, api.handleSubmitBuilderPreferences).Methods(http.MethodPost)
 		r.HandleFunc(pathGetExecutionPayloadBid, api.handleGetExecutionPayloadBid).Methods(http.MethodPost)
+		r.HandleFunc(pathSubmitSignedBeaconBlock, api.handleSubmitSignedBeaconBlock).Methods(http.MethodPost)
 		r.HandleFunc(pathGetPayloadV1, api.handleGetPayloadV1).Methods(http.MethodPost)
 		r.HandleFunc(pathGetPayloadV2, api.handleGetPayloadV2).Methods(http.MethodPost)
 		// r.HandleFunc(pathGetPayload, api.handleGetPayload).Methods(http.MethodPost)
@@ -2136,6 +2139,223 @@ func (api *RelayAPI) respondGetExecutionPayloadBidSSZ(w http.ResponseWriter, bid
 
 // handleSubmitSignedBeaconBlock receives the proposer-signed Gloas beacon
 // block from Lighthouse, constructs and signs the matching execution payload
+// envelope, and publishes it to the configured beacon nodes.
+func (api *RelayAPI) handleSubmitSignedBeaconBlock(w http.ResponseWriter, req *http.Request) {
+	log := api.log.WithFields(logrus.Fields{
+		"method":           "submitSignedBeaconBlock",
+		"consensusVersion": req.Header.Get(HeaderEthConsensusVersion),
+		"contentType":      req.Header.Get(HeaderContentType),
+	})
+	if !strings.EqualFold(req.Header.Get(HeaderEthConsensusVersion), "gloas") {
+		api.RespondError(w, http.StatusBadRequest, "Eth-Consensus-Version must be gloas")
+		return
+	}
+	if api.opts.GloasBuilderIndex == nil || api.blsSk == nil {
+		api.RespondError(w, http.StatusServiceUnavailable, "Gloas builder identity is not configured")
+		return
+	}
+	contentType, _, err := getHeaderContentType(req.Header)
+	if err != nil {
+		api.RespondError(w, http.StatusUnsupportedMediaType, err.Error())
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(req.Body, int64(apiMaxPayloadBytes)))
+	if err != nil {
+		api.RespondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	submittedBlock := new(common.SignedBeaconBlockGloas)
+	if contentType == common.ApplicationOctetStream {
+		err = submittedBlock.UnmarshalSSZ(body)
+	} else {
+		err = json.Unmarshal(body, submittedBlock)
+	}
+	if err != nil {
+		api.RespondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	slot := uint64(submittedBlock.Message.Slot)
+	decodedAt := time.Now().UTC()
+	log = log.WithField("slot", slot)
+
+	api.gloasPayloadsLock.RLock()
+	selectedPayload := api.gloasSelectedPayloads[slot]
+	api.gloasPayloadsLock.RUnlock()
+	if selectedPayload == nil {
+		cachedSelection, cacheErr := api.redis.GetGloasSelectedPayload(slot)
+		if cacheErr != nil {
+			log.WithError(cacheErr).Error("failed to load selected Gloas payload")
+			api.RespondError(w, http.StatusInternalServerError, "failed to load selected Gloas payload")
+			return
+		}
+		if cachedSelection != nil {
+			cachedPayload, payloadErr := api.redis.GetGloasPayload(slot, cachedSelection.BlockHash.String())
+			if payloadErr != nil {
+				log.WithError(payloadErr).Error("failed to load selected Gloas reveal payload")
+				api.RespondError(w, http.StatusInternalServerError, "failed to load selected Gloas reveal payload")
+				return
+			}
+			payloadContext, payloadErr := gloasPayloadContextFromCache(cachedPayload)
+			if payloadErr != nil {
+				log.WithError(payloadErr).Error("invalid selected Gloas reveal payload")
+				api.RespondError(w, http.StatusInternalServerError, "invalid selected Gloas reveal payload")
+				return
+			}
+			selectedPayload = &gloasSelectedPayloadContext{payload: payloadContext, bid: cachedSelection.Bid}
+			api.gloasPayloadsLock.Lock()
+			api.gloasPayloads[gloasPayloadKey(slot, payloadContext.blockHash)] = payloadContext
+			api.gloasSelectedPayloads[slot] = selectedPayload
+			api.gloasPayloadsLock.Unlock()
+		}
+	}
+	if selectedPayload == nil || selectedPayload.payload == nil || selectedPayload.bid == nil {
+		log.Warn("no selected Gloas payload is cached for signed beacon block")
+		api.RespondError(w, http.StatusNotFound, "no selected Gloas payload for slot")
+		return
+	}
+	if selectedPayload.bid.Message == nil {
+		log.Error("selected Gloas bid is incomplete")
+		api.RespondError(w, http.StatusInternalServerError, "selected Gloas bid is incomplete")
+		return
+	}
+	payloadContext := selectedPayload.payload
+	executionRequestsRoot, err := payloadContext.executionRequests.HashTreeRoot()
+	if err != nil {
+		log.WithError(err).Error("invalid execution requests in selected Gloas payload")
+		api.RespondError(w, http.StatusInternalServerError, "selected Gloas execution requests are invalid")
+		return
+	}
+	actualExecutionRequestsRoot := phase0.Root(executionRequestsRoot)
+	if actualExecutionRequestsRoot != selectedPayload.bid.Message.ExecutionRequestsRoot {
+		log.WithFields(logrus.Fields{
+			"bidExecutionRequestsRoot":     selectedPayload.bid.Message.ExecutionRequestsRoot.String(),
+			"payloadExecutionRequestsRoot": actualExecutionRequestsRoot.String(),
+		}).Error("selected Gloas execution requests do not match bid")
+		api.RespondError(w, http.StatusInternalServerError, "selected Gloas execution requests do not match bid")
+		return
+	}
+	if !reflect.DeepEqual(submittedBlock.Message.Body.SignedExecutionPayloadBid, selectedPayload.bid) {
+		api.RespondError(w, http.StatusBadRequest, "signed beacon block does not contain the complete selected relay bid")
+		return
+	}
+
+	var signedBeaconBlockForDB any = json.RawMessage(body)
+	if contentType == common.ApplicationOctetStream {
+		// payload_delivered is a JSON column. Preserve an SSZ request losslessly
+		// in a self-describing JSON object instead of attempting to place raw
+		// binary in that column.
+		signedBeaconBlockForDB = struct {
+			Version     string `json:"version"`
+			ContentType string `json:"content_type"`
+			Data        string `json:"data"`
+		}{
+			Version:     "gloas",
+			ContentType: common.ApplicationOctetStream,
+			Data:        "0x" + hex.EncodeToString(body),
+		}
+	}
+
+	var canonicalBlock *common.SignedBeaconBlockGloas
+	for attempt := 0; attempt < 5; attempt++ {
+		canonicalBlock, err = api.beaconClient.GetGloasSignedBeaconBlock(slot, contentType)
+		if err == nil && canonicalBlock != nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil || canonicalBlock == nil {
+		log.WithError(err).Error("failed to resolve consensus-validated Gloas beacon block")
+		api.RespondError(w, http.StatusBadGateway, "failed to resolve consensus-validated Gloas beacon block")
+		return
+	}
+	if !submittedBlock.Equal(canonicalBlock) {
+		api.RespondError(w, http.StatusBadRequest, "submitted Gloas beacon block does not match the canonical signed block")
+		return
+	}
+
+	var header *beaconclient.GetHeaderResponse
+	for attempt := 0; attempt < 5; attempt++ {
+		header, err = api.beaconClient.GetHeaderForSlot(slot)
+		if err == nil && header != nil && header.Data.Header.Message != nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil || header == nil || header.Data.Header.Message == nil {
+		log.WithError(err).Error("failed to resolve published beacon block root")
+		api.RespondError(w, http.StatusBadGateway, "failed to resolve published beacon block root")
+		return
+	}
+	if header.Data.Header.Message.Slot != slot {
+		api.RespondError(w, http.StatusBadGateway, "beacon node returned a header for a different slot")
+		return
+	}
+	if header.Data.Header.Message.ProposerIndex != uint64(submittedBlock.Message.ProposerIndex) ||
+		!strings.EqualFold(header.Data.Header.Message.ParentRoot, submittedBlock.Message.ParentRoot.String()) ||
+		!strings.EqualFold(header.Data.Header.Message.StateRoot, submittedBlock.Message.StateRoot.String()) ||
+		!strings.EqualFold(header.Data.Header.Signature, submittedBlock.Signature.String()) {
+		api.RespondError(w, http.StatusBadGateway, "beacon block and canonical header do not match")
+		return
+	}
+	beaconBlockRootHash, err := utils.HexToHash(header.Data.Root)
+	if err != nil {
+		api.RespondError(w, http.StatusBadGateway, "beacon node returned an invalid block root")
+		return
+	}
+	parentRootHash, err := utils.HexToHash(header.Data.Header.Message.ParentRoot)
+	if err != nil {
+		api.RespondError(w, http.StatusBadGateway, "beacon node returned an invalid parent root")
+		return
+	}
+
+	envelope := &common.ExecutionPayloadEnvelope{
+		Payload:               payloadContext.payload,
+		ExecutionRequests:     payloadContext.executionRequests,
+		BuilderIndex:          common.Uint64String(*api.opts.GloasBuilderIndex),
+		BeaconBlockRoot:       phase0.Root(beaconBlockRootHash),
+		ParentBeaconBlockRoot: phase0.Root(parentRootHash),
+	}
+	signature, err := ssz.SignMessage(envelope, api.opts.EthNetDetails.DomainBeaconBuilderGloas, api.blsSk)
+	if err != nil {
+		log.WithError(err).Error("failed to sign Gloas execution payload envelope")
+		api.RespondError(w, http.StatusInternalServerError, "failed to sign execution payload envelope")
+		return
+	}
+	signedEnvelope := &common.SignedExecutionPayloadEnvelope{Message: envelope, Signature: signature}
+	var publication any = signedEnvelope
+	blobDataIncluded := payloadContext.blobsBundle != nil && len(payloadContext.blobsBundle.Blobs) > 0
+	if blobDataIncluded {
+		publication = &common.SignedExecutionPayloadEnvelopeContents{
+			SignedExecutionPayloadEnvelope: signedEnvelope,
+			KZGProofs:                      payloadContext.blobsBundle.Proofs,
+			Blobs:                          payloadContext.blobsBundle.Blobs,
+		}
+	}
+	publishStartedAt := time.Now().UTC()
+	statusCode, err := api.beaconClient.PublishExecutionPayloadEnvelope(publication, blobDataIncluded)
+	publishMs := uint64(time.Since(publishStartedAt).Milliseconds()) //nolint:gosec
+	if err != nil || statusCode < http.StatusOK || statusCode >= http.StatusMultipleChoices || statusCode == http.StatusAccepted {
+		if err == nil {
+			err = fmt.Errorf("beacon node returned non-integrated status %d", statusCode)
+		}
+		log.WithError(err).WithField("statusCode", statusCode).Error("failed to publish Gloas execution payload envelope")
+		api.RespondError(w, http.StatusBadGateway, "beacon node rejected execution payload envelope")
+		return
+	}
+	if payloadContext.bidTrace == nil {
+		log.Error("cannot save delivered Gloas payload without its bid trace")
+	} else if err := api.db.SaveDeliveredPayloadGloas(payloadContext.bidTrace, signedBeaconBlockForDB, decodedAt, publishMs); err != nil {
+		log.WithError(err).Error("failed to save delivered Gloas payload")
+	}
+
+	log.WithFields(logrus.Fields{
+		"blockHash":       payloadContext.blockHash.String(),
+		"beaconBlockRoot": header.Data.Root,
+		"publishStatus":   statusCode,
+		"publishMs":       publishMs,
+	}).Info("published Gloas execution payload envelope")
+	w.WriteHeader(http.StatusAccepted)
+}
 
 func (api *RelayAPI) handleRegisterValidator(w http.ResponseWriter, req *http.Request) {
 	var err, userErr error

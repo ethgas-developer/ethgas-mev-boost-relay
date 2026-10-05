@@ -37,6 +37,7 @@ type IDatabaseService interface {
 	DeleteExecutionPayloads(idFirst, idLast uint64) error
 
 	SaveDeliveredPayload(bidTrace *common.BidTraceV2WithBlobFields, signedBlindedBeaconBlock *common.VersionedSignedBlindedBeaconBlock, signedAt time.Time, publishMs uint64) error
+	SaveDeliveredPayloadGloas(bidTrace *common.BidTraceV2WithBlobFields, signedBeaconBlock any, signedAt time.Time, publishMs uint64) error
 	GetNumDeliveredPayloads() (uint64, error)
 	GetRecentDeliveredPayloads(filters GetPayloadsFilters) ([]*DeliveredPayloadEntry, error)
 	GetDeliveredPayloads(idFirst, idLast uint64) (entries []*DeliveredPayloadEntry, err error)
@@ -339,14 +340,25 @@ func (s *DatabaseService) GetExecutionPayloadEntryBySlotPkHash(slot uint64, prop
 }
 
 func (s *DatabaseService) SaveDeliveredPayload(bidTrace *common.BidTraceV2WithBlobFields, signedBlindedBeaconBlock *common.VersionedSignedBlindedBeaconBlock, signedAt time.Time, publishMs uint64) error {
-	_signedBlindedBeaconBlock, err := json.Marshal(signedBlindedBeaconBlock)
+	return s.saveDeliveredPayload(bidTrace, signedBlindedBeaconBlock, signedAt, publishMs)
+}
+
+// SaveDeliveredPayloadGloas records the proposer-signed beacon block that
+// caused the relay to reveal a Gloas execution payload envelope.  It reuses the
+// existing payload_delivered table and bid-trace columns used by legacy PBS.
+func (s *DatabaseService) SaveDeliveredPayloadGloas(bidTrace *common.BidTraceV2WithBlobFields, signedBeaconBlock any, signedAt time.Time, publishMs uint64) error {
+	return s.saveDeliveredPayload(bidTrace, signedBeaconBlock, signedAt, publishMs)
+}
+
+func (s *DatabaseService) saveDeliveredPayload(bidTrace *common.BidTraceV2WithBlobFields, signedBeaconBlock any, signedAt time.Time, publishMs uint64) error {
+	serializedSignedBlock, err := json.Marshal(signedBeaconBlock)
 	if err != nil {
 		return err
 	}
 
 	deliveredPayloadEntry := DeliveredPayloadEntry{
 		SignedAt:                 NewNullTime(signedAt),
-		SignedBlindedBeaconBlock: NewNullString(string(_signedBlindedBeaconBlock)),
+		SignedBlindedBeaconBlock: NewNullString(string(serializedSignedBlock)),
 
 		Slot:  bidTrace.Slot,
 		Epoch: bidTrace.Slot / common.SlotsPerEpoch,

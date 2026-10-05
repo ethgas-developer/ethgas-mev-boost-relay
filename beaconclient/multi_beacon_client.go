@@ -4,6 +4,7 @@ package beaconclient
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -14,10 +15,11 @@ import (
 )
 
 var (
-	ErrBeaconNodeSyncing        = errors.New("beacon node is syncing or unavailable")
-	ErrBeaconNodesUnavailable   = errors.New("all beacon nodes responded with error")
-	ErrWithdrawalsBeforeCapella = errors.New("withdrawals are not supported before capella")
-	ErrBeaconBlock202           = errors.New("beacon block failed validation but was still broadcast (202)")
+	ErrBeaconNodeSyncing           = errors.New("beacon node is syncing or unavailable")
+	ErrBeaconNodesUnavailable      = errors.New("all beacon nodes responded with error")
+	ErrWithdrawalsBeforeCapella    = errors.New("withdrawals are not supported before capella")
+	ErrBeaconBlock202              = errors.New("beacon block failed validation but was still broadcast (202)")
+	ErrExecutionPayloadEnvelope202 = errors.New("execution payload envelope failed validation but was still broadcast (202)")
 )
 
 type BroadcastMode string
@@ -39,6 +41,9 @@ type IMultiBeaconClient interface {
 	GetStateValidators(stateID string) (*GetStateValidatorsResponse, error)
 	GetProposerDuties(epoch uint64) (*ProposerDutiesResponse, error)
 	PublishBlock(block *common.VersionedSignedProposal) (code int, err error)
+	GetHeaderForSlot(slot uint64) (*GetHeaderResponse, error)
+	GetGloasSignedBeaconBlock(slot uint64, contentType string) (*common.SignedBeaconBlockGloas, error)
+	PublishExecutionPayloadEnvelope(envelope any, blobDataIncluded bool) (code int, err error)
 	GetGenesis() (*GetGenesisResponse, error)
 	GetSpec() (spec *GetSpecResponse, err error)
 	GetForkSchedule() (spec *GetForkScheduleResponse, err error)
@@ -57,6 +62,9 @@ type IBeaconInstance interface {
 	GetURI() string
 	GetPublishURI() string
 	PublishBlock(block *common.VersionedSignedProposal, broadcastMode BroadcastMode) (code int, err error)
+	GetHeaderForSlot(slot uint64) (*GetHeaderResponse, error)
+	GetGloasSignedBeaconBlock(slot uint64, contentType string) (*common.SignedBeaconBlockGloas, error)
+	PublishExecutionPayloadEnvelope(envelope any, blobDataIncluded bool, broadcastMode BroadcastMode) (code int, err error)
 	GetGenesis() (*GetGenesisResponse, error)
 	GetSpec() (spec *GetSpecResponse, err error)
 	GetForkSchedule() (spec *GetForkScheduleResponse, err error)
@@ -311,6 +319,85 @@ func (c *MultiBeaconClient) PublishBlock(block *common.VersionedSignedProposal) 
 	}
 	log.Error("failed to publish block on any CL node")
 	return lastErrPublishResp.code, fmt.Errorf("last error: %w", lastErrPublishResp.err)
+}
+
+func (c *MultiBeaconClient) GetHeaderForSlot(slot uint64) (*GetHeaderResponse, error) {
+	for i, client := range c.beaconInstancesByLastResponse() {
+		header, err := client.GetHeaderForSlot(slot)
+		if err == nil {
+			c.bestBeaconIndex.Store(int64(i))
+			return header, nil
+		}
+		c.log.WithError(err).WithField("slot", slot).Warn("failed to fetch beacon block header")
+	}
+	return nil, ErrBeaconNodesUnavailable
+}
+
+// GetGloasSignedBeaconBlock returns the canonical, consensus-validated block
+// from a beacon node.  The relay compares this complete object with the block
+// submitted over the Builder API before revealing the execution payload.
+func (c *MultiBeaconClient) GetGloasSignedBeaconBlock(slot uint64, contentType string) (*common.SignedBeaconBlockGloas, error) {
+	for i, client := range c.beaconInstancesByLastResponse() {
+		block, err := client.GetGloasSignedBeaconBlock(slot, contentType)
+		if err == nil {
+			c.bestBeaconIndex.Store(int64(i))
+			return block, nil
+		}
+		c.log.WithError(err).WithField("slot", slot).Warn("failed to fetch Gloas beacon block")
+	}
+	return nil, ErrBeaconNodesUnavailable
+}
+
+// PublishExecutionPayloadEnvelope publishes a builder-signed Gloas envelope to
+// every configured beacon node and returns after the first successful response.
+// The requests are all started up front, matching the legacy PublishBlock
+// broadcast behavior and allowing each endpoint to record block_publish data.
+func (c *MultiBeaconClient) PublishExecutionPayloadEnvelope(envelope any, blobDataIncluded bool) (code int, err error) {
+	clients := c.beaconInstancesByLastResponse()
+	if len(clients) == 0 {
+		return 0, ErrBeaconNodesUnavailable
+	}
+
+	responses := make(chan publishResp, len(clients))
+	for i, client := range clients {
+		go func(index int, client IBeaconInstance) {
+			code, err := client.PublishExecutionPayloadEnvelope(envelope, blobDataIncluded, c.broadcastMode)
+			responses <- publishResp{index: index, code: code, err: err}
+		}(i, client)
+	}
+
+	var last publishResp
+	sawAccepted := false
+	for range clients {
+		response := <-responses
+		last = response
+		if response.err == nil && response.code >= http.StatusOK && response.code < http.StatusMultipleChoices && response.code != http.StatusAccepted {
+			c.bestBeaconIndex.Store(int64(response.index))
+			return response.code, nil
+		}
+		if response.err == nil && response.code == http.StatusAccepted {
+			sawAccepted = true
+			// As with legacy block publication, 202 means broadcast succeeded but
+			// full validation/integration failed. Continue looking for a 2xx
+			// response from another configured endpoint.
+			continue
+		}
+		if response.err == nil {
+			response.err = fmt.Errorf("unexpected beacon response status %d", response.code)
+			last = response
+		}
+		c.log.WithError(response.err).WithFields(logrus.Fields{
+			"statusCode": response.code,
+			"beacon":     clients[response.index].GetPublishURI(),
+		}).Warn("failed to publish execution payload envelope")
+	}
+	if sawAccepted {
+		return http.StatusAccepted, ErrExecutionPayloadEnvelope202
+	}
+	if last.err != nil {
+		return last.code, fmt.Errorf("last error: %w", last.err)
+	}
+	return last.code, ErrExecutionPayloadEnvelope202
 }
 
 // GetGenesis returns the genesis info - https://ethereum.github.io/beacon-APIs/#/Beacon/getGenesis

@@ -114,6 +114,18 @@ func (c *MockBeaconInstance) PublishBlock(block *common.VersionedSignedProposal,
 	return 0, nil
 }
 
+func (c *MockBeaconInstance) GetHeaderForSlot(slot uint64) (*GetHeaderResponse, error) {
+	return nil, nil
+}
+
+func (c *MockBeaconInstance) GetGloasSignedBeaconBlock(slot uint64, contentType string) (*common.SignedBeaconBlockGloas, error) {
+	return nil, nil
+}
+
+func (c *MockBeaconInstance) PublishExecutionPayloadEnvelope(envelope any, blobDataIncluded bool, broadcastMode BroadcastMode) (code int, err error) {
+	return 200, nil
+}
+
 func (c *MockBeaconInstance) GetGenesis() (*GetGenesisResponse, error) {
 	return nil, nil
 }

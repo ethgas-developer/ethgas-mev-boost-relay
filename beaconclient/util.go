@@ -90,3 +90,32 @@ func fetchBeacon(method, url string, payload []byte, dst any, httpClient *http.C
 
 	return resp.StatusCode, nil
 }
+
+func fetchBeaconRaw(method, url string, headers http.Header, httpClient *http.Client) (code int, body []byte, responseHeaders http.Header, err error) {
+	req, err := http.NewRequest(method, url, nil)
+	if err != nil {
+		return 0, nil, nil, fmt.Errorf("invalid request for %s: %w", url, err)
+	}
+	for key, values := range headers {
+		for _, value := range values {
+			req.Header.Add(key, value)
+		}
+	}
+	client := http.DefaultClient
+	if httpClient != nil {
+		client = httpClient
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, nil, nil, fmt.Errorf("client refused for %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+	body, err = io.ReadAll(resp.Body)
+	if err != nil {
+		return resp.StatusCode, nil, resp.Header, fmt.Errorf("could not read response body for %s: %w", url, err)
+	}
+	if resp.StatusCode >= http.StatusMultipleChoices {
+		return resp.StatusCode, nil, resp.Header, fmt.Errorf("%w: beacon node returned status %d", ErrHTTPErrorResponse, resp.StatusCode)
+	}
+	return resp.StatusCode, body, resp.Header, nil
+}

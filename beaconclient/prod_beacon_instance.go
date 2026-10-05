@@ -239,7 +239,8 @@ type GetHeaderResponse struct {
 	Data struct {
 		Root   string `json:"root"`
 		Header struct {
-			Message *GetHeaderResponseMessage
+			Message   *GetHeaderResponseMessage `json:"message"`
+			Signature string                    `json:"signature"`
 		}
 	}
 }
@@ -248,6 +249,8 @@ type GetHeaderResponseMessage struct {
 	Slot          uint64 `json:"slot,string"`
 	ProposerIndex uint64 `json:"proposer_index,string"`
 	ParentRoot    string `json:"parent_root"`
+	StateRoot     string `json:"state_root"`
+	BodyRoot      string `json:"body_root"`
 }
 
 // GetHeader returns the latest header - https://ethereum.github.io/beacon-APIs/#/Beacon/getBlockHeader
@@ -264,6 +267,40 @@ func (c *ProdBeaconInstance) GetHeaderForSlot(slot uint64) (*GetHeaderResponse, 
 	resp := new(GetHeaderResponse)
 	_, err := fetchBeacon(http.MethodGet, uri, nil, resp, nil, http.Header{}, false)
 	return resp, err
+}
+
+func (c *ProdBeaconInstance) GetGloasSignedBeaconBlock(slot uint64, contentType string) (*common.SignedBeaconBlockGloas, error) {
+	uri := fmt.Sprintf("%s/eth/v2/beacon/blocks/%d", c.beaconURI, slot)
+	headers := http.Header{}
+	headers.Set("Accept", contentType)
+	_, body, responseHeaders, err := fetchBeaconRaw(http.MethodGet, uri, headers, nil)
+	if err != nil {
+		return nil, err
+	}
+	if version := responseHeaders.Get("Eth-Consensus-Version"); version != "" && !strings.EqualFold(version, "gloas") {
+		return nil, fmt.Errorf("beacon node returned consensus version %q", version)
+	}
+	block := new(common.SignedBeaconBlockGloas)
+	if contentType == common.ApplicationOctetStream {
+		if err := block.UnmarshalSSZ(body); err != nil {
+			return nil, fmt.Errorf("decode beacon node Gloas block SSZ: %w", err)
+		}
+		return block, nil
+	}
+	response := new(struct {
+		Version string          `json:"version"`
+		Data    json.RawMessage `json:"data"`
+	})
+	if err := json.Unmarshal(body, response); err != nil {
+		return nil, fmt.Errorf("decode beacon node Gloas block response: %w", err)
+	}
+	if !strings.EqualFold(response.Version, "gloas") {
+		return nil, fmt.Errorf("beacon node returned consensus version %q", response.Version)
+	}
+	if err := json.Unmarshal(response.Data, block); err != nil {
+		return nil, fmt.Errorf("decode beacon node Gloas block JSON: %w", err)
+	}
+	return block, nil
 }
 
 func (c *ProdBeaconInstance) GetURI() string {
@@ -354,6 +391,83 @@ func (c *ProdBeaconInstance) PublishBlock(block *common.VersionedSignedProposal,
 	}()
 
 	return code, err
+}
+
+func (c *ProdBeaconInstance) PublishExecutionPayloadEnvelope(envelope any, blobDataIncluded bool, broadcastMode BroadcastMode) (code int, err error) {
+	encodeStartedAt := time.Now().UTC()
+	payload, err := json.Marshal(envelope)
+	if err != nil {
+		return 0, fmt.Errorf("could not marshal execution payload envelope: %w", err)
+	}
+	uri := fmt.Sprintf("%s/eth/v1/beacon/execution_payload_envelopes?broadcast_validation=%s", c.beaconPublishURI, broadcastMode)
+	headers := http.Header{}
+	headers.Set("Eth-Consensus-Version", "gloas")
+	headers.Set("Eth-Blob-Data-Included", fmt.Sprintf("%t", blobDataIncluded))
+
+	slot, blockHash, metadataErr := executionPayloadEnvelopeMetadata(envelope)
+	publishingStartedAt := time.Now().UTC()
+	slotStartTimestamp := c.genesisTime + slot*common.SecondsPerSlot
+	msIntoSlot := publishingStartedAt.UnixMilli() - int64(slotStartTimestamp)*1000 //nolint:gosec
+	code, err = fetchBeacon(http.MethodPost, uri, payload, nil, c.publishingClient, headers, false)
+	finishedAt := time.Now().UTC()
+	c.log.WithFields(logrus.Fields{
+		"slot":               slot,
+		"blockHash":          blockHash,
+		"encodeDurationMs":   publishingStartedAt.Sub(encodeStartedAt).Milliseconds(),
+		"publishDurationMs":  finishedAt.Sub(publishingStartedAt).Milliseconds(),
+		"payloadBytes":       len(payload),
+		"slotStartTimestamp": slotStartTimestamp,
+		"genesisTime":        c.genesisTime,
+	}).Info("finished publish execution payload envelope request")
+
+	// Match legacy PublishBlock accounting: each ProdBeaconInstance represents
+	// one configured beacon publication endpoint, so it writes one row for its
+	// own request regardless of the endpoint's response.
+	go func() {
+		if metadataErr != nil {
+			c.log.WithError(metadataErr).Warn("cannot insert Gloas block publish entry")
+			return
+		}
+		if c.db == nil {
+			c.log.Error("database service is not set, cannot insert block publish entry")
+			return
+		}
+		if c.genesisTime == 0 {
+			c.log.WithField("beaconPublishURI", c.beaconPublishURI).Error("Beacon client is not valid: invalid URI or connection failed")
+			return
+		}
+		if dbErr := c.db.InsertBlockPublish(
+			int64(slot),
+			c.beaconPublishURI,
+			int64(slotStartTimestamp),
+			publishingStartedAt.UnixMilli(),
+			finishedAt.UnixMilli(),
+			blockHash,
+			msIntoSlot,
+		); dbErr != nil {
+			c.log.WithError(dbErr).Error("failed to insert Gloas block publish entry into db")
+		}
+	}()
+
+	return code, err
+}
+
+func executionPayloadEnvelopeMetadata(envelope any) (slot uint64, blockHash string, err error) {
+	var signedEnvelope *common.SignedExecutionPayloadEnvelope
+	switch value := envelope.(type) {
+	case *common.SignedExecutionPayloadEnvelope:
+		signedEnvelope = value
+	case *common.SignedExecutionPayloadEnvelopeContents:
+		if value != nil {
+			signedEnvelope = value.SignedExecutionPayloadEnvelope
+		}
+	default:
+		return 0, "", fmt.Errorf("unsupported execution payload envelope type %T", envelope)
+	}
+	if signedEnvelope == nil || signedEnvelope.Message == nil || signedEnvelope.Message.Payload == nil {
+		return 0, "", fmt.Errorf("incomplete execution payload envelope")
+	}
+	return uint64(signedEnvelope.Message.Payload.SlotNumber), signedEnvelope.Message.Payload.BlockHash.String(), nil
 }
 
 type GetGenesisResponse struct {

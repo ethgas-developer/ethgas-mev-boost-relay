@@ -90,6 +90,10 @@ func (db MockDB) SaveDeliveredPayload(bidTrace *common.BidTraceV2WithBlobFields,
 	return nil
 }
 
+func (db MockDB) SaveDeliveredPayloadGloas(bidTrace *common.BidTraceV2WithBlobFields, signedBeaconBlock any, signedAt time.Time, publishMs uint64) error {
+	return nil
+}
+
 func (db MockDB) UpsertBlockBuilderEntryAfterSubmission(lastSubmission *BuilderBlockSubmissionEntry, isError bool) error {
 	return nil
 }
