@@ -4,6 +4,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -24,24 +25,28 @@ var (
 	apiDefaultSecretKey  = common.GetEnv("SECRET_KEY", "")
 	apiDefaultLogTag     = os.Getenv("LOG_TAG")
 
-	apiDefaultPprofListenAddr    = os.Getenv("PPROF_ADDR")
-	apiDefaultInternalAPIEnabled = os.Getenv("ENABLE_INTERNAL_API") == "1"
+	apiDefaultPprofListenAddr      = os.Getenv("PPROF_ADDR")
+	apiDefaultGloasBuilderIndex    = os.Getenv("GLOAS_BUILDER_INDEX")
+	apiDefaultGloasRequestAuthData = os.Getenv("GLOAS_REQUEST_AUTH_DATA")
+	apiDefaultInternalAPIEnabled   = os.Getenv("ENABLE_INTERNAL_API") == "1"
 
 	// Default Builder, Data, and Proposer API as true.
 	apiDefaultBuilderAPIEnabled  = os.Getenv("DISABLE_BUILDER_API") != "1"
 	apiDefaultDataAPIEnabled     = os.Getenv("DISABLE_DATA_API") != "1"
 	apiDefaultProposerAPIEnabled = os.Getenv("DISABLE_PROPOSER_API") != "1"
 
-	apiListenAddr      string
-	apiPprofListenAddr string
-	apiSecretKey       string
-	apiBlockSimURL     string
-	apiDebug           bool
-	apiBuilderAPI      bool
-	apiDataAPI         bool
-	apiInternalAPI     bool
-	apiProposerAPI     bool
-	apiLogTag          string
+	apiListenAddr           string
+	apiPprofListenAddr      string
+	apiGloasBuilderIndex    string
+	apiGloasRequestAuthData string
+	apiSecretKey            string
+	apiBlockSimURL          string
+	apiDebug                bool
+	apiBuilderAPI           bool
+	apiDataAPI              bool
+	apiInternalAPI          bool
+	apiProposerAPI          bool
+	apiLogTag               string
 
 	apiKnownValidators []string
 )
@@ -66,6 +71,8 @@ func init() {
 	apiCmd.Flags().StringVar(&network, "network", defaultNetwork, "Which network to use")
 
 	apiCmd.Flags().StringVar(&apiPprofListenAddr, "pprof-listen-addr", apiDefaultPprofListenAddr, "listen address for pprof, empty to disable")
+	apiCmd.Flags().StringVar(&apiGloasBuilderIndex, "gloas-builder-index", apiDefaultGloasBuilderIndex, "on-chain Gloas builder index used to sign execution payload bids; empty disables bid responses")
+	apiCmd.Flags().StringVar(&apiGloasRequestAuthData, "gloas-request-auth-data", apiDefaultGloasRequestAuthData, "exact Gloas request-auth data; defaults to the builder URL bytes on the validator")
 	apiCmd.Flags().BoolVar(&apiBuilderAPI, "builder-api", apiDefaultBuilderAPIEnabled, "enable builder API (/builder/...)")
 	apiCmd.Flags().BoolVar(&apiDataAPI, "data-api", apiDefaultDataAPIEnabled, "enable data API (/data/...)")
 	apiCmd.Flags().BoolVar(&apiInternalAPI, "internal-api", apiDefaultInternalAPIEnabled, "enable internal API (/internal/...)")
@@ -183,6 +190,22 @@ var apiCmd = &cobra.Command{
 			PprofListenAddr: apiPprofListenAddr,
 
 			InitialKnownValidators: apiKnownValidators,
+		}
+
+		if apiGloasBuilderIndex != "" {
+			builderIndex, err := strconv.ParseUint(apiGloasBuilderIndex, 10, 64)
+			if err != nil {
+				log.WithError(err).Fatal("invalid Gloas builder index")
+			}
+			opts.GloasBuilderIndex = &builderIndex
+			if strings.HasPrefix(apiGloasRequestAuthData, "0x") {
+				opts.GloasRequestAuthData, err = hexutil.Decode(apiGloasRequestAuthData)
+				if err != nil {
+					log.WithError(err).Fatal("invalid hex Gloas request auth data")
+				}
+			} else {
+				opts.GloasRequestAuthData = []byte(apiGloasRequestAuthData)
+			}
 		}
 
 		// Decode the private key

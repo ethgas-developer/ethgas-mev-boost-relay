@@ -83,21 +83,26 @@ const (
 )
 
 var (
-	ErrMissingLogOpt              = errors.New("log parameter is nil")
-	ErrMissingBeaconClientOpt     = errors.New("beacon-client is nil")
-	ErrMissingDatastoreOpt        = errors.New("proposer datastore is nil")
-	ErrRelayPubkeyMismatch        = errors.New("relay pubkey does not match existing one")
-	ErrServerAlreadyStarted       = errors.New("server was already started")
-	ErrBuilderAPIWithoutSecretKey = errors.New("cannot start builder API without secret key")
-	ErrNegativeTimestamp          = errors.New("timestamp cannot be negative")
-	ErrInvalidForkVersion         = errors.New("invalid fork version")
+	ErrMissingLogOpt               = errors.New("log parameter is nil")
+	ErrMissingBeaconClientOpt      = errors.New("beacon-client is nil")
+	ErrMissingDatastoreOpt         = errors.New("proposer datastore is nil")
+	ErrRelayPubkeyMismatch         = errors.New("relay pubkey does not match existing one")
+	ErrServerAlreadyStarted        = errors.New("server was already started")
+	ErrBuilderAPIWithoutSecretKey  = errors.New("cannot start builder API without secret key")
+	ErrNegativeTimestamp           = errors.New("timestamp cannot be negative")
+	ErrInvalidForkVersion          = errors.New("invalid fork version")
+	ErrGloasBuilderWithoutKey      = errors.New("Gloas builder index requires a secret key")
+	ErrGloasBuilderWithoutFork     = errors.New("Gloas builder index requires GLOAS_FORK_VERSION")
+	ErrGloasBuilderWithoutAuthData = errors.New("Gloas builder index requires request auth data")
 )
 
 var (
 	// Proposer API (builder-specs)
-	pathStatus            = "/eth/v1/builder/status"
-	pathRegisterValidator = "/eth/v1/builder/validators"
-	pathGetHeader         = "/eth/v1/builder/header/{slot:[0-9]+}/{parent_hash:0x[a-fA-F0-9]+}/{pubkey:0x[a-fA-F0-9]+}"
+	pathStatus                   = "/eth/v1/builder/status"
+	pathRegisterValidator        = "/eth/v1/builder/validators"
+	pathGetHeader                = "/eth/v1/builder/header/{slot:[0-9]+}/{parent_hash:0x[a-fA-F0-9]+}/{pubkey:0x[a-fA-F0-9]+}"
+	pathSubmitBuilderPreferences = "/eth/v1/builder/builder_preferences/{proposer_pubkey:0x[a-fA-F0-9]+}"
+	pathGetExecutionPayloadBid   = "/eth/v1/builder/execution_payload_bid/{slot:[0-9]+}/{parent_hash:0x[a-fA-F0-9]+}/{parent_root:0x[a-fA-F0-9]+}/{proposer_pubkey:0x[a-fA-F0-9]+}"
 	// pathGetPayload        = "/eth/v1/builder/blinded_blocks"
 	pathGetPayloadV1 = "/eth/v1/builder/blinded_blocks"
 	pathGetPayloadV2 = "/eth/v2/builder/blinded_blocks"
@@ -127,7 +132,6 @@ var (
 	defaultBuilder          = GetEnvStr("DEFAULT_BUILDER_PUBKEY", "0xa1885d66bef164889a2e35845c3b626545d7b0e513efe335e97c3a45e534013fa3bc38c3b7e6143695aecc4872ac52c4")
 	defaultFeeRecipient     = GetEnvStr("DEFAULT_FEE_RECIPIENT", "0x7566b700c0eaac88b521536f4e4e1b5b9afe6fe1")
 	realTimeBidMultiplier   = GetEnvStr("REALTIME_BID_MULTIPLIER", "1")
-
 	// various timings
 	timeoutGetPayloadRetryMs       = cli.GetEnvInt("GETPAYLOAD_RETRY_TIMEOUT_MS", 100)
 	getExchangeFinalizedCutoffMs   = cli.GetEnvInt("GETHEADER_EXCHANGE_FINALIZED_CUTOFF_MS", -2000)
@@ -217,6 +221,19 @@ func applyBidMultiplier(value *uint256.Int, multiplier string) (*uint256.Int, er
 	}
 
 	return adjustedValue, nil
+}
+
+// ethgasAdjustedBidValue is called for single-relay or realtime multi-relay markets.
+func ethgasAdjustedBidValue(actualValue *uint256.Int, multiRelay bool) (*uint256.Int, error) {
+	if actualValue == nil {
+		return nil, errors.New("bid value is nil")
+	}
+	if multiRelay {
+		return applyBidMultiplier(actualValue, realTimeBidMultiplier)
+	}
+
+	baseValue := uint256.MustFromDecimal("11000000000000000000000") // 11000 ETH
+	return new(uint256.Int).Add(baseValue, actualValue), nil
 }
 
 // ApiClient represents the client for interacting with the API
@@ -382,6 +399,14 @@ type RelayAPIOpts struct {
 
 	SecretKey *bls.SecretKey // used to sign bids (getHeader responses)
 
+	// GloasBuilderIndex is the on-chain builder registry index whose pubkey
+	// matches SecretKey. Nil keeps getExecutionPayloadBid in no-bid mode.
+	GloasBuilderIndex *uint64
+	// GloasRequestAuthData is the exact opaque byte sequence proposers sign.
+	// Without an out-of-band value builder-specs defaults this to the exact
+	// UTF-8 bytes of the builder's advertised URL.
+	GloasRequestAuthData []byte
+
 	// Network specific variables
 	EthNetDetails common.EthNetworkDetails
 
@@ -439,6 +464,11 @@ type gloasPayloadContext struct {
 	blobsBundle       *builderApiFulu.BlobsBundle
 }
 
+type gloasSelectedPayloadContext struct {
+	payload *gloasPayloadContext
+	bid     *common.SignedExecutionPayloadBid
+}
+
 func (c *gloasPayloadContext) cacheEntry() *common.GloasPayloadCacheEntry {
 	if c == nil {
 		return nil
@@ -454,6 +484,24 @@ func (c *gloasPayloadContext) cacheEntry() *common.GloasPayloadCacheEntry {
 			BlobsBundle:       c.blobsBundle,
 		},
 	}
+}
+
+func gloasPayloadContextFromCache(entry *common.GloasPayloadCacheEntry) (*gloasPayloadContext, error) {
+	if entry == nil || entry.Contents == nil || entry.Contents.ExecutionPayload == nil || entry.Contents.ExecutionRequests == nil || entry.Contents.BlobsBundle == nil || entry.BidTrace == nil {
+		return nil, errors.New("incomplete Gloas payload cache entry")
+	}
+	if uint64(entry.Contents.ExecutionPayload.SlotNumber) != entry.Slot || entry.Contents.ExecutionPayload.BlockHash != entry.BlockHash {
+		return nil, errors.New("Gloas payload cache metadata mismatch")
+	}
+	return &gloasPayloadContext{
+		slot:              entry.Slot,
+		blockHash:         entry.BlockHash,
+		feeRecipient:      entry.FeeRecipient,
+		bidTrace:          entry.BidTrace,
+		payload:           entry.Contents.ExecutionPayload,
+		executionRequests: entry.Contents.ExecutionRequests,
+		blobsBundle:       entry.Contents.BlobsBundle,
+	}, nil
 }
 
 func gloasPayloadKey(slot uint64, blockHash fmt.Stringer) string {
@@ -517,6 +565,7 @@ type RelayAPI struct {
 	payloadAttributesLock sync.RWMutex
 	gloasPayloads         map[string]*gloasPayloadContext
 	gloasPayloadsLock     sync.RWMutex
+	gloasSelectedPayloads map[uint64]*gloasSelectedPayloadContext
 
 	// The slot we are currently optimistically simulating.
 	optimisticSlot uberatomic.Uint64
@@ -738,9 +787,23 @@ func NewRelayAPI(opts RelayAPIOpts) (api *RelayAPI, err error) {
 		return nil, ErrMissingDatastoreOpt
 	}
 
-	// If block-builder API is enabled, then ensure secret key is all set
+	if opts.GloasBuilderIndex != nil {
+		if opts.SecretKey == nil {
+			return nil, ErrGloasBuilderWithoutKey
+		}
+		if opts.EthNetDetails.GloasForkVersionHex == "" {
+			return nil, ErrGloasBuilderWithoutFork
+		}
+		if len(opts.GloasRequestAuthData) == 0 || len(opts.GloasRequestAuthData) > common.MaxBuilderRequestAuthDataSize {
+			return nil, ErrGloasBuilderWithoutAuthData
+		}
+		opts.Log.WithField("builderIndex", *opts.GloasBuilderIndex).Info("Gloas builder identity enabled")
+	}
+
+	// If either builder-facing submissions or Gloas bid responses are enabled,
+	// ensure the relay signing key is ready.
 	var publicKey phase0.BLSPubKey
-	if opts.BlockBuilderAPI {
+	if opts.BlockBuilderAPI || opts.GloasBuilderIndex != nil {
 		if opts.SecretKey == nil {
 			return nil, ErrBuilderAPIWithoutSecretKey
 		}
@@ -781,8 +844,9 @@ func NewRelayAPI(opts RelayAPIOpts) (api *RelayAPI, err error) {
 		memcached:    opts.Memcached,
 		db:           opts.DB,
 
-		payloadAttributes: make(map[string]payloadAttributesHelper),
-		gloasPayloads:     make(map[string]*gloasPayloadContext),
+		payloadAttributes:     make(map[string]payloadAttributesHelper),
+		gloasPayloads:         make(map[string]*gloasPayloadContext),
+		gloasSelectedPayloads: make(map[uint64]*gloasSelectedPayloadContext),
 
 		proposerDutiesResponse: &[]byte{},
 		blockSimRateLimiter:    NewBlockSimulationRateLimiter(opts.BlockSimURL),
@@ -864,6 +928,8 @@ func (api *RelayAPI) getRouter() http.Handler {
 		r.HandleFunc(pathStatus, api.handleStatus).Methods(http.MethodGet)
 		r.HandleFunc(pathRegisterValidator, api.handleRegisterValidator).Methods(http.MethodPost)
 		r.HandleFunc(pathGetHeader, api.handleGetHeader).Methods(http.MethodGet)
+		r.HandleFunc(pathSubmitBuilderPreferences, api.handleSubmitBuilderPreferences).Methods(http.MethodPost)
+		r.HandleFunc(pathGetExecutionPayloadBid, api.handleGetExecutionPayloadBid).Methods(http.MethodPost)
 		r.HandleFunc(pathGetPayloadV1, api.handleGetPayloadV1).Methods(http.MethodPost)
 		r.HandleFunc(pathGetPayloadV2, api.handleGetPayloadV2).Methods(http.MethodPost)
 		// r.HandleFunc(pathGetPayload, api.handleGetPayload).Methods(http.MethodPost)
@@ -1023,8 +1089,10 @@ func (api *RelayAPI) StartServer() (err error) {
 
 	}
 
-	// Builder submissions need payload attributes for validation.
-	needsPayloadAttributes := api.opts.BlockBuilderAPI
+	// Builder submissions need payload attributes for validation. A
+	// proposer-only Gloas replica also needs them to bind a bid request's
+	// execution parent, beacon parent, and proposer index before serving it.
+	needsPayloadAttributes := api.opts.BlockBuilderAPI || (api.opts.ProposerAPI && api.opts.GloasBuilderIndex != nil && api.opts.EthNetDetails.GloasForkVersionHex != "")
 	if needsPayloadAttributes {
 		go func() {
 			c := make(chan beaconclient.PayloadAttributesEvent)
@@ -1626,6 +1694,448 @@ func (api *RelayAPI) handleRoot(w http.ResponseWriter, req *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, "MEV-Boost Relay API")
 }
+
+const maxGloasAuthRequestBodyBytes = 1 << 20
+
+type sszRequestDecoder interface {
+	UnmarshalSSZ([]byte) error
+}
+
+func decodeGloasRequest(req *http.Request, jsonTarget any, sszTarget sszRequestDecoder) error {
+	body, err := io.ReadAll(io.LimitReader(req.Body, maxGloasAuthRequestBodyBytes+1))
+	if err != nil {
+		return fmt.Errorf("read request body: %w", err)
+	}
+	if len(body) == 0 {
+		return errors.New("request body is required")
+	}
+	if len(body) > maxGloasAuthRequestBodyBytes {
+		return errors.New("request body is too large")
+	}
+
+	contentType := req.Header.Get(HeaderContentType)
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return fmt.Errorf("invalid Content-Type: %w", err)
+	}
+	switch mediaType {
+	case ApplicationJSON:
+		decoder := json.NewDecoder(bytes.NewReader(body))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(jsonTarget); err != nil {
+			return fmt.Errorf("decode JSON request: %w", err)
+		}
+		if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) {
+			return errors.New("JSON request must contain exactly one value")
+		}
+		return nil
+	case common.ApplicationOctetStream:
+		if err := sszTarget.UnmarshalSSZ(body); err != nil {
+			return fmt.Errorf("decode SSZ request: %w", err)
+		}
+		return nil
+	default:
+		return fmt.Errorf("unsupported Content-Type %q", mediaType)
+	}
+}
+
+func (api *RelayAPI) validateGloasRequestAuth(auth *common.SignedBuilderRequestAuth, proposerPubkey phase0.BLSPubKey, expectedSlot *uint64) (int, error) {
+	if auth == nil || auth.Message == nil {
+		return http.StatusBadRequest, errors.New("missing signed request auth")
+	}
+	if len(auth.Message.Data) == 0 || len(auth.Message.Data) > common.MaxBuilderRequestAuthDataSize {
+		return http.StatusBadRequest, errors.New("invalid request auth data length")
+	}
+	if !bytes.Equal(auth.Message.Data, api.opts.GloasRequestAuthData) {
+		return http.StatusBadRequest, errors.New("request auth data does not match this builder")
+	}
+	if expectedSlot != nil && uint64(auth.Message.Slot) != *expectedSlot {
+		return http.StatusBadRequest, errors.New("request auth slot does not match requested slot")
+	}
+	verified, err := ssz.VerifySignature(
+		auth.Message,
+		api.opts.EthNetDetails.DomainBuilderRequestAuth,
+		proposerPubkey[:],
+		auth.Signature[:],
+	)
+	if err != nil || !verified {
+		return http.StatusUnauthorized, errors.New("invalid request auth signature")
+	}
+	return 0, nil
+}
+
+// handleSubmitBuilderPreferences authenticates and stores a proposer's
+// slot-scoped maximum execution payment for use by every relay API replica.
+func (api *RelayAPI) handleSubmitBuilderPreferences(w http.ResponseWriter, req *http.Request) {
+	if !strings.EqualFold(req.Header.Get(HeaderEthConsensusVersion), "gloas") {
+		api.RespondError(w, http.StatusBadRequest, "Eth-Consensus-Version must be gloas")
+		return
+	}
+	proposerPubkey, err := utils.HexToPubkey(mux.Vars(req)["proposer_pubkey"])
+	if err != nil {
+		api.RespondError(w, http.StatusBadRequest, common.ErrInvalidPubkey.Error())
+		return
+	}
+	preferencesRequest := new(common.BuilderPreferencesRequest)
+	if err := decodeGloasRequest(req, preferencesRequest, preferencesRequest); err != nil {
+		api.RespondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if preferencesRequest.Preferences == nil || preferencesRequest.Auth == nil {
+		api.RespondError(w, http.StatusBadRequest, "missing preferences or request auth")
+		return
+	}
+	status, err := api.validateGloasRequestAuth(preferencesRequest.Auth, proposerPubkey, nil)
+	if err != nil {
+		api.RespondError(w, status, err.Error())
+		return
+	}
+	slot := uint64(preferencesRequest.Auth.Message.Slot)
+	if slot < api.headSlot.Load() {
+		api.RespondError(w, http.StatusBadRequest, "request auth slot is too old")
+		return
+	}
+	expiration := 2 * common.DurationPerEpoch
+	if err := api.redis.SaveGloasBuilderPreferences(slot, proposerPubkey.String(), preferencesRequest.Preferences, expiration); err != nil {
+		api.log.WithError(err).WithFields(logrus.Fields{
+			"slot":           slot,
+			"proposerPubkey": proposerPubkey.String(),
+		}).Error("failed to store Gloas builder preferences")
+		api.RespondError(w, http.StatusInternalServerError, "failed to store builder preferences")
+		return
+	}
+	api.log.WithFields(logrus.Fields{
+		"slot":                slot,
+		"proposerPubkey":      proposerPubkey.String(),
+		"maxExecutionPayment": uint64(preferencesRequest.Preferences.MaxExecutionPayment),
+	}).Info("Gloas builder preferences stored")
+	w.WriteHeader(http.StatusAccepted)
+}
+
+// handleGetExecutionPayloadBid serves the same winning Fulu/Electra submission
+// used by getHeader, converted to and re-signed as a Gloas execution payload
+// bid. A 204 response is the normal no-bid outcome.
+func (api *RelayAPI) handleGetExecutionPayloadBid(w http.ResponseWriter, req *http.Request) {
+	vars := mux.Vars(req)
+	slotStr := vars["slot"]
+	parentHashHex := vars["parent_hash"]
+	parentRootHex := vars["parent_root"]
+	proposerPubkeyHex := vars["proposer_pubkey"]
+	log := api.log.WithFields(logrus.Fields{
+		"method":               "getExecutionPayloadBid",
+		"slot":                 slotStr,
+		"parentHash":           parentHashHex,
+		"parentRoot":           parentRootHex,
+		"proposerPubkey":       proposerPubkeyHex,
+		"consensusVersion":     req.Header.Get(HeaderEthConsensusVersion),
+		"contentType":          req.Header.Get(HeaderContentType),
+		"accept":               req.Header.Get(HeaderAccept),
+		"dateMilliseconds":     req.Header.Get("Date-Milliseconds"),
+		"requestTimeoutMillis": req.Header.Get("X-Timeout-Ms"),
+		"contentLength":        req.ContentLength,
+		"remoteAddr":           req.RemoteAddr,
+		"ua":                   req.UserAgent(),
+	})
+	log.Info("Gloas execution payload bid request received")
+
+	negotiatedResponseMediaType, err := NegotiateRequestResponseType(req)
+	if err != nil {
+		api.RespondError(w, http.StatusNotAcceptable, err.Error())
+		return
+	}
+	if !strings.EqualFold(req.Header.Get(HeaderEthConsensusVersion), "gloas") {
+		api.RespondError(w, http.StatusBadRequest, "Eth-Consensus-Version must be gloas")
+		return
+	}
+
+	slot, err := strconv.ParseUint(slotStr, 10, 64)
+	if err != nil {
+		api.RespondError(w, http.StatusBadRequest, common.ErrInvalidSlot.Error())
+		return
+	}
+	if len(parentHashHex) != 66 || len(parentRootHex) != 66 {
+		api.RespondError(w, http.StatusBadRequest, common.ErrInvalidHash.Error())
+		return
+	}
+	if len(proposerPubkeyHex) != 98 {
+		api.RespondError(w, http.StatusBadRequest, common.ErrInvalidPubkey.Error())
+		return
+	}
+	proposerPubkey, err := utils.HexToPubkey(proposerPubkeyHex)
+	if err != nil {
+		api.RespondError(w, http.StatusBadRequest, common.ErrInvalidPubkey.Error())
+		return
+	}
+	parentHash, err := utils.HexToHash(parentHashHex)
+	if err != nil {
+		api.RespondError(w, http.StatusBadRequest, common.ErrInvalidHash.Error())
+		return
+	}
+	parentRootHash, err := utils.HexToHash(parentRootHex)
+	if err != nil {
+		api.RespondError(w, http.StatusBadRequest, common.ErrInvalidHash.Error())
+		return
+	}
+	parentRoot := phase0.Root(parentRootHash)
+	canonicalParentHash := parentHash.String()
+	canonicalProposerPubkey := proposerPubkey.String()
+
+	dateMilliseconds, err := strconv.ParseUint(req.Header.Get("Date-Milliseconds"), 10, 64)
+	if err != nil || dateMilliseconds == 0 {
+		api.RespondError(w, http.StatusBadRequest, "valid Date-Milliseconds header is required")
+		return
+	}
+	timeoutMillis, err := strconv.ParseUint(req.Header.Get("X-Timeout-Ms"), 10, 64)
+	if err != nil || timeoutMillis == 0 {
+		api.RespondError(w, http.StatusBadRequest, "valid X-Timeout-Ms header is required")
+		return
+	}
+	auth := new(common.SignedBuilderRequestAuth)
+	if err := decodeGloasRequest(req, auth, auth); err != nil {
+		api.RespondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	status, err := api.validateGloasRequestAuth(auth, proposerPubkey, &slot)
+	if err != nil {
+		api.RespondError(w, status, err.Error())
+		return
+	}
+
+	if api.opts.GloasBuilderIndex == nil || api.blsSk == nil || api.opts.EthNetDetails.GloasForkVersionHex == "" {
+		log.Debug("Gloas builder identity is not configured; returning no bid")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if slot < api.headSlot.Load() {
+		api.RespondError(w, http.StatusBadRequest, "slot is too old")
+		return
+	}
+
+	// The parent execution hash and parent beacon root must describe the same
+	// live payload-attributes event. Lighthouse rejects bids that do not match.
+	api.payloadAttributesLock.RLock()
+	attrs, attrsFound := api.payloadAttributes[getPayloadAttributesKey(canonicalParentHash, slot)]
+	api.payloadAttributesLock.RUnlock()
+	if !attrsFound || attrs.parentBeaconRoot == nil || *attrs.parentBeaconRoot != parentRoot {
+		log.WithFields(logrus.Fields{
+			"attributesFound": attrsFound,
+			"expectedParentRoot": func() string {
+				if attrs.parentBeaconRoot == nil {
+					return ""
+				}
+				return attrs.parentBeaconRoot.String()
+			}(),
+		}).Info("no live payload attributes match Gloas bid request")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	proposerPreferences, err := api.resolveGloasProposerPreferences(slot, attrs.proposerIndex, proposerPubkey)
+	if err != nil {
+		log.WithError(err).WithField("proposerIndex", attrs.proposerIndex).Info("no usable Gloas proposer preferences for bid request")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	preferenceMessage := proposerPreferences.Message
+
+	legacyBid, err := api.redis.GetBestBid(slot, canonicalParentHash, canonicalProposerPubkey)
+	if err != nil {
+		log.WithError(err).Error("could not get winning bid")
+		api.RespondError(w, http.StatusInternalServerError, "could not get winning bid")
+		return
+	}
+	if legacyBid == nil || legacyBid.IsEmpty() {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	var legacyMessage *builderApiElectra.BuilderBid
+	switch legacyBid.Version {
+	case spec.DataVersionFulu:
+		if legacyBid.Fulu != nil {
+			legacyMessage = legacyBid.Fulu.Message
+		}
+	case spec.DataVersionElectra:
+		if legacyBid.Electra != nil {
+			legacyMessage = legacyBid.Electra.Message
+		}
+	default:
+		log.WithField("bidVersion", legacyBid.Version).Info("winning bid cannot be converted to Gloas")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if legacyMessage == nil || legacyMessage.Header == nil || legacyMessage.Header.ParentHash != parentHash {
+		log.Warn("winning bid is incomplete or has a different parent hash")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	api.gloasPayloadsLock.RLock()
+	payloadContext := api.gloasPayloads[gloasPayloadKey(slot, legacyMessage.Header.BlockHash)]
+	api.gloasPayloadsLock.RUnlock()
+	if payloadContext == nil {
+		cachedPayload, cacheErr := api.redis.GetGloasPayload(slot, legacyMessage.Header.BlockHash.String())
+		if cacheErr != nil {
+			log.WithError(cacheErr).Error("failed to load Gloas reveal payload")
+			api.RespondError(w, http.StatusInternalServerError, "failed to load Gloas reveal payload")
+			return
+		}
+		if cachedPayload != nil {
+			payloadContext, cacheErr = gloasPayloadContextFromCache(cachedPayload)
+			if cacheErr != nil {
+				log.WithError(cacheErr).Error("invalid cached Gloas reveal payload")
+				api.RespondError(w, http.StatusInternalServerError, "invalid cached Gloas reveal payload")
+				return
+			}
+			api.gloasPayloadsLock.Lock()
+			api.gloasPayloads[gloasPayloadKey(slot, legacyMessage.Header.BlockHash)] = payloadContext
+			api.gloasPayloadsLock.Unlock()
+		}
+	}
+	if payloadContext == nil {
+		// Do not let a proposer commit to a bid which this relay cannot reveal.
+		// A legacy V5/Fulu submission lacks Amsterdam's block_access_list and
+		// slot_number and therefore cannot form a valid Gloas envelope.
+		log.WithField("blockHash", legacyMessage.Header.BlockHash.String()).Warn("winning legacy bid has no revealable Gloas payload")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if payloadContext.payload == nil || uint64(payloadContext.payload.SlotNumber) != slot || payloadContext.payload.BlockHash != legacyMessage.Header.BlockHash {
+		log.Warn("cached Gloas payload does not match winning bid")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if payloadContext.feeRecipient != preferenceMessage.FeeRecipient {
+		log.WithFields(logrus.Fields{
+			"payloadFeeRecipient":    payloadContext.feeRecipient.String(),
+			"preferenceFeeRecipient": preferenceMessage.FeeRecipient.String(),
+		}).Warn("winning Gloas payload does not honor signed proposer fee recipient")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if err := api.validateKnownGloasParentGasLimit(parentHash, uint64(payloadContext.payload.GasLimit), uint64(preferenceMessage.TargetGasLimit)); err != nil {
+		log.WithError(err).Warn("winning Gloas payload does not honor signed proposer gas target")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	// Match getHeader's ETHGas market behavior without mutating the winning bid
+	// cached in Redis.  In Gloas the relay is the protocol-visible builder, so
+	// the adjusted legacy value is returned as the trusted execution payment.
+	gloasLegacyMessage := legacyMessage
+	var marketAvailable, multiRelay, realTime bool
+	if !disableEthgasMarketAPI {
+		market, marketErr := api.getMarketForSlot(slot)
+		if marketErr != nil {
+			log.WithError(marketErr).Warn("failed to fetch market info; bid value left unchanged")
+		} else if market != nil {
+			marketAvailable = true
+			multiRelay = market.MultiRelay
+			realTime = market.RealTime
+		}
+	}
+	if !disableEthgasMarketAPI && marketAvailable && (!multiRelay || realTime) {
+		adjustedValue, adjustErr := ethgasAdjustedBidValue(legacyMessage.Value, multiRelay)
+		if adjustErr != nil {
+			log.WithError(adjustErr).Warn("failed to adjust Gloas bid value, using actual bid value")
+		} else {
+			messageCopy := *legacyMessage
+			messageCopy.Value = adjustedValue
+			gloasLegacyMessage = &messageCopy
+		}
+	}
+	log = log.WithFields(logrus.Fields{
+		"marketAvailable": marketAvailable,
+		"multiRelay":      multiRelay,
+		"realTime":        realTime,
+	})
+
+	bid, err := common.NewExecutionPayloadBid(gloasLegacyMessage, payloadContext.executionRequests, slot, parentRoot, preferenceMessage.FeeRecipient, *api.opts.GloasBuilderIndex)
+	if err != nil {
+		log.WithError(err).Error("failed to convert winning bid to Gloas")
+		api.RespondError(w, http.StatusInternalServerError, "failed to construct Gloas bid")
+		return
+	}
+	preferences, err := api.redis.GetGloasBuilderPreferences(slot, canonicalProposerPubkey)
+	if err != nil {
+		log.WithError(err).Error("failed to get Gloas builder preferences")
+		api.RespondError(w, http.StatusInternalServerError, "failed to get builder preferences")
+		return
+	}
+	maxExecutionPayment := phase0.Gwei(0)
+	if preferences != nil {
+		maxExecutionPayment = preferences.MaxExecutionPayment
+	}
+	if bid.ExecutionPayment > maxExecutionPayment {
+		log.WithFields(logrus.Fields{
+			"executionPayment":    uint64(bid.ExecutionPayment),
+			"maxExecutionPayment": uint64(maxExecutionPayment),
+			"preferencesFound":    preferences != nil,
+		}).Info("capping Gloas execution payment to proposer preference")
+		bid.ExecutionPayment = maxExecutionPayment
+	}
+	signature, err := ssz.SignMessage(bid, api.opts.EthNetDetails.DomainBeaconBuilderGloas, api.blsSk)
+	if err != nil {
+		log.WithError(err).Error("failed to sign Gloas execution payload bid")
+		api.RespondError(w, http.StatusInternalServerError, "failed to sign Gloas bid")
+		return
+	}
+
+	response := &common.VersionedSignedExecutionPayloadBidResponse{
+		Version: "gloas",
+		Data: &common.SignedExecutionPayloadBid{
+			Message:   bid,
+			Signature: signature,
+		},
+	}
+	if err := api.redis.SaveGloasSelectedPayload(slot, &common.GloasSelectedPayloadCacheEntry{
+		BlockHash: payloadContext.blockHash,
+		Bid:       response.Data,
+	}); err != nil {
+		log.WithError(err).Error("failed to persist selected Gloas payload")
+		api.RespondError(w, http.StatusInternalServerError, "failed to persist selected Gloas payload")
+		return
+	}
+	api.gloasPayloadsLock.Lock()
+	api.gloasSelectedPayloads[slot] = &gloasSelectedPayloadContext{
+		payload: payloadContext,
+		bid:     response.Data,
+	}
+	for selectedSlot := range api.gloasSelectedPayloads {
+		if selectedSlot+2 < slot {
+			delete(api.gloasSelectedPayloads, selectedSlot)
+		}
+	}
+	api.gloasPayloadsLock.Unlock()
+	w.Header().Set(HeaderEthConsensusVersion, "gloas")
+	log.WithFields(logrus.Fields{
+		"blockHash":           bid.BlockHash.String(),
+		"builderIndex":        uint64(bid.BuilderIndex),
+		"valueGwei":           uint64(bid.Value),
+		"executionPayment":    uint64(bid.ExecutionPayment),
+		"responseContentType": negotiatedResponseMediaType,
+	}).Info("Gloas execution payload bid delivered")
+	if negotiatedResponseMediaType == common.ApplicationOctetStream {
+		api.respondGetExecutionPayloadBidSSZ(w, response.Data)
+		return
+	}
+	api.RespondOK(w, response)
+}
+
+func (api *RelayAPI) respondGetExecutionPayloadBidSSZ(w http.ResponseWriter, bid *common.SignedExecutionPayloadBid) {
+	sszData, err := bid.MarshalSSZ()
+	if err != nil {
+		api.log.WithError(err).Error("error serializing Gloas execution payload bid as SSZ")
+		api.RespondError(w, http.StatusInternalServerError, "failed to serialize Gloas bid")
+		return
+	}
+	w.Header().Set(HeaderEthConsensusVersion, "gloas")
+	w.Header().Set(HeaderContentType, common.ApplicationOctetStream)
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write(sszData); err != nil {
+		api.log.WithError(err).Error("error writing Gloas SSZ bid response")
+	}
+}
+
+// handleSubmitSignedBeaconBlock receives the proposer-signed Gloas beacon
+// block from Lighthouse, constructs and signs the matching execution payload
 
 func (api *RelayAPI) handleRegisterValidator(w http.ResponseWriter, req *http.Request) {
 	var err, userErr error

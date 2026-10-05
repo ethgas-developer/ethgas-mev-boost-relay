@@ -8,6 +8,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -26,6 +27,7 @@ import (
 	"github.com/attestantio/go-eth2-client/spec/deneb"
 	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/flashbots/go-boost-utils/bls"
+	"github.com/flashbots/go-boost-utils/ssz"
 	"github.com/flashbots/go-boost-utils/utils"
 	"github.com/holiman/uint256"
 	"github.com/sirupsen/logrus"
@@ -72,18 +74,19 @@ func newTestBackend(t require.TestingT, numBeaconNodes int) *testBackend {
 	require.NoError(t, err)
 
 	opts := RelayAPIOpts{
-		Log:             common.TestLog,
-		ListenAddr:      "localhost:12345",
-		BeaconClient:    &beaconclient.MultiBeaconClient{},
-		Datastore:       ds,
-		Redis:           redisCache,
-		DB:              db,
-		EthNetDetails:   *mainnetDetails,
-		SecretKey:       sk,
-		ProposerAPI:     true,
-		BlockBuilderAPI: true,
-		DataAPI:         true,
-		InternalAPI:     true,
+		Log:                  common.TestLog,
+		ListenAddr:           "localhost:12345",
+		BeaconClient:         &beaconclient.MultiBeaconClient{},
+		Datastore:            ds,
+		Redis:                redisCache,
+		DB:                   db,
+		EthNetDetails:        *mainnetDetails,
+		SecretKey:            sk,
+		GloasRequestAuthData: []byte("http://relay.test"),
+		ProposerAPI:          true,
+		BlockBuilderAPI:      true,
+		DataAPI:              true,
+		InternalAPI:          true,
 	}
 
 	relay, err := NewRelayAPI(opts)
@@ -120,6 +123,18 @@ func (be *testBackend) requestBytes(method, path string, payload []byte, headers
 	rr := httptest.NewRecorder()
 	be.relay.getRouter().ServeHTTP(rr, req)
 	return rr
+}
+
+func newSignedGloasRequestAuth(t *testing.T, domain phase0.Domain, slot uint64, data []byte) (*common.SignedBuilderRequestAuth, *bls.SecretKey, phase0.BLSPubKey) {
+	t.Helper()
+	sk, blsPubkey, err := bls.GenerateNewKeypair()
+	require.NoError(t, err)
+	pubkey, err := utils.BlsPublicKeyToPublicKey(blsPubkey)
+	require.NoError(t, err)
+	message := &common.BuilderRequestAuth{Data: append([]byte(nil), data...), Slot: phase0.Slot(slot)}
+	signature, err := ssz.SignMessage(message, domain, sk)
+	require.NoError(t, err)
+	return &common.SignedBuilderRequestAuth{Message: message, Signature: signature}, sk, pubkey
 }
 
 func (be *testBackend) request(method, path string, payload any) *httptest.ResponseRecorder {
@@ -303,6 +318,355 @@ func TestGetHeader(t *testing.T) {
 	// Check 3: Request returns 204 if sending a filtered user agent
 	rr = backend.requestWithUA(http.MethodGet, path, "mev-boost/v1.5.0 Go-http-client/1.1", nil)
 	require.Equal(t, http.StatusNoContent, rr.Code, rr.Body.String())
+}
+
+func TestGetExecutionPayloadBid(t *testing.T) {
+	previousDisableEthgasMarketAPI := disableEthgasMarketAPI
+	disableEthgasMarketAPI = false
+	t.Cleanup(func() {
+		disableEthgasMarketAPI = previousDisableEthgasMarketAPI
+	})
+
+	backend := newTestBackend(t, 1)
+	backend.relay.marketCache.Store(testSlot, &marketCacheEntry{
+		value: &WholeBlockMarket{
+			Slot:       testSlot,
+			MultiRelay: false,
+			RealTime:   false,
+		},
+		expiration: time.Now().Add(time.Minute),
+	})
+	parentRoot := "0x23e606c7b3d1faad7e83503ce3dedce4c6bb89b0c28ffb240d713c7b110b9747"
+	auth, proposerSK, proposer := newSignedGloasRequestAuth(t, backend.relay.opts.EthNetDetails.DomainBuilderRequestAuth, testSlot, backend.relay.opts.GloasRequestAuthData)
+	authJSON, err := json.Marshal(auth)
+	require.NoError(t, err)
+	proposerPubkey := proposer.String()
+	path := fmt.Sprintf(
+		"/eth/v1/builder/execution_payload_bid/%d/%s/%s/%s",
+		testSlot,
+		testParentHash,
+		parentRoot,
+		proposerPubkey,
+	)
+
+	headers := map[string]string{
+		HeaderEthConsensusVersion: "gloas",
+		HeaderContentType:         ApplicationJSON,
+		HeaderAccept:              ApplicationJSON,
+		"Date-Milliseconds":       "123456789",
+		"X-Timeout-Ms":            "400",
+	}
+	rr := backend.requestBytes(http.MethodPost, path, authJSON, headers)
+	require.Equal(t, http.StatusNoContent, rr.Code, rr.Body.String())
+	require.Empty(t, rr.Body.String())
+
+	// Configure a matching local builder identity and cache a live payload
+	// attributes event plus a winning Fulu bid. This exercises the complete
+	// handleGetExecutionPayloadBid conversion and response path.
+	builderIndex := uint64(7)
+	backend.relay.opts.GloasBuilderIndex = &builderIndex
+	backend.relay.opts.EthNetDetails.GloasForkVersionHex = "0x80000038"
+	proposerPreferencesDomain, err := common.ComputeDomain(
+		common.DomainTypeProposerPreferences,
+		backend.relay.opts.EthNetDetails.GloasForkVersionHex,
+		backend.relay.opts.EthNetDetails.GenesisValidatorsRootHex,
+	)
+	require.NoError(t, err)
+	backend.relay.opts.EthNetDetails.DomainProposerPreferences = proposerPreferencesDomain
+	const proposerIndex = uint64(17)
+	backend.datastore.SetKnownValidator(common.NewPubkeyHex(proposerPubkey), proposerIndex)
+	parentRootHash, err := utils.HexToHash(parentRoot)
+	require.NoError(t, err)
+	parentBeaconRoot := phase0.Root(parentRootHash)
+	backend.relay.payloadAttributes[getPayloadAttributesKey(testParentHash, testSlot)] = payloadAttributesHelper{
+		slot:             testSlot,
+		proposerIndex:    proposerIndex,
+		parentHash:       testParentHash,
+		parentBeaconRoot: &parentBeaconRoot,
+		payloadAttributes: beaconclient.PayloadAttributes{
+			SuggestedFeeRecipient: testAddress.String(),
+		},
+	}
+	preference := signedGloasProposerPreferences(
+		t,
+		proposerPreferencesDomain,
+		proposerSK,
+		testSlot,
+		proposerIndex,
+		phase0.Root{0x99},
+		testAddress2,
+		0,
+	)
+	backend.relay.processGloasProposerPreferences(beaconclient.ProposerPreferencesEvent{Version: common.ForkVersionStringGloas, Data: preference})
+
+	bidValue := uint256.MustFromDecimal("11000000001")
+	trace := &common.BidTraceV2WithBlobFields{
+		BidTrace: builderApiV1.BidTrace{Value: bidValue},
+	}
+	payload, getPayloadResp, getHeaderResp := common.CreateTestBlockSubmission(t, testBuilderPubkey, bidValue, &common.CreateTestBlockSubmissionOpts{
+		Slot:           testSlot,
+		ParentHash:     testParentHash,
+		ProposerPubkey: proposerPubkey,
+		Version:        spec.DataVersionFulu,
+	})
+	_, err = backend.redis.SaveBidAndUpdateTopBid(t.Context(), backend.redis.NewPipeline(), trace, payload, getPayloadResp, getHeaderResp, time.Now(), false, nil, false)
+	require.NoError(t, err)
+	gloasPayload, err := common.NewExecutionPayloadGloas(payload.Fulu.ExecutionPayload, []byte{0xc0}, testSlot)
+	require.NoError(t, err)
+	submissionInfo, err := common.GetBlockSubmissionInfo(payload)
+	require.NoError(t, err)
+	gloasBidTrace := &common.BidTraceV2WithBlobFields{
+		BidTrace:      *submissionInfo.BidTrace,
+		BlockNumber:   submissionInfo.BlockNumber,
+		NumTx:         uint64(len(submissionInfo.Transactions)),
+		NumBlobs:      uint64(len(submissionInfo.Blobs)),
+		BlobGasUsed:   submissionInfo.BlobGasUsed,
+		ExcessBlobGas: submissionInfo.ExcessBlobGas,
+	}
+	payloadContext := &gloasPayloadContext{
+		slot:      testSlot,
+		blockHash: gloasPayload.BlockHash,
+		// The selected submission's validated recipient can differ from the
+		// payload-attributes recipient when ETHGas overrides it for the market.
+		feeRecipient:      testAddress2,
+		bidTrace:          gloasBidTrace,
+		payload:           gloasPayload,
+		executionRequests: common.NewExecutionRequestsGloas(payload.Fulu.ExecutionRequests),
+		blobsBundle:       payload.Fulu.BlobsBundle,
+	}
+	require.NoError(t, backend.redis.SaveGloasPayload(payloadContext.cacheEntry()))
+	// Empty process-local state to prove that another relay instance (or a
+	// restarted one) can reconstruct the full reveal payload from Redis.
+	backend.relay.gloasPayloads = make(map[string]*gloasPayloadContext)
+
+	rr = backend.requestBytes(http.MethodPost, path, authJSON, headers)
+	require.Equal(t, http.StatusOK, rr.Code)
+	require.Equal(t, "gloas", rr.Header().Get(HeaderEthConsensusVersion))
+	response := new(common.VersionedSignedExecutionPayloadBidResponse)
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), response))
+	require.Equal(t, "gloas", response.Version)
+	require.NotNil(t, response.Data)
+	require.NotNil(t, response.Data.Message)
+	require.Equal(t, phase0.Slot(testSlot), response.Data.Message.Slot)
+	require.Equal(t, common.Uint64String(builderIndex), response.Data.Message.BuilderIndex)
+	require.Equal(t, phase0.Gwei(0), response.Data.Message.Value)
+	require.Equal(t, phase0.Gwei(0), response.Data.Message.ExecutionPayment)
+	require.Equal(t, parentBeaconRoot, response.Data.Message.ParentBlockRoot)
+	require.Equal(t, testAddress2, response.Data.Message.FeeRecipient)
+	verified, err := ssz.VerifySignature(
+		response.Data.Message,
+		backend.relay.opts.EthNetDetails.DomainBeaconBuilderGloas,
+		backend.relay.publicKey[:],
+		response.Data.Signature[:],
+	)
+	require.NoError(t, err)
+	require.True(t, verified)
+
+	// A trusted relay is only allowed to expose its payment after the validator
+	// explicitly supplies a sufficiently large max_execution_payment.
+	require.NoError(t, backend.redis.SaveGloasBuilderPreferences(testSlot, proposerPubkey, &common.BuilderPreferences{MaxExecutionPayment: ^phase0.Gwei(0)}, time.Minute))
+	rr = backend.requestBytes(http.MethodPost, path, authJSON, headers)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	response = new(common.VersionedSignedExecutionPayloadBidResponse)
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), response))
+	require.Equal(t, phase0.Gwei(11_000_000_000_011), response.Data.Message.ExecutionPayment)
+
+	sszHeaders := map[string]string{
+		HeaderEthConsensusVersion: "gloas",
+		HeaderContentType:         common.ApplicationOctetStream,
+		HeaderAccept:              "application/octet-stream;q=1.0,application/json;q=0.9",
+		"Date-Milliseconds":       "123456789",
+		"X-Timeout-Ms":            "400",
+	}
+	authSSZ, err := auth.MarshalSSZ()
+	require.NoError(t, err)
+	rr = backend.requestBytes(http.MethodPost, path, authSSZ, sszHeaders)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	require.Equal(t, "gloas", rr.Header().Get(HeaderEthConsensusVersion))
+	require.Equal(t, common.ApplicationOctetStream, rr.Header().Get(HeaderContentType))
+	sszResponse := new(common.SignedExecutionPayloadBid)
+	require.NoError(t, sszResponse.UnmarshalSSZ(rr.Body.Bytes()))
+	require.Equal(t, response.Data, sszResponse)
+	verified, err = ssz.VerifySignature(
+		sszResponse.Message,
+		backend.relay.opts.EthNetDetails.DomainBeaconBuilderGloas,
+		backend.relay.publicKey[:],
+		sszResponse.Signature[:],
+	)
+	require.NoError(t, err)
+	require.True(t, verified)
+
+	for _, tc := range []struct {
+		name       string
+		disabled   bool
+		multiRelay bool
+		realTime   bool
+		multiplier string
+		payment    phase0.Gwei
+	}{
+		{"single relay", false, false, false, "2", 11_000_000_000_011},
+		{"realtime single relay", false, false, true, "2", 11_000_000_000_011},
+		{"multi relay", false, true, false, "2", 11},
+		{"realtime multi relay", false, true, true, "2", 22},
+		{"disabled single relay", true, false, false, "2", 11},
+		{"disabled realtime single relay", true, false, true, "2", 11},
+		{"disabled multi relay", true, true, false, "2", 11},
+		{"disabled realtime multi relay", true, true, true, "2", 11},
+		{"invalid realtime multiplier", false, true, true, "invalid", 11},
+		{"single relay ignores invalid multiplier", false, false, true, "invalid", 11_000_000_000_011},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			previousDisabled, previousMultiplier := disableEthgasMarketAPI, realTimeBidMultiplier
+			t.Cleanup(func() {
+				disableEthgasMarketAPI, realTimeBidMultiplier = previousDisabled, previousMultiplier
+			})
+			disableEthgasMarketAPI, realTimeBidMultiplier = tc.disabled, tc.multiplier
+			backend.relay.marketCache.Store(testSlot, &marketCacheEntry{
+				value: &WholeBlockMarket{
+					Slot: testSlot, MultiRelay: tc.multiRelay, RealTime: tc.realTime,
+				},
+				expiration: time.Now().Add(time.Minute),
+			})
+			rr := backend.requestBytes(http.MethodPost, path, authJSON, headers)
+			require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+			result := new(common.VersionedSignedExecutionPayloadBidResponse)
+			require.NoError(t, json.Unmarshal(rr.Body.Bytes(), result))
+			require.Equal(t, tc.payment, result.Data.Message.ExecutionPayment)
+			verified, err := ssz.VerifySignature(result.Data.Message,
+				backend.relay.opts.EthNetDetails.DomainBeaconBuilderGloas,
+				backend.relay.publicKey[:], result.Data.Signature[:])
+			require.NoError(t, err)
+			require.True(t, verified)
+		})
+	}
+
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"missing market data", http.StatusOK, `{"success":true}`},
+		{"null market", http.StatusOK, `{"success":true,"data":{"markets":null}}`},
+		{"empty market", http.StatusOK, `{"success":true,"data":{"markets":{}}}`},
+		{"wrong slot", http.StatusOK, `{"success":true,"data":{"markets":{"slot":43}}}`},
+		{"failed lookup", http.StatusBadGateway, `upstream unavailable`},
+		{"unsuccessful lookup", http.StatusOK, `{"success":false}`},
+		{"invalid response", http.StatusOK, `invalid JSON`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var requests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				if r.URL.Path != "/api/v1/p/wholeblock/market" || r.URL.Query().Get("slot") != "42" {
+					t.Errorf("unexpected market request: %s", r.URL)
+				}
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer server.Close()
+			previousClient, previousURL := client, exchangeAPIURL
+			t.Cleanup(func() {
+				client, exchangeAPIURL = previousClient, previousURL
+			})
+			client = &ApiClient{Client: server.Client(), AccessToken: "test-token"}
+			exchangeAPIURL = server.URL
+			backend.relay.marketCache.Delete(testSlot)
+
+			// Both the initial lookup and its cached absence must preserve the bid.
+			for attempt := 0; attempt < 2; attempt++ {
+				rr := backend.requestBytes(http.MethodPost, path, authJSON, headers)
+				require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+				result := new(common.VersionedSignedExecutionPayloadBidResponse)
+				require.NoError(t, json.Unmarshal(rr.Body.Bytes(), result))
+				require.Equal(t, phase0.Gwei(11), result.Data.Message.ExecutionPayment)
+				verified, err := ssz.VerifySignature(result.Data.Message,
+					backend.relay.opts.EthNetDetails.DomainBeaconBuilderGloas,
+					backend.relay.publicKey[:], result.Data.Signature[:])
+				require.NoError(t, err)
+				require.True(t, verified)
+			}
+			require.Equal(t, int32(1), requests.Load(), "second bid request should use the cached market absence")
+		})
+	}
+
+	// Non-realtime multi-relay markets expose the builder's actual value.
+	backend.relay.marketCache.Store(testSlot, &marketCacheEntry{
+		value: &WholeBlockMarket{
+			Slot:       testSlot,
+			MultiRelay: true,
+			RealTime:   false,
+		},
+		expiration: time.Now().Add(time.Minute),
+	})
+	rr = backend.requestBytes(http.MethodPost, path, authJSON, headers)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	multiRelayResponse := new(common.VersionedSignedExecutionPayloadBidResponse)
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), multiRelayResponse))
+	require.Equal(t, phase0.Gwei(0), multiRelayResponse.Data.Message.Value)
+	require.Equal(t, phase0.Gwei(11), multiRelayResponse.Data.Message.ExecutionPayment)
+
+	require.NoError(t, backend.redis.SaveGloasBuilderPreferences(testSlot, proposerPubkey, &common.BuilderPreferences{MaxExecutionPayment: 5}, time.Minute))
+	rr = backend.requestBytes(http.MethodPost, path, authJSON, headers)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	cappedResponse := new(common.VersionedSignedExecutionPayloadBidResponse)
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), cappedResponse))
+	require.Equal(t, phase0.Gwei(5), cappedResponse.Data.Message.ExecutionPayment)
+
+	rr = backend.request(http.MethodGet, path, nil)
+	require.Equal(t, http.StatusMethodNotAllowed, rr.Code)
+
+}
+
+func TestSubmitBuilderPreferences(t *testing.T) {
+	backend := newTestBackend(t, 1)
+	auth, _, proposer := newSignedGloasRequestAuth(t, backend.relay.opts.EthNetDetails.DomainBuilderRequestAuth, testSlot, backend.relay.opts.GloasRequestAuthData)
+	proposerPubkey := proposer.String()
+	path := fmt.Sprintf("/eth/v1/builder/builder_preferences/%s", proposerPubkey)
+	request := &common.BuilderPreferencesRequest{
+		Preferences: &common.BuilderPreferences{MaxExecutionPayment: 1234},
+		Auth:        auth,
+	}
+	requestJSON, err := json.Marshal(request)
+	require.NoError(t, err)
+
+	rr := backend.requestBytes(
+		http.MethodPost,
+		path,
+		requestJSON,
+		map[string]string{HeaderEthConsensusVersion: "gloas", HeaderContentType: ApplicationJSON},
+	)
+	require.Equal(t, http.StatusAccepted, rr.Code)
+	require.Empty(t, rr.Body.String())
+	stored, err := backend.redis.GetGloasBuilderPreferences(testSlot, proposerPubkey)
+	require.NoError(t, err)
+	require.Equal(t, request.Preferences, stored)
+
+	requestSSZ, err := request.MarshalSSZ()
+	require.NoError(t, err)
+	rr = backend.requestBytes(http.MethodPost, path, requestSSZ, map[string]string{
+		HeaderEthConsensusVersion: "gloas",
+		HeaderContentType:         common.ApplicationOctetStream,
+	})
+	require.Equal(t, http.StatusAccepted, rr.Code, rr.Body.String())
+
+	request.Auth.Message.Data = []byte("wrong-builder")
+	invalidDataJSON, err := json.Marshal(request)
+	require.NoError(t, err)
+	rr = backend.requestBytes(http.MethodPost, path, invalidDataJSON, map[string]string{
+		HeaderEthConsensusVersion: "gloas",
+		HeaderContentType:         ApplicationJSON,
+	})
+	require.Equal(t, http.StatusBadRequest, rr.Code, rr.Body.String())
+
+	request.Auth.Message.Data = append([]byte(nil), backend.relay.opts.GloasRequestAuthData...)
+	request.Auth.Signature[0] ^= 0xff
+	invalidSignatureJSON, err := json.Marshal(request)
+	require.NoError(t, err)
+	rr = backend.requestBytes(http.MethodPost, path, invalidSignatureJSON, map[string]string{
+		HeaderEthConsensusVersion: "gloas",
+		HeaderContentType:         ApplicationJSON,
+	})
+	require.Equal(t, http.StatusUnauthorized, rr.Code, rr.Body.String())
 }
 
 func TestBuilderApiGetValidators(t *testing.T) {

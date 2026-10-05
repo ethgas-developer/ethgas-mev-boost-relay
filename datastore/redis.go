@@ -97,6 +97,7 @@ type RedisCache struct {
 	prefixTopBidValue                 string
 	prefixFloorBid                    string
 	prefixFloorBidValue               string
+	prefixGloasBuilderPreferences     string
 	prefixGloasProposerPreferences    string
 	prefixGloasPayload                string
 	prefixGloasSelectedPayload        string
@@ -144,6 +145,7 @@ func NewRedisCache(prefix, redisURI, readonlyURI string) (*RedisCache, error) {
 		prefixTopBidValue:                 fmt.Sprintf("%s/%s:top-bid-value", redisPrefix, prefix),                  // prefix:slot_parentHash_proposerPubkey
 		prefixFloorBid:                    fmt.Sprintf("%s/%s:bid-floor", redisPrefix, prefix),                      // prefix:slot_parentHash_proposerPubkey
 		prefixFloorBidValue:               fmt.Sprintf("%s/%s:bid-floor-value", redisPrefix, prefix),                // prefix:slot_parentHash_proposerPubkey
+		prefixGloasBuilderPreferences:     fmt.Sprintf("%s/%s:gloas-builder-preferences", redisPrefix, prefix),
 		prefixGloasProposerPreferences:    fmt.Sprintf("%s/%s:gloas-proposer-preferences", redisPrefix, prefix),
 		prefixGloasPayload:                fmt.Sprintf("%s/%s:gloas-payload", redisPrefix, prefix),
 		prefixGloasSelectedPayload:        fmt.Sprintf("%s/%s:gloas-selected-payload", redisPrefix, prefix),
@@ -212,6 +214,10 @@ func (r *RedisCache) keyFloorBid(slot uint64, parentHash, proposerPubkey string)
 // keyFloorBidValue returns the key for the highest non-cancellable value of a given slot+parentHash+proposerPubkey
 func (r *RedisCache) keyFloorBidValue(slot uint64, parentHash, proposerPubkey string) string {
 	return fmt.Sprintf("%s:%d_%s_%s", r.prefixFloorBidValue, slot, parentHash, proposerPubkey)
+}
+
+func (r *RedisCache) keyGloasBuilderPreferences(slot uint64, proposerPubkey string) string {
+	return fmt.Sprintf("%s:%d_%s", r.prefixGloasBuilderPreferences, slot, strings.ToLower(proposerPubkey))
 }
 
 func (r *RedisCache) keyGloasProposerPreferences(slot, validatorIndex uint64, dependentRoot string) string {
@@ -435,6 +441,28 @@ func (r *RedisCache) GetBestBid(slot uint64, parentHash, proposerPubkey string) 
 		return nil, nil
 	}
 	return resp, err
+}
+
+// SaveGloasBuilderPreferences persists the authenticated preference shared by
+// all relay API instances. The caller supplies a bounded expiry because the
+// preference is only meaningful for its proposal slot.
+func (r *RedisCache) SaveGloasBuilderPreferences(slot uint64, proposerPubkey string, preferences *common.BuilderPreferences, expiration time.Duration) error {
+	if preferences == nil {
+		return errors.New("nil Gloas builder preferences")
+	}
+	return r.SetObj(r.keyGloasBuilderPreferences(slot, proposerPubkey), preferences, expiration)
+}
+
+func (r *RedisCache) GetGloasBuilderPreferences(slot uint64, proposerPubkey string) (*common.BuilderPreferences, error) {
+	preferences := new(common.BuilderPreferences)
+	err := r.GetObj(r.keyGloasBuilderPreferences(slot, proposerPubkey), preferences)
+	if errors.Is(err, redis.Nil) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return preferences, nil
 }
 
 // SaveGloasSignedProposerPreferences stores the full validator-signed

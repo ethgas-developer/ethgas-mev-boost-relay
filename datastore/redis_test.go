@@ -35,6 +35,21 @@ func setupTestRedis(t *testing.T) *RedisCache {
 	return redisService
 }
 
+func TestGloasBuilderPreferences(t *testing.T) {
+	cache := setupTestRedis(t)
+	pubkey := common.ValidPayloadRegisterValidator.Message.Pubkey.String()
+
+	preferences, err := cache.GetGloasBuilderPreferences(42, pubkey)
+	require.NoError(t, err)
+	require.Nil(t, preferences)
+
+	expected := &common.BuilderPreferences{MaxExecutionPayment: 1234}
+	require.NoError(t, cache.SaveGloasBuilderPreferences(42, pubkey, expected, time.Minute))
+	preferences, err = cache.GetGloasBuilderPreferences(42, strings.ToUpper(pubkey))
+	require.NoError(t, err)
+	require.Equal(t, expected, preferences)
+}
+
 func TestGloasPayloadPersistence(t *testing.T) {
 	cache := setupTestRedis(t)
 	payload, _, _ := common.CreateTestBlockSubmission(t, common.ValidPayloadRegisterValidator.Message.Pubkey.String(), uint256.NewInt(10), &common.CreateTestBlockSubmissionOpts{
