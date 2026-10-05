@@ -13,12 +13,15 @@ import (
 	builderApi "github.com/attestantio/go-builder-client/api"
 	builderApiCapella "github.com/attestantio/go-builder-client/api/capella"
 	builderApiDeneb "github.com/attestantio/go-builder-client/api/deneb"
+	builderApiElectra "github.com/attestantio/go-builder-client/api/electra"
+	builderApiFulu "github.com/attestantio/go-builder-client/api/fulu"
 	builderApiV1 "github.com/attestantio/go-builder-client/api/v1"
 	builderSpec "github.com/attestantio/go-builder-client/spec"
 	"github.com/attestantio/go-eth2-client/spec"
 	"github.com/attestantio/go-eth2-client/spec/bellatrix"
 	"github.com/attestantio/go-eth2-client/spec/capella"
 	"github.com/attestantio/go-eth2-client/spec/deneb"
+	"github.com/attestantio/go-eth2-client/spec/electra"
 	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/flashbots/go-boost-utils/bls"
 	"github.com/flashbots/go-boost-utils/ssz"
@@ -178,7 +181,55 @@ func CreateTestBlockSubmission(t *testing.T, builderPubkey string, value *uint25
 		ProposerPubkey: proposerPk,
 	}
 
-	if version == spec.DataVersionDeneb {
+	if version == spec.DataVersionFulu {
+		payload = &VersionedSubmitBlockRequest{
+			VersionedSubmitBlockRequest: builderSpec.VersionedSubmitBlockRequest{ //nolint:exhaustruct
+				Version: version,
+				Fulu: &builderApiFulu.SubmitBlockRequest{
+					Message: bidTrace,
+					ExecutionPayload: &deneb.ExecutionPayload{ //nolint:exhaustruct
+						ParentHash:    parentHash,
+						BaseFeePerGas: uint256.NewInt(0),
+					},
+					BlobsBundle: &builderApiFulu.BlobsBundle{
+						Commitments: make([]deneb.KZGCommitment, 0),
+						Proofs:      make([]deneb.KZGProof, 0),
+						Blobs:       make([]deneb.Blob, 0),
+					},
+					ExecutionRequests: &electra.ExecutionRequests{
+						Deposits:       make([]*electra.DepositRequest, 0),
+						Withdrawals:    make([]*electra.WithdrawalRequest, 0),
+						Consolidations: make([]*electra.ConsolidationRequest, 0),
+					},
+					Signature: phase0.BLSSignature{},
+				},
+			},
+		}
+	} else if version == spec.DataVersionElectra {
+		payload = &VersionedSubmitBlockRequest{
+			VersionedSubmitBlockRequest: builderSpec.VersionedSubmitBlockRequest{ //nolint:exhaustruct
+				Version: version,
+				Electra: &builderApiElectra.SubmitBlockRequest{
+					Message: bidTrace,
+					ExecutionPayload: &deneb.ExecutionPayload{ //nolint:exhaustruct
+						ParentHash:    parentHash,
+						BaseFeePerGas: uint256.NewInt(0),
+					},
+					BlobsBundle: &builderApiDeneb.BlobsBundle{
+						Commitments: make([]deneb.KZGCommitment, 0),
+						Proofs:      make([]deneb.KZGProof, 0),
+						Blobs:       make([]deneb.Blob, 0),
+					},
+					ExecutionRequests: &electra.ExecutionRequests{
+						Deposits:       make([]*electra.DepositRequest, 0),
+						Withdrawals:    make([]*electra.WithdrawalRequest, 0),
+						Consolidations: make([]*electra.ConsolidationRequest, 0),
+					},
+					Signature: phase0.BLSSignature{},
+				},
+			},
+		}
+	} else if version == spec.DataVersionDeneb {
 		payload = &VersionedSubmitBlockRequest{
 			VersionedSubmitBlockRequest: builderSpec.VersionedSubmitBlockRequest{ //nolint:exhaustruct
 				Version: version,

@@ -79,6 +79,7 @@ var (
 	ForkVersionStringDeneb     = "deneb"
 	ForkVersionStringElectra   = "electra"
 	ForkVersionStringFulu      = "fulu"
+	ForkVersionStringGloas     = "gloas"
 )
 
 type EthNetworkDetails struct {
@@ -90,6 +91,7 @@ type EthNetworkDetails struct {
 	DenebForkVersionHex      string
 	ElectraForkVersionHex    string
 	FuluForkVersionHex       string
+	GloasForkVersionHex      string
 
 	DomainBuilder                 phase0.Domain
 	DomainBeaconProposerBellatrix phase0.Domain
@@ -97,6 +99,9 @@ type EthNetworkDetails struct {
 	DomainBeaconProposerDeneb     phase0.Domain
 	DomainBeaconProposerElectra   phase0.Domain
 	DomainBeaconProposerFulu      phase0.Domain
+	DomainBeaconBuilderGloas      phase0.Domain
+	DomainBuilderRequestAuth      phase0.Domain
+	DomainProposerPreferences     phase0.Domain
 }
 
 func NewEthNetworkDetails(networkName string) (ret *EthNetworkDetails, err error) {
@@ -107,12 +112,21 @@ func NewEthNetworkDetails(networkName string) (ret *EthNetworkDetails, err error
 	var denebForkVersion string
 	var electraForkVersion string
 	var fuluForkVersion string
+	var gloasForkVersion string
 	var domainBuilder phase0.Domain
 	var domainBeaconProposerBellatrix phase0.Domain
 	var domainBeaconProposerCapella phase0.Domain
 	var domainBeaconProposerDeneb phase0.Domain
 	var domainBeaconProposerElectra phase0.Domain
 	var domainBeaconProposerFulu phase0.Domain
+	var domainBeaconBuilderGloas phase0.Domain
+	var domainBuilderRequestAuth phase0.Domain
+	var domainProposerPreferences phase0.Domain
+
+	// Gloas is not active on the named public networks yet. Devnets provide
+	// their fork version explicitly, and custom networks already provide the
+	// matching genesis validators root below.
+	gloasForkVersion = os.Getenv("GLOAS_FORK_VERSION")
 
 	switch networkName {
 	case EthNetworkHolesky:
@@ -172,6 +186,11 @@ func NewEthNetworkDetails(networkName string) (ret *EthNetworkDetails, err error
 		return nil, err
 	}
 
+	domainBuilderRequestAuth, err = ComputeDomain(DomainTypeRequestAuth, genesisForkVersion, phase0.Root{}.String())
+	if err != nil {
+		return nil, err
+	}
+
 	domainBeaconProposerBellatrix, err = ComputeDomain(boostSsz.DomainTypeBeaconProposer, bellatrixForkVersion, genesisValidatorsRoot)
 	if err != nil {
 		return nil, err
@@ -197,6 +216,17 @@ func NewEthNetworkDetails(networkName string) (ret *EthNetworkDetails, err error
 		return nil, err
 	}
 
+	if gloasForkVersion != "" {
+		domainBeaconBuilderGloas, err = ComputeDomain(DomainTypeBeaconBuilder, gloasForkVersion, genesisValidatorsRoot)
+		if err != nil {
+			return nil, err
+		}
+		domainProposerPreferences, err = ComputeDomain(DomainTypeProposerPreferences, gloasForkVersion, genesisValidatorsRoot)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	return &EthNetworkDetails{
 		Name:                          networkName,
 		GenesisForkVersionHex:         genesisForkVersion,
@@ -206,12 +236,16 @@ func NewEthNetworkDetails(networkName string) (ret *EthNetworkDetails, err error
 		DenebForkVersionHex:           denebForkVersion,
 		ElectraForkVersionHex:         electraForkVersion,
 		FuluForkVersionHex:            fuluForkVersion,
+		GloasForkVersionHex:           gloasForkVersion,
 		DomainBuilder:                 domainBuilder,
 		DomainBeaconProposerBellatrix: domainBeaconProposerBellatrix,
 		DomainBeaconProposerCapella:   domainBeaconProposerCapella,
 		DomainBeaconProposerDeneb:     domainBeaconProposerDeneb,
 		DomainBeaconProposerElectra:   domainBeaconProposerElectra,
 		DomainBeaconProposerFulu:      domainBeaconProposerFulu,
+		DomainBeaconBuilderGloas:      domainBeaconBuilderGloas,
+		DomainBuilderRequestAuth:      domainBuilderRequestAuth,
+		DomainProposerPreferences:     domainProposerPreferences,
 	}, nil
 }
 

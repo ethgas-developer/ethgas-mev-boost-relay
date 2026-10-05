@@ -403,6 +403,7 @@ func FuluUnblindSignedBlock(blindedBlock *eth2ApiV1Electra.SignedBlindedBeaconBl
 
 type BuilderBlockValidationRequest struct {
 	*VersionedSubmitBlockRequest
+	Gloas                 *GloasSubmitBlockRequest
 	RegisteredGasLimit    uint64
 	ParentBeaconBlockRoot *phase0.Root
 }
@@ -447,8 +448,31 @@ type fuluBuilderBlockValidationRequestJSON struct {
 	ApplyBlacklist        bool                        `json:"apply_blacklist"`
 }
 
+type gloasBuilderBlockValidationRequestJSON struct {
+	Message               *builderApiV1.BidTrace      `json:"message"`
+	ExecutionPayload      *ExecutionPayloadGloas      `json:"execution_payload"`
+	BlobsBundle           *builderApiFulu.BlobsBundle `json:"blobs_bundle"`
+	ExecutionRequests     *ExecutionRequestsGloas     `json:"execution_requests"`
+	Signature             string                      `json:"signature"`
+	RegisteredGasLimit    uint64                      `json:"registered_gas_limit,string"`
+	ParentBeaconBlockRoot string                      `json:"parent_beacon_block_root"`
+	ApplyBlacklist        bool                        `json:"apply_blacklist"`
+}
+
 func (r *BuilderBlockValidationRequest) MarshalJSON() ([]byte, error) {
 	parentBeaconBlockRoot := formatParentBeaconBlockRoot(r.ParentBeaconBlockRoot)
+	if r.Gloas != nil {
+		return json.Marshal(&gloasBuilderBlockValidationRequestJSON{
+			Message:               r.Gloas.Message,
+			ExecutionPayload:      r.Gloas.ExecutionPayload,
+			BlobsBundle:           r.Gloas.BlobsBundle,
+			ExecutionRequests:     r.Gloas.ExecutionRequests,
+			Signature:             r.Gloas.Signature.String(),
+			RegisteredGasLimit:    r.RegisteredGasLimit,
+			ParentBeaconBlockRoot: parentBeaconBlockRoot,
+			ApplyBlacklist:        true,
+		})
+	}
 
 	switch r.Version { //nolint:exhaustive
 	case spec.DataVersionCapella:
@@ -511,6 +535,9 @@ type BuilderBlockValidationResponse struct {
 
 type VersionedSubmitBlockRequest struct {
 	builderSpec.VersionedSubmitBlockRequest
+	// Gloas retains the Amsterdam-only reveal fields while the embedded Fulu
+	// request continues to feed the relay's established validation path.
+	Gloas *GloasPayloadContents `json:"-"`
 }
 
 func (r *VersionedSubmitBlockRequest) MarshalSSZ() ([]byte, error) {
