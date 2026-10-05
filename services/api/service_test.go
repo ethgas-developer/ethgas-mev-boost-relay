@@ -224,16 +224,22 @@ func TestRegisterValidator(t *testing.T) {
 }
 
 func TestGetHeader(t *testing.T) {
+	previousDisableEthgasMarketAPI := disableEthgasMarketAPI
+	disableEthgasMarketAPI = true
+	t.Cleanup(func() {
+		disableEthgasMarketAPI = previousDisableEthgasMarketAPI
+	})
+
 	// Setup backend with headSlot and genesisTime
 	backend := newTestBackend(t, 1)
+	slot := uint64(2)
 	backend.relay.genesisInfo = &beaconclient.GetGenesisResponse{
 		Data: beaconclient.GetGenesisResponseData{
-			GenesisTime: uint64(time.Now().UTC().Unix()), //nolint:gosec
+			GenesisTime: uint64(time.Now().UTC().Unix()) - slot*common.SecondsPerSlot, //nolint:gosec
 		},
 	}
 
 	// request params
-	slot := uint64(2)
 	backend.relay.headSlot.Store(slot)
 	parentHash := "0x13e606c7b3d1faad7e83503ce3dedce4c6bb89b0c28ffb240d713c7b110b9747"
 	proposerPubkey := "0x6ae5932d1e248d987d51b58665b81848814202d7b23b343d20f2a167d12f07dcb01ca41c42fdd60b7fca9c4b90890792"
@@ -256,7 +262,7 @@ func TestGetHeader(t *testing.T) {
 		Version:        spec.DataVersionCapella,
 	}
 	payload, getPayloadResp, getHeaderResp := common.CreateTestBlockSubmission(t, builderPubkey, bidValue, &opts)
-	_, err := backend.redis.SaveBidAndUpdateTopBid(t.Context(), backend.redis.NewPipeline(), trace, payload, getPayloadResp, getHeaderResp, time.Now(), false, nil)
+	_, err := backend.redis.SaveBidAndUpdateTopBid(t.Context(), backend.redis.NewPipeline(), trace, payload, getPayloadResp, getHeaderResp, time.Now(), false, nil, false)
 	require.NoError(t, err)
 
 	// Check 1: regular capella request works and returns a bid
@@ -279,8 +285,9 @@ func TestGetHeader(t *testing.T) {
 		Version:        spec.DataVersionDeneb,
 	}
 	payload, getPayloadResp, getHeaderResp = common.CreateTestBlockSubmission(t, builderPubkey, bidValue, &opts)
-	_, err = backend.redis.SaveBidAndUpdateTopBid(t.Context(), backend.redis.NewPipeline(), trace, payload, getPayloadResp, getHeaderResp, time.Now(), false, nil)
+	_, err = backend.redis.SaveBidAndUpdateTopBid(t.Context(), backend.redis.NewPipeline(), trace, payload, getPayloadResp, getHeaderResp, time.Now(), false, nil, false)
 	require.NoError(t, err)
+	backend.relay.genesisInfo.Data.GenesisTime = uint64(time.Now().UTC().Unix()) - (slot+1)*common.SecondsPerSlot //nolint:gosec
 
 	// Check 2: regular deneb request works and returns a bid
 	rr = backend.request(http.MethodGet, path, nil)
@@ -295,7 +302,7 @@ func TestGetHeader(t *testing.T) {
 
 	// Check 3: Request returns 204 if sending a filtered user agent
 	rr = backend.requestWithUA(http.MethodGet, path, "mev-boost/v1.5.0 Go-http-client/1.1", nil)
-	require.Equal(t, http.StatusNoContent, rr.Code)
+	require.Equal(t, http.StatusNoContent, rr.Code, rr.Body.String())
 }
 
 func TestBuilderApiGetValidators(t *testing.T) {
@@ -394,6 +401,12 @@ func TestBuilderSubmitBlockSSZ(t *testing.T) {
 }
 
 func TestBuilderSubmitBlock(t *testing.T) {
+	previousDisableEthgasMarketAPI := disableEthgasMarketAPI
+	disableEthgasMarketAPI = true
+	t.Cleanup(func() {
+		disableEthgasMarketAPI = previousDisableEthgasMarketAPI
+	})
+
 	type testHelper struct {
 		headSlot            uint64
 		submissionTimestamp int
@@ -468,6 +481,7 @@ func TestBuilderSubmitBlock(t *testing.T) {
 			backend.relay.capellaEpoch = 0
 			backend.relay.denebEpoch = 2
 			backend.relay.electraEpoch = 5
+			backend.relay.fuluEpoch = -1
 			backend.relay.proposerDutiesMap = make(map[uint64]*common.BuilderGetValidatorsResponseEntry)
 			backend.relay.proposerDutiesMap[headSlot+1] = &common.BuilderGetValidatorsResponseEntry{
 				Slot: headSlot,
@@ -642,7 +656,7 @@ func TestCheckSubmissionFeeRecipient(t *testing.T) {
 			log := logrus.NewEntry(logger)
 			submission, err := common.GetBlockSubmissionInfo(tc.payload)
 			require.NoError(t, err)
-			gasLimit, ok := backend.relay.checkSubmissionFeeRecipient(w, log, submission.BidTrace)
+			gasLimit, ok := backend.relay.checkSubmissionFeeRecipient(w, log, submission.BidTrace, "", "")
 			require.Equal(t, tc.expectGasLimit, gasLimit)
 			require.Equal(t, tc.expectOk, ok)
 		})
@@ -903,6 +917,7 @@ func TestCheckSubmissionPayloadAttrs(t *testing.T) {
 			backend.relay.capellaEpoch = 1
 			backend.relay.denebEpoch = 2
 			backend.relay.electraEpoch = 3
+			backend.relay.fuluEpoch = 4
 			backend.relay.payloadAttributesLock.RLock()
 			backend.relay.payloadAttributes[getPayloadAttributesKey(testParentHash, testSlot)] = tc.attrs
 			backend.relay.payloadAttributesLock.RUnlock()
@@ -1015,6 +1030,7 @@ func TestCheckSubmissionSlotDetails(t *testing.T) {
 			backend.relay.capellaEpoch = 1
 			backend.relay.denebEpoch = 2
 			backend.relay.electraEpoch = 3
+			backend.relay.fuluEpoch = 4
 			headSlot := testSlot - 1
 			w := httptest.NewRecorder()
 			logger := logrus.New()
@@ -1166,6 +1182,9 @@ func TestCheckFloorBidValue(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.description, func(t *testing.T) {
 			_, _, backend := startTestBackend(t)
+			if tc.description == "failure_slot_already_delivered" {
+				require.NoError(t, backend.redis.CheckAndSetLastSlotAndHashDelivered(1, phase0.Hash32{}.String()))
+			}
 			submission, err := common.GetBlockSubmissionInfo(tc.payload)
 			require.NoError(t, err)
 			err = backend.redis.SetFloorBidValue(submission.BidTrace.Slot, submission.BidTrace.ParentHash.String(), submission.BidTrace.ProposerPubkey.String(), tc.floorValue)
