@@ -3253,7 +3253,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 			log.Info("Builder pubkey matches FallbackBuilder or one of the Builders")
 		} else {
 			log.Info("Builder pubkey does not match FallbackBuilder or any of the Builders", " pubkey:", builderPubkey)
-			api.RespondError(w, http.StatusBadRequest, "Block Owner haven't deletaged your builder pubkey")
+			api.RespondError(w, http.StatusBadRequest, "Block Owner hasn't deletaged your builder pubkey")
 			return
 		}
 
