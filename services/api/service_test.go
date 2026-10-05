@@ -400,6 +400,98 @@ func TestBuilderSubmitBlockSSZ(t *testing.T) {
 	}
 }
 
+func TestBuilderSubmitBlockGloasSSZ(t *testing.T) {
+	previousDisableEthgasMarketAPI := disableEthgasMarketAPI
+	disableEthgasMarketAPI = true
+	t.Cleanup(func() {
+		disableEthgasMarketAPI = previousDisableEthgasMarketAPI
+	})
+
+	backend := newTestBackend(t, 1)
+	backend.relay.headSlot.Store(testSlot - 1)
+	backend.relay.capellaEpoch = 0
+	backend.relay.denebEpoch = 0
+	backend.relay.electraEpoch = 0
+	backend.relay.fuluEpoch = 0
+
+	proposerSK, proposerBLSPubkey, err := bls.GenerateNewKeypair()
+	require.NoError(t, err)
+	proposer, err := utils.BlsPublicKeyToPublicKey(proposerBLSPubkey)
+	require.NoError(t, err)
+	proposerPubkey := proposer.String()
+	versioned, _, _ := common.CreateTestBlockSubmission(t, testBuilderPubkey, uint256.NewInt(1), &common.CreateTestBlockSubmissionOpts{
+		Slot:           testSlot,
+		ParentHash:     testParentHash,
+		ProposerPubkey: proposerPubkey,
+		Version:        spec.DataVersionFulu,
+	})
+	versioned.Fulu.Message.ProposerFeeRecipient = common.ValidPayloadRegisterValidator.Message.FeeRecipient
+	versioned.Fulu.ExecutionPayload.Timestamp = backend.relay.genesisInfo.Data.GenesisTime + testSlot*common.SecondsPerSlot
+	prevRandao, err := utils.HexToHash(testPrevRandao)
+	require.NoError(t, err)
+	versioned.Fulu.ExecutionPayload.PrevRandao = prevRandao
+	versioned.Fulu.ExecutionPayload.Withdrawals = []*capella.Withdrawal{}
+
+	gloasPayload, err := common.NewExecutionPayloadGloas(versioned.Fulu.ExecutionPayload, []byte{0xc0}, testSlot)
+	require.NoError(t, err)
+	gloasRequest := &common.GloasSubmitBlockRequest{
+		Message:           versioned.Fulu.Message,
+		ExecutionPayload:  gloasPayload,
+		BlobsBundle:       versioned.Fulu.BlobsBundle,
+		ExecutionRequests: common.NewExecutionRequestsGloas(versioned.Fulu.ExecutionRequests),
+		Signature:         versioned.Fulu.Signature,
+	}
+	requestSSZ, err := gloasRequest.MarshalSSZ()
+	require.NoError(t, err)
+
+	withdrawalsRoot, err := ComputeWithdrawalsRoot(versioned.Fulu.ExecutionPayload.Withdrawals)
+	require.NoError(t, err)
+	backend.relay.proposerDutiesMap = make(map[uint64]*common.BuilderGetValidatorsResponseEntry)
+	backend.relay.proposerDutiesMap[testSlot] = &common.BuilderGetValidatorsResponseEntry{
+		Slot:  testSlot,
+		Entry: &common.ValidPayloadRegisterValidator,
+	}
+	backend.relay.payloadAttributes = make(map[string]payloadAttributesHelper)
+	const proposerIndex = uint64(17)
+	backend.relay.payloadAttributes[getPayloadAttributesKey(testParentHash, testSlot)] = payloadAttributesHelper{
+		slot:          testSlot,
+		proposerIndex: proposerIndex,
+		parentHash:    testParentHash,
+		payloadAttributes: beaconclient.PayloadAttributes{
+			PrevRandao: testPrevRandao,
+		},
+		withdrawalsRoot: withdrawalsRoot,
+	}
+	backend.datastore.SetKnownValidator(common.NewPubkeyHex(proposerPubkey), proposerIndex)
+	backend.relay.opts.EthNetDetails.GloasForkVersionHex = "0x80000038"
+	proposerPreferencesDomain, err := common.ComputeDomain(
+		common.DomainTypeProposerPreferences,
+		backend.relay.opts.EthNetDetails.GloasForkVersionHex,
+		backend.relay.opts.EthNetDetails.GenesisValidatorsRootHex,
+	)
+	require.NoError(t, err)
+	backend.relay.opts.EthNetDetails.DomainProposerPreferences = proposerPreferencesDomain
+	preference := signedGloasProposerPreferences(
+		t,
+		proposerPreferencesDomain,
+		proposerSK,
+		testSlot,
+		proposerIndex,
+		phase0.Root{0x99},
+		common.ValidPayloadRegisterValidator.Message.FeeRecipient,
+		uint64(gloasPayload.GasLimit),
+	)
+	backend.relay.processGloasProposerPreferences(beaconclient.ProposerPreferencesEvent{Version: common.ForkVersionStringGloas, Data: preference})
+
+	rr := backend.requestBytes(http.MethodPost, "/relay/v1/builder/blocks", requestSSZ, map[string]string{
+		HeaderContentType: ApplicationOctetStream,
+	})
+	// Reaching signature validation proves that the handler decoded the V6 SSZ
+	// body and ran it through the existing Fulu validation pipeline.
+	require.Equal(t, http.StatusBadRequest, rr.Code, rr.Body.String())
+	require.Contains(t, rr.Body.String(), "signature")
+}
+
 func TestBuilderSubmitBlock(t *testing.T) {
 	previousDisableEthgasMarketAPI := disableEthgasMarketAPI
 	disableEthgasMarketAPI = true

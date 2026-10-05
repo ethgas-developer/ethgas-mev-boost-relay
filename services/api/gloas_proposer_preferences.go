@@ -166,3 +166,18 @@ func isGasLimitTargetCompatible(parentGasLimit, gasLimit, targetGasLimit uint64)
 	}
 	return gasLimit == minGasLimit
 }
+
+func (api *RelayAPI) validateKnownGloasParentGasLimit(parentHash phase0.Hash32, gasLimit, targetGasLimit uint64) error {
+	api.gloasPayloadsLock.RLock()
+	defer api.gloasPayloadsLock.RUnlock()
+	for _, payload := range api.gloasPayloads {
+		if payload == nil || payload.payload == nil || payload.payload.BlockHash != parentHash {
+			continue
+		}
+		if !isGasLimitTargetCompatible(uint64(payload.payload.GasLimit), gasLimit, targetGasLimit) {
+			return fmt.Errorf("gas limit %d is incompatible with target %d and parent gas limit %d", gasLimit, targetGasLimit, payload.payload.GasLimit)
+		}
+		return nil
+	}
+	return nil
+}

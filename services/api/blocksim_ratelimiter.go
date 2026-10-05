@@ -26,6 +26,7 @@ var (
 	ErrNoDenebPayload   = errors.New("deneb payload is nil")
 	ErrNoElectraPayload = errors.New("electra payload is nil")
 	ErrNoFuluPayload    = errors.New("fulu payload is nil")
+	ErrNoGloasPayload   = errors.New("gloas payload is nil")
 
 	maxConcurrentBlocks = int64(cli.GetEnvInt("BLOCKSIM_MAX_CONCURRENT", 4)) // 0 for no maximum
 	simRequestTimeout   = time.Duration(cli.GetEnvInt("BLOCKSIM_TIMEOUT_MS", 10000)) * time.Millisecond
@@ -98,7 +99,11 @@ func (b *BlockSimulationRateLimiter) Send(
 		return nil, ErrNoElectraPayload, nil
 	}
 
-	if payload.Version == spec.DataVersionFulu && payload.Fulu == nil {
+	if payload.Gloas != nil && payload.Gloas.ExecutionPayload == nil {
+		return nil, ErrNoGloasPayload, nil
+	}
+
+	if payload.Gloas == nil && payload.Version == spec.DataVersionFulu && payload.Fulu == nil {
 		return nil, ErrNoFuluPayload, nil
 	}
 
@@ -118,7 +123,9 @@ func (b *BlockSimulationRateLimiter) Send(
 	}
 
 	// Create and fire off JSON-RPC request
-	if payload.Version == spec.DataVersionFulu {
+	if payload.Gloas != nil {
+		simReq = jsonrpc.NewJSONRPCRequest("1", simRPCNamespace+"_validateBuilderSubmissionV6", payload)
+	} else if payload.Version == spec.DataVersionFulu {
 		simReq = jsonrpc.NewJSONRPCRequest("1", simRPCNamespace+"_validateBuilderSubmissionV5", payload)
 	} else if payload.Version == spec.DataVersionElectra {
 		simReq = jsonrpc.NewJSONRPCRequest("1", simRPCNamespace+"_validateBuilderSubmissionV4", payload)

@@ -38,9 +38,11 @@ import (
 	builderApiCapella "github.com/attestantio/go-builder-client/api/capella"
 	builderApiDeneb "github.com/attestantio/go-builder-client/api/deneb"
 	builderApiElectra "github.com/attestantio/go-builder-client/api/electra"
+	builderApiFulu "github.com/attestantio/go-builder-client/api/fulu"
 
 	builderApiV1 "github.com/attestantio/go-builder-client/api/v1"
 	"github.com/attestantio/go-eth2-client/spec"
+	"github.com/attestantio/go-eth2-client/spec/bellatrix"
 	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/buger/jsonparser"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -427,6 +429,37 @@ type blockSimResult struct {
 	validationErr        error
 }
 
+type gloasPayloadContext struct {
+	slot              uint64
+	blockHash         phase0.Hash32
+	feeRecipient      bellatrix.ExecutionAddress
+	bidTrace          *common.BidTraceV2WithBlobFields
+	payload           *common.ExecutionPayloadGloas
+	executionRequests *common.ExecutionRequestsGloas
+	blobsBundle       *builderApiFulu.BlobsBundle
+}
+
+func (c *gloasPayloadContext) cacheEntry() *common.GloasPayloadCacheEntry {
+	if c == nil {
+		return nil
+	}
+	return &common.GloasPayloadCacheEntry{
+		Slot:         c.slot,
+		BlockHash:    c.blockHash,
+		FeeRecipient: c.feeRecipient,
+		BidTrace:     c.bidTrace,
+		Contents: &common.GloasPayloadContents{
+			ExecutionPayload:  c.payload,
+			ExecutionRequests: c.executionRequests,
+			BlobsBundle:       c.blobsBundle,
+		},
+	}
+}
+
+func gloasPayloadKey(slot uint64, blockHash fmt.Stringer) string {
+	return fmt.Sprintf("%d_%s", slot, blockHash.String())
+}
+
 // RelayAPI represents a single Relay instance
 type RelayAPI struct {
 	opts RelayAPIOpts
@@ -482,6 +515,8 @@ type RelayAPI struct {
 
 	payloadAttributes     map[string]payloadAttributesHelper // key:parentBlockHash
 	payloadAttributesLock sync.RWMutex
+	gloasPayloads         map[string]*gloasPayloadContext
+	gloasPayloadsLock     sync.RWMutex
 
 	// The slot we are currently optimistically simulating.
 	optimisticSlot uberatomic.Uint64
@@ -747,6 +782,7 @@ func NewRelayAPI(opts RelayAPIOpts) (api *RelayAPI, err error) {
 		db:           opts.DB,
 
 		payloadAttributes: make(map[string]payloadAttributesHelper),
+		gloasPayloads:     make(map[string]*gloasPayloadContext),
 
 		proposerDutiesResponse: &[]byte{},
 		blockSimRateLimiter:    NewBlockSimulationRateLimiter(opts.BlockSimURL),
@@ -3201,9 +3237,12 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	}
 
 	builderEthConsensusVersion := req.Header.Get(HeaderEthConsensusVersion)
+	isGloasSSZSubmission := contentType == common.ApplicationOctetStream && common.IsGloasSubmitBlockRequestSSZ(requestPayloadBytes)
 	if builderEthConsensusVersion == "" {
 		// don't reject a builder submission if the Eth-Consensus-Version header is not present
-		if contentType == common.ApplicationOctetStream {
+		if isGloasSSZSubmission {
+			builderEthConsensusVersion = "gloas"
+		} else if contentType == common.ApplicationOctetStream {
 			slot, err := getSlotFromBuilderSSZPayload(requestPayloadBytes)
 			if err != nil {
 				log.WithError(err).Warn("could not get slot from builder ssz payload")
@@ -3223,7 +3262,39 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	}
 
 	nextTime = time.Now().UTC()
-	if err := payload.UnmarshalWithVersion(requestPayloadBytes, contentType, builderEthConsensusVersion); err != nil {
+	var gloasSubmission *common.GloasSubmitBlockRequest
+	isGloasSubmission := strings.EqualFold(builderEthConsensusVersion, "gloas") ||
+		strings.EqualFold(builderEthConsensusVersion, "amsterdam") ||
+		bytes.Contains(requestPayloadBytes, []byte(`"block_access_list"`))
+	if isGloasSubmission {
+		gloasSubmission = new(common.GloasSubmitBlockRequest)
+		if contentType == common.ApplicationOctetStream {
+			err = gloasSubmission.UnmarshalSSZ(requestPayloadBytes)
+		} else {
+			err = json.Unmarshal(requestPayloadBytes, gloasSubmission)
+		}
+		if err != nil {
+			log.WithError(err).Warn("could not decode Gloas builder submission")
+			api.RespondError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		fuluSubmission, err := gloasSubmission.AsFulu()
+		if err != nil {
+			api.RespondError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		// Existing relay validation and Redis schemas are reused for the common
+		// Fulu fields. The complete Gloas payload and all five execution-request
+		// lists are retained separately for the bid commitment and reveal.
+		payload.Version = spec.DataVersionFulu
+		payload.Fulu = fuluSubmission
+		payload.Gloas = &common.GloasPayloadContents{
+			ExecutionPayload:  gloasSubmission.ExecutionPayload,
+			BlobsBundle:       gloasSubmission.BlobsBundle,
+			ExecutionRequests: gloasSubmission.ExecutionRequests,
+		}
+		log = log.WithField("builderPayloadVersion", "gloas")
+	} else if err := payload.UnmarshalWithVersion(requestPayloadBytes, contentType, builderEthConsensusVersion); err != nil {
 		log.WithError(err).Warn("could not decode payload")
 		api.RespondError(w, http.StatusBadRequest, err.Error())
 		return
@@ -3583,11 +3654,6 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 
 	log = log.WithField("builderIsHighPrio", builderEntry.status.IsHighPrio)
 
-	gasLimit, ok := api.checkSubmissionFeeRecipient(w, log, submission.BidTrace, feeRecipient, builderPubkey.String())
-	if !ok {
-		return
-	}
-
 	// preconf txs should have 0 bid value if there have no public txs
 	// // Don't accept blocks with 0 value
 	// if submission.BidTrace.Value.ToBig().Cmp(ZeroU256.BigInt()) == 0 || len(submission.Transactions) == 0 {
@@ -3607,6 +3673,44 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	attrs, ok := api.checkSubmissionPayloadAttrs(w, log, submission)
 	if !ok {
 		return
+	}
+
+	var gasLimit uint64
+	if gloasSubmission != nil {
+		// ValidatorRegistrationV1 is deprecated at Gloas. Validate the
+		// submission against the independently verified consensus preference
+		// for this exact proposer duty, and pass its target gas limit to the V6
+		// simulator for the parent-relative EIP-1559 compatibility check.
+		proposerPreferences, preferenceErr := api.resolveGloasProposerPreferences(
+			submission.BidTrace.Slot,
+			attrs.proposerIndex,
+			submission.BidTrace.ProposerPubkey,
+		)
+		if preferenceErr != nil {
+			log.WithError(preferenceErr).Warn("rejecting Gloas submission without usable signed proposer preferences")
+			api.RespondError(w, http.StatusBadRequest, preferenceErr.Error())
+			return
+		}
+		preferenceMessage := proposerPreferences.Message
+		if submission.BidTrace.ProposerFeeRecipient != preferenceMessage.FeeRecipient {
+			log.WithFields(logrus.Fields{
+				"expectedFeeRecipient": preferenceMessage.FeeRecipient.String(),
+				"actualFeeRecipient":   submission.BidTrace.ProposerFeeRecipient.String(),
+			}).Info("Gloas fee recipient does not match signed proposer preferences")
+			api.RespondError(w, http.StatusBadRequest, "fee recipient does not match signed proposer preferences")
+			return
+		}
+		gasLimit = uint64(preferenceMessage.TargetGasLimit)
+		if err := api.validateKnownGloasParentGasLimit(submission.BidTrace.ParentHash, submission.GasLimit, gasLimit); err != nil {
+			log.WithError(err).Info("Gloas gas limit does not match signed proposer preferences")
+			api.RespondError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	} else {
+		gasLimit, ok = api.checkSubmissionFeeRecipient(w, log, submission.BidTrace, feeRecipient, builderPubkey.String())
+		if !ok {
+			return
+		}
 	}
 
 	// Verify the signature
@@ -3723,6 +3827,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		builder:    builderEntry,
 		req: &common.BuilderBlockValidationRequest{
 			VersionedSubmitBlockRequest: payload,
+			Gloas:                       gloasSubmission,
 			RegisteredGasLimit:          gasLimit,
 			ParentBeaconBlockRoot:       attrs.parentBeaconRoot,
 		},
@@ -3791,6 +3896,35 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		}
 	}
 
+	var gloasContext *gloasPayloadContext
+	if gloasSubmission != nil {
+		bidTrace := &common.BidTraceV2WithBlobFields{
+			BidTrace:      *submission.BidTrace,
+			BlockNumber:   submission.BlockNumber,
+			NumTx:         uint64(len(submission.Transactions)),
+			NumBlobs:      uint64(len(submission.Blobs)),
+			BlobGasUsed:   submission.BlobGasUsed,
+			ExcessBlobGas: submission.ExcessBlobGas,
+		}
+		gloasContext = &gloasPayloadContext{
+			slot:              submission.BidTrace.Slot,
+			blockHash:         gloasSubmission.ExecutionPayload.BlockHash,
+			feeRecipient:      submission.BidTrace.ProposerFeeRecipient,
+			bidTrace:          bidTrace,
+			payload:           gloasSubmission.ExecutionPayload,
+			executionRequests: payload.Gloas.ExecutionRequests,
+			blobsBundle:       gloasSubmission.BlobsBundle,
+		}
+		if err := api.redis.SaveGloasPayload(gloasContext.cacheEntry()); err != nil {
+			log.WithError(err).Error("failed to persist complete Gloas reveal payload")
+			api.RespondError(w, http.StatusInternalServerError, "failed to persist complete Gloas reveal payload")
+			return
+		}
+		api.gloasPayloadsLock.Lock()
+		api.gloasPayloads[gloasPayloadKey(gloasContext.slot, gloasContext.blockHash)] = gloasContext
+		api.gloasPayloadsLock.Unlock()
+	}
+
 	redisOpts := redisUpdateBidOpts{
 		w:                    w,
 		tx:                   tx,
@@ -3831,6 +3965,16 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 					log.WithError(err).Error("failed saving execution payload in memcached")
 				}
 			}(log)
+		}
+
+		if gloasContext != nil {
+			api.gloasPayloadsLock.Lock()
+			for storedKey, stored := range api.gloasPayloads {
+				if stored.slot+2 < gloasContext.slot {
+					delete(api.gloasPayloads, storedKey)
+				}
+			}
+			api.gloasPayloadsLock.Unlock()
 		}
 	}
 
