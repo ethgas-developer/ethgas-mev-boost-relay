@@ -398,6 +398,7 @@ type RelayAPIOpts struct {
 
 type payloadAttributesHelper struct {
 	slot              uint64
+	proposerIndex     uint64
 	parentHash        string
 	withdrawalsRoot   phase0.Root
 	parentBeaconRoot  *phase0.Root
@@ -945,10 +946,14 @@ func (api *RelayAPI) StartServer() (err error) {
 		log.Infof("capella fork detected (currentEpoch: %d / capellaEpoch: %d)", common.SlotToEpoch(currentSlot), api.capellaEpoch)
 	}
 
-	// start proposer API specific things
-	if api.opts.ProposerAPI {
+	// Gloas builder-facing replicas must resolve and verify signed proposer
+	// preferences too, so they need the validator index/pubkey cache even when
+	// the proposer API is deployed separately.
+	needsKnownValidators := api.opts.ProposerAPI || (api.opts.BlockBuilderAPI && api.opts.EthNetDetails.GloasForkVersionHex != "")
+	if needsKnownValidators {
 		// Optionally seed the known-validators cache so registrations are accepted
-		// before the first beacon-driven refresh.
+		// and Gloas proposer preferences can be verified before the first
+		// beacon-driven refresh.
 		if len(api.opts.InitialKnownValidators) > 0 {
 			if err := api.datastore.SetInitialKnownValidators(api.opts.InitialKnownValidators, currentSlot); err != nil {
 				return fmt.Errorf("seed known validators: %w", err)
@@ -956,10 +961,15 @@ func (api *RelayAPI) StartServer() (err error) {
 			api.log.Infof("seeded %d known validators from --known-validators", len(api.opts.InitialKnownValidators))
 		}
 
-		// Update known validators (which can take 10-30 sec). This is a requirement for service readiness, because without them,
-		// getPayload() doesn't have the information it needs (known validators), which could lead to missed slots.
-		go api.datastore.RefreshKnownValidators(api.log, api.beaconClient, currentSlot)
+		// Seed the cache immediately at startup.  RefreshKnownValidators applies
+		// the recurring slot-4/20 schedule and is therefore a no-op at genesis
+		// slot 0, which leaves early validator registrations unusable.  The head
+		// event loop continues to use the scheduled wrapper for later refreshes.
+		go api.datastore.RefreshKnownValidatorsWithoutChecks(api.log, api.beaconClient, currentSlot)
+	}
 
+	// start proposer API specific things
+	if api.opts.ProposerAPI {
 		// Start the validator registration db-save processor
 		api.log.Infof("starting %d validator registration processors", numValidatorRegProcessors)
 		for range numValidatorRegProcessors {
@@ -975,15 +985,36 @@ func (api *RelayAPI) StartServer() (err error) {
 		// Get current proposer duties blocking before starting, to have them ready
 		api.updateProposerDuties(syncStatus.HeadSlot)
 
-		// Subscribe to payload attributes events (only for builder-api)
+	}
+
+	// Builder submissions need payload attributes for validation.
+	needsPayloadAttributes := api.opts.BlockBuilderAPI
+	if needsPayloadAttributes {
 		go func() {
 			c := make(chan beaconclient.PayloadAttributesEvent)
 			api.beaconClient.SubscribeToPayloadAttributesEvents(c)
-			for {
-				payloadAttributes := <-c
+			for payloadAttributes := range c {
 				api.processPayloadAttributes(payloadAttributes)
 			}
 		}()
+	}
+
+	// From Gloas onwards validator registrations no longer carry the
+	// authoritative fee recipient and gas target. Both builder-facing and
+	// proposer-facing replicas need the beacon node's gossip-validated
+	// preferences; Redis shares the verified records between split replicas.
+	if (api.opts.BlockBuilderAPI || api.opts.ProposerAPI) && api.opts.EthNetDetails.GloasForkVersionHex != "" {
+		if subscriber, ok := api.beaconClient.(beaconclient.IProposerPreferencesSubscriber); ok {
+			go func() {
+				c := make(chan beaconclient.ProposerPreferencesEvent)
+				subscriber.SubscribeToProposerPreferencesEvents(c)
+				for preference := range c {
+					api.processGloasProposerPreferences(preference)
+				}
+			}()
+		} else {
+			api.log.Warn("beacon client does not support Gloas proposer_preferences events")
+		}
 	}
 
 	// Process current slot
@@ -1329,6 +1360,7 @@ func (api *RelayAPI) processPayloadAttributes(payloadAttributes beaconclient.Pay
 	// Step 2: save new one
 	api.payloadAttributes[getPayloadAttributesKey(payloadAttributes.Data.ParentBlockHash, payloadAttrSlot)] = payloadAttributesHelper{
 		slot:              payloadAttrSlot,
+		proposerIndex:     payloadAttributes.Data.ProposerIndex,
 		parentHash:        payloadAttributes.Data.ParentBlockHash,
 		withdrawalsRoot:   withdrawalsRoot,
 		parentBeaconRoot:  parentBeaconRoot,

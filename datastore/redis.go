@@ -35,6 +35,7 @@ var (
 	ErrFailedUpdatingTopBidNoBids            = errors.New("failed to update top bid because no bids were found")
 	ErrAnotherPayloadAlreadyDeliveredForSlot = errors.New("another payload block hash for slot was already delivered")
 	ErrPastSlotAlreadyDelivered              = errors.New("payload for past slot was already delivered")
+	ErrGloasProposerPreferencesConflict      = errors.New("conflicting Gloas proposer preferences for the same duty and dependent root")
 
 	// Docs about redis settings: https://redis.io/docs/reference/clients/
 	redisConnectionPoolSize = cli.GetEnvInt("REDIS_CONNECTION_POOL_SIZE", 0) // 0 means use default (10 per CPU)
@@ -96,6 +97,7 @@ type RedisCache struct {
 	prefixTopBidValue                 string
 	prefixFloorBid                    string
 	prefixFloorBidValue               string
+	prefixGloasProposerPreferences    string
 	prefixGloasPayload                string
 	prefixGloasSelectedPayload        string
 
@@ -142,6 +144,7 @@ func NewRedisCache(prefix, redisURI, readonlyURI string) (*RedisCache, error) {
 		prefixTopBidValue:                 fmt.Sprintf("%s/%s:top-bid-value", redisPrefix, prefix),                  // prefix:slot_parentHash_proposerPubkey
 		prefixFloorBid:                    fmt.Sprintf("%s/%s:bid-floor", redisPrefix, prefix),                      // prefix:slot_parentHash_proposerPubkey
 		prefixFloorBidValue:               fmt.Sprintf("%s/%s:bid-floor-value", redisPrefix, prefix),                // prefix:slot_parentHash_proposerPubkey
+		prefixGloasProposerPreferences:    fmt.Sprintf("%s/%s:gloas-proposer-preferences", redisPrefix, prefix),
 		prefixGloasPayload:                fmt.Sprintf("%s/%s:gloas-payload", redisPrefix, prefix),
 		prefixGloasSelectedPayload:        fmt.Sprintf("%s/%s:gloas-selected-payload", redisPrefix, prefix),
 
@@ -209,6 +212,18 @@ func (r *RedisCache) keyFloorBid(slot uint64, parentHash, proposerPubkey string)
 // keyFloorBidValue returns the key for the highest non-cancellable value of a given slot+parentHash+proposerPubkey
 func (r *RedisCache) keyFloorBidValue(slot uint64, parentHash, proposerPubkey string) string {
 	return fmt.Sprintf("%s:%d_%s_%s", r.prefixFloorBidValue, slot, parentHash, proposerPubkey)
+}
+
+func (r *RedisCache) keyGloasProposerPreferences(slot, validatorIndex uint64, dependentRoot string) string {
+	return fmt.Sprintf("%s:%d_%d_%s", r.prefixGloasProposerPreferences, slot, validatorIndex, strings.ToLower(dependentRoot))
+}
+
+func (r *RedisCache) keyGloasProposerPreferencesDuty(slot, validatorIndex uint64) string {
+	return fmt.Sprintf("%s:duty:%d_%d", r.prefixGloasProposerPreferences, slot, validatorIndex)
+}
+
+func (r *RedisCache) keyGloasProposerPreferencesConflict(slot, validatorIndex uint64) string {
+	return fmt.Sprintf("%s:conflict:%d_%d", r.prefixGloasProposerPreferences, slot, validatorIndex)
 }
 
 func (r *RedisCache) keyGloasPayload(slot uint64, blockHash string) string {
@@ -420,6 +435,91 @@ func (r *RedisCache) GetBestBid(slot uint64, parentHash, proposerPubkey string) 
 		return nil, nil
 	}
 	return resp, err
+}
+
+// SaveGloasSignedProposerPreferences stores the full validator-signed
+// consensus preference under its branch-scoped identity. SETNX preserves the
+// first valid gossip item for a (slot, validator, dependent-root) tuple across
+// all relay replicas, matching the consensus gossip first-seen rule.
+func (r *RedisCache) SaveGloasSignedProposerPreferences(preferences *common.SignedProposerPreferences, expiration time.Duration) error {
+	if preferences == nil || preferences.Message == nil {
+		return errors.New("incomplete Gloas signed proposer preferences")
+	}
+	message := preferences.Message
+	key := r.keyGloasProposerPreferences(uint64(message.ProposalSlot), uint64(message.ValidatorIndex), message.DependentRoot.String())
+	encoded, err := json.Marshal(preferences)
+	if err != nil {
+		return err
+	}
+	stored, err := r.client.SetNX(context.Background(), key, encoded, expiration).Result()
+	if err != nil {
+		return err
+	}
+	if !stored {
+		existing, getErr := r.client.Get(context.Background(), key).Result()
+		if getErr != nil {
+			return getErr
+		}
+		if existing != string(encoded) {
+			conflictKey := r.keyGloasProposerPreferencesConflict(uint64(message.ProposalSlot), uint64(message.ValidatorIndex))
+			if setErr := r.client.Set(context.Background(), conflictKey, strings.ToLower(message.DependentRoot.String()), expiration).Err(); setErr != nil {
+				return fmt.Errorf("persist Gloas proposer preferences conflict: %w", setErr)
+			}
+			return ErrGloasProposerPreferencesConflict
+		}
+	}
+
+	dutyKey := r.keyGloasProposerPreferencesDuty(uint64(message.ProposalSlot), uint64(message.ValidatorIndex))
+	pipe := r.client.TxPipeline()
+	pipe.SAdd(context.Background(), dutyKey, strings.ToLower(message.DependentRoot.String()))
+	pipe.Expire(context.Background(), dutyKey, expiration)
+	_, err = pipe.Exec(context.Background())
+	return err
+}
+
+func (r *RedisCache) GetGloasSignedProposerPreferences(slot, validatorIndex uint64, dependentRoot string) (*common.SignedProposerPreferences, error) {
+	preferences := new(common.SignedProposerPreferences)
+	err := r.GetObj(r.keyGloasProposerPreferences(slot, validatorIndex, dependentRoot), preferences)
+	if errors.Is(err, redis.Nil) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return preferences, nil
+}
+
+// GetGloasSignedProposerPreferencesForDuty returns every branch-scoped
+// preference observed for a proposal duty. Callers must reject incompatible
+// values across roots unless they can identify the correct fork-choice branch.
+func (r *RedisCache) GetGloasSignedProposerPreferencesForDuty(slot, validatorIndex uint64) ([]*common.SignedProposerPreferences, error) {
+	conflict, err := r.client.Exists(context.Background(), r.keyGloasProposerPreferencesConflict(slot, validatorIndex)).Result()
+	if err != nil {
+		return nil, err
+	}
+	if conflict > 0 {
+		return nil, ErrGloasProposerPreferencesConflict
+	}
+	dutyKey := r.keyGloasProposerPreferencesDuty(slot, validatorIndex)
+	roots, err := r.client.SMembers(context.Background(), dutyKey).Result()
+	if err != nil {
+		return nil, err
+	}
+	preferences := make([]*common.SignedProposerPreferences, 0, len(roots))
+	for _, root := range roots {
+		entry, getErr := r.GetGloasSignedProposerPreferences(slot, validatorIndex, root)
+		if getErr != nil {
+			return nil, getErr
+		}
+		if entry == nil {
+			// The exact key can expire just before the index set. Prune the stale
+			// member so future lookups do not report a false ambiguity.
+			_ = r.client.SRem(context.Background(), dutyKey, root).Err()
+			continue
+		}
+		preferences = append(preferences, entry)
+	}
+	return preferences, nil
 }
 
 func (r *RedisCache) SaveGloasPayload(entry *common.GloasPayloadCacheEntry) error {
