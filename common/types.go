@@ -74,6 +74,14 @@ var (
 	FuluForkVersionHoodi   = "0x70000910"
 	FuluForkVersionMainnet = "0x06000000"
 
+	// Gloas defaults follow published network/client configs. Leave unpublished
+	// versions empty rather than guessing; GLOAS_FORK_VERSION can override them.
+	GloasForkVersionHolesky = "0x08017000"
+	GloasForkVersionSepolia = "0x90000076"
+	GloasForkVersionGoerli  = "0x07001020"
+	GloasForkVersionHoodi   = "0x80000910"
+	GloasForkVersionMainnet = "0x07000000"
+
 	ForkVersionStringBellatrix = "bellatrix"
 	ForkVersionStringCapella   = "capella"
 	ForkVersionStringDeneb     = "deneb"
@@ -123,11 +131,6 @@ func NewEthNetworkDetails(networkName string) (ret *EthNetworkDetails, err error
 	var domainBuilderRequestAuth phase0.Domain
 	var domainProposerPreferences phase0.Domain
 
-	// Gloas is not active on the named public networks yet. Devnets provide
-	// their fork version explicitly, and custom networks already provide the
-	// matching genesis validators root below.
-	gloasForkVersion = os.Getenv("GLOAS_FORK_VERSION")
-
 	switch networkName {
 	case EthNetworkHolesky:
 		genesisForkVersion = GenesisForkVersionHolesky
@@ -137,6 +140,7 @@ func NewEthNetworkDetails(networkName string) (ret *EthNetworkDetails, err error
 		denebForkVersion = DenebForkVersionHolesky
 		electraForkVersion = ElectraForkVersionHolesky
 		fuluForkVersion = FuluForkVersionHolesky
+		gloasForkVersion = GloasForkVersionHolesky
 	case EthNetworkSepolia:
 		genesisForkVersion = GenesisForkVersionSepolia
 		genesisValidatorsRoot = GenesisValidatorsRootSepolia
@@ -145,6 +149,7 @@ func NewEthNetworkDetails(networkName string) (ret *EthNetworkDetails, err error
 		denebForkVersion = DenebForkVersionSepolia
 		electraForkVersion = ElectraForkVersionSepolia
 		fuluForkVersion = FuluForkVersionSepolia
+		gloasForkVersion = GloasForkVersionSepolia
 	case EthNetworkGoerli:
 		genesisForkVersion = GenesisForkVersionGoerli
 		genesisValidatorsRoot = GenesisValidatorsRootGoerli
@@ -153,6 +158,7 @@ func NewEthNetworkDetails(networkName string) (ret *EthNetworkDetails, err error
 		denebForkVersion = DenebForkVersionGoerli
 		electraForkVersion = ElectraForkVersionGoerli
 		fuluForkVersion = FuluForkVersionGoerli
+		gloasForkVersion = GloasForkVersionGoerli
 	case EthNetworkHoodi:
 		genesisForkVersion = GenesisForkVersionHoodi
 		genesisValidatorsRoot = GenesisValidatorsRootHoodi
@@ -161,6 +167,7 @@ func NewEthNetworkDetails(networkName string) (ret *EthNetworkDetails, err error
 		denebForkVersion = DenebForkVersionHoodi
 		electraForkVersion = ElectraForkVersionHoodi
 		fuluForkVersion = FuluForkVersionHoodi
+		gloasForkVersion = GloasForkVersionHoodi
 	case EthNetworkMainnet:
 		genesisForkVersion = GenesisForkVersionMainnet
 		genesisValidatorsRoot = GenesisValidatorsRootMainnet
@@ -169,6 +176,7 @@ func NewEthNetworkDetails(networkName string) (ret *EthNetworkDetails, err error
 		denebForkVersion = DenebForkVersionMainnet
 		electraForkVersion = ElectraForkVersionMainnet
 		fuluForkVersion = FuluForkVersionMainnet
+		gloasForkVersion = GloasForkVersionMainnet
 	case EthNetworkCustom:
 		genesisForkVersion = os.Getenv("GENESIS_FORK_VERSION")
 		genesisValidatorsRoot = os.Getenv("GENESIS_VALIDATORS_ROOT")
@@ -179,6 +187,12 @@ func NewEthNetworkDetails(networkName string) (ret *EthNetworkDetails, err error
 		fuluForkVersion = os.Getenv("FULU_FORK_VERSION")
 	default:
 		return nil, fmt.Errorf("%w: %s", ErrUnknownNetwork, networkName)
+	}
+
+	// Keep explicit devnet/custom versions authoritative over network defaults.
+	// A fork version defines signing domains, not the chain activation epoch.
+	if override := os.Getenv("GLOAS_FORK_VERSION"); override != "" {
+		gloasForkVersion = override
 	}
 
 	domainBuilder, err = ComputeDomain(boostSsz.DomainTypeAppBuilder, genesisForkVersion, phase0.Root{}.String())
@@ -259,12 +273,15 @@ func (e *EthNetworkDetails) String() string {
 	CapellaForkVersionHex: %s,
 	DenebForkVersionHex: %s,
 	ElectraForkVersionHex: %s,
+	GloasForkVersionHex: %s,
 	DomainBuilder: %x,
 	DomainBeaconProposerBellatrix: %x,
 	DomainBeaconProposerCapella: %x,
 	DomainBeaconProposerDeneb: %x
 	DomainBeaconProposerElectra: %x
 	DomainBeaconProposerFulu: %x
+	DomainBeaconBuilderGloas: %x
+	DomainProposerPreferences: %x
 }`,
 		e.Name,
 		e.GenesisForkVersionHex,
@@ -273,12 +290,15 @@ func (e *EthNetworkDetails) String() string {
 		e.CapellaForkVersionHex,
 		e.DenebForkVersionHex,
 		e.ElectraForkVersionHex,
+		e.GloasForkVersionHex,
 		e.DomainBuilder,
 		e.DomainBeaconProposerBellatrix,
 		e.DomainBeaconProposerCapella,
 		e.DomainBeaconProposerDeneb,
 		e.DomainBeaconProposerElectra,
-		e.DomainBeaconProposerFulu)
+		e.DomainBeaconProposerFulu,
+		e.DomainBeaconBuilderGloas,
+		e.DomainProposerPreferences)
 }
 
 // PubkeyHex represents a hex-encoded public key.
