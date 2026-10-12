@@ -18,6 +18,7 @@ import (
 	eth2ApiV1Electra "github.com/attestantio/go-eth2-client/api/v1/electra"
 	eth2ApiV1Fulu "github.com/attestantio/go-eth2-client/api/v1/fulu"
 	"github.com/attestantio/go-eth2-client/spec"
+	"github.com/attestantio/go-eth2-client/spec/bellatrix"
 	"github.com/attestantio/go-eth2-client/spec/capella"
 	"github.com/attestantio/go-eth2-client/spec/deneb"
 	"github.com/attestantio/go-eth2-client/spec/electra"
@@ -568,6 +569,10 @@ type VersionedSubmitBlockRequest struct {
 	// Gloas retains the Amsterdam-only reveal fields while the embedded Fulu
 	// request continues to feed the relay's established validation path.
 	Gloas *GloasPayloadContents `json:"-"`
+	// GloasExchangeFeeRecipient is relay-validated payout policy, not part of
+	// the builder's signed request or the consensus payload. Never decode it
+	// from the builder wire format; persist it with the accepted Redis bid.
+	GloasExchangeFeeRecipient *bellatrix.ExecutionAddress `json:"-"`
 }
 
 func (r *VersionedSubmitBlockRequest) MarshalSSZ() ([]byte, error) {

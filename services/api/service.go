@@ -460,13 +460,14 @@ type blockSimResult struct {
 }
 
 type gloasPayloadContext struct {
-	slot              uint64
-	blockHash         phase0.Hash32
-	feeRecipient      bellatrix.ExecutionAddress
-	bidTrace          *common.BidTraceV2WithBlobFields
-	payload           *common.ExecutionPayloadGloas
-	executionRequests *common.ExecutionRequestsGloas
-	blobsBundle       *builderApiFulu.BlobsBundle
+	slot                 uint64
+	blockHash            phase0.Hash32
+	feeRecipient         bellatrix.ExecutionAddress
+	exchangeFeeRecipient *bellatrix.ExecutionAddress
+	bidTrace             *common.BidTraceV2WithBlobFields
+	payload              *common.ExecutionPayloadGloas
+	executionRequests    *common.ExecutionRequestsGloas
+	blobsBundle          *builderApiFulu.BlobsBundle
 }
 
 type gloasSelectedPayloadContext struct {
@@ -479,10 +480,11 @@ func (c *gloasPayloadContext) cacheEntry() *common.GloasPayloadCacheEntry {
 		return nil
 	}
 	return &common.GloasPayloadCacheEntry{
-		Slot:         c.slot,
-		BlockHash:    c.blockHash,
-		FeeRecipient: c.feeRecipient,
-		BidTrace:     c.bidTrace,
+		Slot:                 c.slot,
+		BlockHash:            c.blockHash,
+		FeeRecipient:         c.feeRecipient,
+		ExchangeFeeRecipient: c.exchangeFeeRecipient,
+		BidTrace:             c.bidTrace,
 		Contents: &common.GloasPayloadContents{
 			ExecutionPayload:  c.payload,
 			ExecutionRequests: c.executionRequests,
@@ -498,14 +500,19 @@ func gloasPayloadContextFromCache(entry *common.GloasPayloadCacheEntry) (*gloasP
 	if uint64(entry.Contents.ExecutionPayload.SlotNumber) != entry.Slot || entry.Contents.ExecutionPayload.BlockHash != entry.BlockHash {
 		return nil, errors.New("Gloas payload cache metadata mismatch")
 	}
+	if entry.ExchangeFeeRecipient != nil &&
+		(*entry.ExchangeFeeRecipient != entry.FeeRecipient || *entry.ExchangeFeeRecipient != entry.BidTrace.ProposerFeeRecipient) {
+		return nil, errors.New("Gloas exchange payout cache metadata mismatch")
+	}
 	return &gloasPayloadContext{
-		slot:              entry.Slot,
-		blockHash:         entry.BlockHash,
-		feeRecipient:      entry.FeeRecipient,
-		bidTrace:          entry.BidTrace,
-		payload:           entry.Contents.ExecutionPayload,
-		executionRequests: entry.Contents.ExecutionRequests,
-		blobsBundle:       entry.Contents.BlobsBundle,
+		slot:                 entry.Slot,
+		blockHash:            entry.BlockHash,
+		feeRecipient:         entry.FeeRecipient,
+		exchangeFeeRecipient: entry.ExchangeFeeRecipient,
+		bidTrace:             entry.BidTrace,
+		payload:              entry.Contents.ExecutionPayload,
+		executionRequests:    entry.Contents.ExecutionRequests,
+		blobsBundle:          entry.Contents.BlobsBundle,
 	}, nil
 }
 
@@ -2011,11 +2018,17 @@ func (api *RelayAPI) handleGetExecutionPayloadBid(w http.ResponseWriter, req *ht
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	if payloadContext.feeRecipient != preferenceMessage.FeeRecipient {
+	expectedPayoutRecipient, payoutErr := api.gloasPayloadPayoutRecipient(payloadContext, preferenceMessage.FeeRecipient)
+	if payoutErr != nil {
+		log.WithError(payoutErr).Warn("winning Gloas payload has unusable exchange payout policy")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if payloadContext.feeRecipient != expectedPayoutRecipient {
 		log.WithFields(logrus.Fields{
-			"payloadFeeRecipient":    payloadContext.feeRecipient.String(),
-			"preferenceFeeRecipient": preferenceMessage.FeeRecipient.String(),
-		}).Warn("winning Gloas payload does not honor signed proposer fee recipient")
+			"payloadFeeRecipient":  payloadContext.feeRecipient.String(),
+			"expectedFeeRecipient": expectedPayoutRecipient.String(),
+		}).Warn("winning Gloas payload does not honor expected payout fee recipient")
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -4418,9 +4431,9 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	var gasLimit uint64
 	if gloasSubmission != nil {
 		// ValidatorRegistrationV1 is deprecated at Gloas. Validate the
-		// submission against the independently verified consensus preference
-		// for this exact proposer duty, and pass its target gas limit to the V6
-		// simulator for the parent-relative EIP-1559 compatibility check.
+		// exact signed proposer duty and retain its gas target for V6 simulation.
+		// As on main, an exchange buyer overrides the builder's execution payout
+		// recipient, not the signed consensus preferences or outgoing bid fields.
 		proposerPreferences, preferenceErr := api.resolveGloasProposerPreferences(
 			submission.BidTrace.Slot,
 			attrs.proposerIndex,
@@ -4432,14 +4445,21 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 			return
 		}
 		preferenceMessage := proposerPreferences.Message
-		if submission.BidTrace.ProposerFeeRecipient != preferenceMessage.FeeRecipient {
-			log.WithFields(logrus.Fields{
-				"expectedFeeRecipient": preferenceMessage.FeeRecipient.String(),
-				"actualFeeRecipient":   submission.BidTrace.ProposerFeeRecipient.String(),
-			}).Info("Gloas fee recipient does not match signed proposer preferences")
-			api.RespondError(w, http.StatusBadRequest, "fee recipient does not match signed proposer preferences")
+		expectedFeeRecipient, exchangeFeeRecipient, recipientErr := gloasSubmissionFeeRecipient(preferenceMessage.FeeRecipient, feeRecipient)
+		if recipientErr != nil {
+			log.WithError(recipientErr).Warn("invalid Gloas exchange fee recipient")
+			api.RespondError(w, http.StatusBadRequest, recipientErr.Error())
 			return
 		}
+		if submission.BidTrace.ProposerFeeRecipient != expectedFeeRecipient {
+			log.WithFields(logrus.Fields{
+				"expectedFeeRecipient": expectedFeeRecipient.String(),
+				"actualFeeRecipient":   submission.BidTrace.ProposerFeeRecipient.String(),
+			}).Info("Gloas fee recipient does not match expected payout recipient")
+			api.RespondError(w, http.StatusBadRequest, "fee recipient does not match expected payout recipient")
+			return
+		}
+		payload.GloasExchangeFeeRecipient = exchangeFeeRecipient
 		gasLimit = uint64(preferenceMessage.TargetGasLimit)
 		if err := api.validateKnownGloasParentGasLimit(submission.BidTrace.ParentHash, submission.GasLimit, gasLimit); err != nil {
 			log.WithError(err).Info("Gloas gas limit does not match signed proposer preferences")
@@ -4644,13 +4664,14 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 			ExcessBlobGas: submission.ExcessBlobGas,
 		}
 		gloasContext = &gloasPayloadContext{
-			slot:              submission.BidTrace.Slot,
-			blockHash:         gloasSubmission.ExecutionPayload.BlockHash,
-			feeRecipient:      submission.BidTrace.ProposerFeeRecipient,
-			bidTrace:          bidTrace,
-			payload:           gloasSubmission.ExecutionPayload,
-			executionRequests: payload.Gloas.ExecutionRequests,
-			blobsBundle:       gloasSubmission.BlobsBundle,
+			slot:                 submission.BidTrace.Slot,
+			blockHash:            gloasSubmission.ExecutionPayload.BlockHash,
+			feeRecipient:         submission.BidTrace.ProposerFeeRecipient,
+			exchangeFeeRecipient: payload.GloasExchangeFeeRecipient,
+			bidTrace:             bidTrace,
+			payload:              gloasSubmission.ExecutionPayload,
+			executionRequests:    payload.Gloas.ExecutionRequests,
+			blobsBundle:          gloasSubmission.BlobsBundle,
 		}
 	}
 

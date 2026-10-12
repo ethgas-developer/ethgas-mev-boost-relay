@@ -283,8 +283,11 @@ type GloasPayloadCacheEntry struct {
 	Slot         uint64                     `json:"slot,string"`
 	BlockHash    phase0.Hash32              `json:"block_hash"`
 	FeeRecipient bellatrix.ExecutionAddress `json:"fee_recipient"`
-	BidTrace     *BidTraceV2WithBlobFields  `json:"bid_trace"`
-	Contents     *GloasPayloadContents      `json:"contents"`
+	// ExchangeFeeRecipient records the buyer payout validated on submission.
+	// It is separate from the signed proposer's consensus bid fee recipient.
+	ExchangeFeeRecipient *bellatrix.ExecutionAddress `json:"exchange_fee_recipient,omitempty"`
+	BidTrace             *BidTraceV2WithBlobFields   `json:"bid_trace"`
+	Contents             *GloasPayloadContents       `json:"contents"`
 }
 
 // GloasSelectedPayloadCacheEntry records the exact relay bid accepted by the

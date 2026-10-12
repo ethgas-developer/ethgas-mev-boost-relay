@@ -843,11 +843,12 @@ func (r *RedisCache) SaveBidAndUpdateTopBid(ctx context.Context, pipeliner redis
 		// replacements must not overwrite the Gloas payload for an accepted bid.
 		if payload.Gloas != nil {
 			entry := &common.GloasPayloadCacheEntry{
-				Slot:         submission.BidTrace.Slot,
-				BlockHash:    submission.BidTrace.BlockHash,
-				FeeRecipient: submission.BidTrace.ProposerFeeRecipient,
-				BidTrace:     trace,
-				Contents:     payload.Gloas,
+				Slot:                 submission.BidTrace.Slot,
+				BlockHash:            submission.BidTrace.BlockHash,
+				FeeRecipient:         submission.BidTrace.ProposerFeeRecipient,
+				ExchangeFeeRecipient: payload.GloasExchangeFeeRecipient,
+				BidTrace:             trace,
+				Contents:             payload.Gloas,
 			}
 			if err := r.SetObjPipelined(ctx, pipeliner, r.keyGloasPayload(entry.Slot, entry.BlockHash.String()), entry, expiryBidCache); err != nil {
 				return err
