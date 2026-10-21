@@ -137,6 +137,8 @@ redis-cli DEL boost-relay/sepolia:validators-registration boost-relay/sepolia:va
 * `DB_TABLE_PREFIX` - prefix to use for db tables (default uses `dev`)
 * `GETPAYLOAD_RETRY_TIMEOUT_MS` - getPayload retry getting a payload if first try failed (default: `100`)
 * `GETVALIDATORS_TIMEOUT_SEC` - timeout for the beacon node getStateValidators request used to refresh known validators (default: `60`)
+* `GLOAS_REQUEST_AUTH_DATA` - enables Gloas builder identity discovery when the relay signing key and network fork version are configured; exact auth bytes (plain text or `0x`-encoded) agreed with proposers
+* `GLOAS_BUILDER_INDEX` - optional expected on-chain index for the relay signing key; omitted means auto-discovery, and a configured mismatch disables Gloas bids
 * `MEMCACHED_URIS` - optional comma separated list of memcached endpoints, typically used as secondary storage alongside Redis
 * `MEMCACHED_EXPIRY_SECONDS` - item expiry timeout when using memcache (default: `45`)
 * `MEMCACHED_CLIENT_TIMEOUT_MS` - client timeout in milliseconds (default: `250`)
@@ -364,6 +366,42 @@ WantedBy=default.target
 ```
 
 </details>
+
+## Gloas relay builder identity
+
+The relay acts as the protocol-facing builder using its existing BLS signing
+key. Register and activate that public key on the target chain first; the relay
+does not submit deposits or register keys automatically.
+
+Set `GLOAS_REQUEST_AUTH_DATA` (or `--gloas-request-auth-data`) to the agreed
+request-auth bytes. For the default hostname convention, use the relay's
+advertised hostname, not Commit-Boost's hostname. Keep the relay's network/fork
+configuration and `--secret-key` consistent with that registration.
+
+`GLOAS_BUILDER_INDEX` / `--gloas-builder-index` can now be omitted. The relay
+queries `POST /eth/v1/beacon/states/head/builders` filtered by its own public
+key at startup and every five seconds. An explicitly configured index is an
+additional assertion: it must match the discovered index and cannot bypass
+registry verification. Split proposer replicas verify the identity independently.
+
+Only an active, non-exited payload-builder entry with a matching public key
+from a synced, non-optimistic beacon node enables Gloas bids. Missing, pending,
+exited, mismatched, malformed or unavailable registry results disable new bids
+(`204 No Content`); the relay retries automatically. Lookups have a five-second
+overall deadline, failed nodes can fall back to another configured beacon, and
+cached verification expires after thirty seconds. No registry HTTP request is
+made on the bid-serving hot path. The beacon client must support the standard
+builders endpoint; an older client without it cannot enable Gloas bidding.
+
+Existing Fulu endpoints stay available while registration is pending or the
+chain is still pre-Gloas. A payload already committed by a proposer can still be
+revealed during a registry outage: its cached relay-signed bid supplies the
+authenticated builder index, and the normal signed-block/canonicality checks
+still apply.
+
+Useful log messages are `relay's Gloas builder identity is registered and active`
+and `Gloas bidding disabled until builder identity is verified active`. The latter
+includes the reason (including a configured/registered index mismatch).
 
 ## Bid Cancellations
 

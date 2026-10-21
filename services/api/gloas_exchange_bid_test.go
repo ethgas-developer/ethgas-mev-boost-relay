@@ -65,6 +65,7 @@ func newGloasExchangeBidFixture(t *testing.T, payout bellatrix.ExecutionAddress,
 	builderIndex := uint64(7)
 	f.backend.relay.opts.GloasBuilderIndex = &builderIndex
 	f.backend.relay.opts.EthNetDetails.GloasForkVersionHex = "0x80000038"
+	f.backend.relay.setGloasBuilderIdentity(builderIndex, true, "active")
 	domain, err := common.ComputeDomain(common.DomainTypeProposerPreferences,
 		f.backend.relay.opts.EthNetDetails.GloasForkVersionHex,
 		f.backend.relay.opts.EthNetDetails.GenesisValidatorsRootHex)
@@ -249,6 +250,7 @@ func TestGloasExchangeBidPersistedOverrideAcrossInstances(t *testing.T) {
 	disableEthgasMarketAPI = previousDisabled
 	require.NoError(t, err)
 	secondRelay.genesisInfo = firstRelay.genesisInfo
+	secondRelay.setGloasBuilderIdentity(*firstRelay.opts.GloasBuilderIndex, true, "active")
 	secondRelay.payloadAttributes[getPayloadAttributesKey(testParentHash, testSlot)] = firstRelay.payloadAttributes[getPayloadAttributesKey(testParentHash, testSlot)]
 	require.Empty(t, secondRelay.gloasPayloads)
 	require.Empty(t, secondRelay.gloasSelectedPayloads)

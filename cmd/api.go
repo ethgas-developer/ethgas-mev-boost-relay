@@ -71,7 +71,7 @@ func init() {
 	apiCmd.Flags().StringVar(&network, "network", defaultNetwork, "Which network to use")
 
 	apiCmd.Flags().StringVar(&apiPprofListenAddr, "pprof-listen-addr", apiDefaultPprofListenAddr, "listen address for pprof, empty to disable")
-	apiCmd.Flags().StringVar(&apiGloasBuilderIndex, "gloas-builder-index", apiDefaultGloasBuilderIndex, "on-chain Gloas builder index used to sign execution payload bids; empty disables bid responses")
+	apiCmd.Flags().StringVar(&apiGloasBuilderIndex, "gloas-builder-index", apiDefaultGloasBuilderIndex, "expected on-chain Gloas builder index; empty auto-discovers the relay key's index when request-auth data is configured")
 	apiCmd.Flags().StringVar(&apiGloasRequestAuthData, "gloas-request-auth-data", apiDefaultGloasRequestAuthData, "exact Gloas request-auth data; defaults to the builder URL bytes on the validator")
 	apiCmd.Flags().BoolVar(&apiBuilderAPI, "builder-api", apiDefaultBuilderAPIEnabled, "enable builder API (/builder/...)")
 	apiCmd.Flags().BoolVar(&apiDataAPI, "data-api", apiDefaultDataAPIEnabled, "enable data API (/data/...)")
@@ -198,6 +198,8 @@ var apiCmd = &cobra.Command{
 				log.WithError(err).Fatal("invalid Gloas builder index")
 			}
 			opts.GloasBuilderIndex = &builderIndex
+		}
+		if apiGloasRequestAuthData != "" {
 			if strings.HasPrefix(apiGloasRequestAuthData, "0x") {
 				opts.GloasRequestAuthData, err = hexutil.Decode(apiGloasRequestAuthData)
 				if err != nil {
@@ -205,6 +207,9 @@ var apiCmd = &cobra.Command{
 				}
 			} else {
 				opts.GloasRequestAuthData = []byte(apiGloasRequestAuthData)
+			}
+			if len(opts.GloasRequestAuthData) == 0 || len(opts.GloasRequestAuthData) > common.MaxBuilderRequestAuthDataSize {
+				log.Fatal("Gloas request auth data must contain 1..4096 bytes")
 			}
 		}
 

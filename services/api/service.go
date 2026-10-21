@@ -404,8 +404,8 @@ type RelayAPIOpts struct {
 
 	SecretKey *bls.SecretKey // used to sign bids (getHeader responses)
 
-	// GloasBuilderIndex is the on-chain builder registry index whose pubkey
-	// matches SecretKey. Nil keeps getExecutionPayloadBid in no-bid mode.
+	// GloasBuilderIndex optionally asserts the on-chain index discovered for
+	// SecretKey. The beacon registry must confirm that this identity is active.
 	GloasBuilderIndex *uint64
 	// GloasRequestAuthData is the exact opaque byte sequence proposers sign.
 	// Without an out-of-band value builder-specs defaults this to the exact
@@ -527,6 +527,12 @@ type RelayAPI struct {
 
 	blsSk     *bls.SecretKey
 	publicKey *phase0.BLSPubKey
+
+	gloasBuilderIdentityMu     sync.RWMutex
+	gloasBuilderRefreshMu      sync.Mutex
+	gloasBuilderIdentity       gloasBuilderIdentity
+	gloasBuilderIdentityCancel context.CancelFunc
+	gloasBuilderIdentityWG     sync.WaitGroup
 
 	srv         *http.Server
 	srvStarted  uberatomic.Bool
@@ -799,7 +805,7 @@ func NewRelayAPI(opts RelayAPIOpts) (api *RelayAPI, err error) {
 		return nil, ErrMissingDatastoreOpt
 	}
 
-	if opts.GloasBuilderIndex != nil {
+	if opts.GloasBuilderIndex != nil || len(opts.GloasRequestAuthData) > 0 {
 		if opts.SecretKey == nil {
 			return nil, ErrGloasBuilderWithoutKey
 		}
@@ -809,7 +815,7 @@ func NewRelayAPI(opts RelayAPIOpts) (api *RelayAPI, err error) {
 		if len(opts.GloasRequestAuthData) == 0 || len(opts.GloasRequestAuthData) > common.MaxBuilderRequestAuthDataSize {
 			return nil, ErrGloasBuilderWithoutAuthData
 		}
-		opts.Log.WithField("builderIndex", *opts.GloasBuilderIndex).Info("Gloas builder identity enabled")
+		opts.Log.Info("Gloas builder registry verification enabled")
 	}
 
 	// Both block submission and ETHGas header adjustment require a signing key.
@@ -821,7 +827,7 @@ func NewRelayAPI(opts RelayAPIOpts) (api *RelayAPI, err error) {
 	}
 
 	var publicKey phase0.BLSPubKey
-	if opts.SecretKey != nil && (opts.BlockBuilderAPI || opts.ProposerAPI || opts.GloasBuilderIndex != nil) {
+	if opts.SecretKey != nil && (opts.BlockBuilderAPI || opts.ProposerAPI || opts.GloasBuilderIndex != nil || len(opts.GloasRequestAuthData) > 0) {
 		// Initialize the identity in proposer-only processes as well.
 		blsPubkey, err := bls.PublicKeyFromSecretKey(opts.SecretKey)
 		if err != nil {
@@ -1107,7 +1113,7 @@ func (api *RelayAPI) StartServer() (err error) {
 	// Builder submissions need payload attributes for validation. A
 	// proposer-only Gloas replica also needs them to bind a bid request's
 	// execution parent, beacon parent, and proposer index before serving it.
-	needsPayloadAttributes := api.opts.BlockBuilderAPI || (api.opts.ProposerAPI && api.opts.GloasBuilderIndex != nil && api.opts.EthNetDetails.GloasForkVersionHex != "")
+	needsPayloadAttributes := api.opts.BlockBuilderAPI || (api.opts.ProposerAPI && api.gloasBuilderIdentityEnabled() && api.opts.EthNetDetails.GloasForkVersionHex != "")
 	if needsPayloadAttributes {
 		go func() {
 			c := make(chan beaconclient.PayloadAttributesEvent)
@@ -1135,6 +1141,12 @@ func (api *RelayAPI) StartServer() (err error) {
 			api.log.Warn("beacon client does not support Gloas proposer_preferences events")
 		}
 	}
+
+	api.startGloasBuilderIdentityUpdates()
+	defer func() {
+		api.stopGloasBuilderIdentityUpdates()
+		api.gloasBuilderIdentityWG.Wait()
+	}()
 
 	// Process current slot
 	api.processNewSlot(currentSlot)
@@ -1206,6 +1218,7 @@ func (api *RelayAPI) StopServer() (err error) {
 
 	// start server shutdown
 	api.log.Info("Stopping server...")
+	api.stopGloasBuilderIdentityUpdates()
 
 	// stop returning bids on getHeader calls (should only be used when running a single instance)
 	if api.opts.ProposerAPI && apiShutdownStopSendingBids {
@@ -1916,8 +1929,9 @@ func (api *RelayAPI) handleGetExecutionPayloadBid(w http.ResponseWriter, req *ht
 		return
 	}
 
-	if api.opts.GloasBuilderIndex == nil || api.blsSk == nil || api.opts.EthNetDetails.GloasForkVersionHex == "" {
-		log.Debug("Gloas builder identity is not configured; returning no bid")
+	identity, identityActive := api.currentGloasBuilderIdentity()
+	if !identityActive {
+		log.Debug("Gloas builder identity is not verified active; returning no bid")
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -2068,7 +2082,7 @@ func (api *RelayAPI) handleGetExecutionPayloadBid(w http.ResponseWriter, req *ht
 		"realTime":        realTime,
 	})
 
-	bid, err := common.NewExecutionPayloadBid(gloasLegacyMessage, payloadContext.executionRequests, slot, parentRoot, preferenceMessage.FeeRecipient, *api.opts.GloasBuilderIndex)
+	bid, err := common.NewExecutionPayloadBid(gloasLegacyMessage, payloadContext.executionRequests, slot, parentRoot, preferenceMessage.FeeRecipient, identity.index)
 	if err != nil {
 		log.WithError(err).Error("failed to convert winning bid to Gloas")
 		api.RespondError(w, http.StatusInternalServerError, "failed to construct Gloas bid")
@@ -2092,6 +2106,10 @@ func (api *RelayAPI) handleGetExecutionPayloadBid(w http.ResponseWriter, req *ht
 		}).Info("capping Gloas execution payment to proposer preference")
 		bid.ExecutionPayment = maxExecutionPayment
 	}
+	if !api.gloasBuilderIdentityStillCurrent(identity) {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	signature, err := ssz.SignMessage(bid, api.opts.EthNetDetails.DomainBeaconBuilderGloas, api.blsSk)
 	if err != nil {
 		log.WithError(err).Error("failed to sign Gloas execution payload bid")
@@ -2105,6 +2123,10 @@ func (api *RelayAPI) handleGetExecutionPayloadBid(w http.ResponseWriter, req *ht
 			Message:   bid,
 			Signature: signature,
 		},
+	}
+	if !api.gloasBuilderIdentityStillCurrent(identity) {
+		w.WriteHeader(http.StatusNoContent)
+		return
 	}
 	if err := api.redis.SaveGloasSelectedPayload(slot, &common.GloasSelectedPayloadCacheEntry{
 		BlockHash: payloadContext.blockHash,
@@ -2168,7 +2190,7 @@ func (api *RelayAPI) handleSubmitSignedBeaconBlock(w http.ResponseWriter, req *h
 		api.RespondError(w, http.StatusBadRequest, "Eth-Consensus-Version must be gloas")
 		return
 	}
-	if api.opts.GloasBuilderIndex == nil || api.blsSk == nil {
+	if api.blsSk == nil || api.publicKey == nil || api.opts.EthNetDetails.GloasForkVersionHex == "" {
 		api.RespondError(w, http.StatusServiceUnavailable, "Gloas builder identity is not configured")
 		return
 	}
@@ -2234,6 +2256,19 @@ func (api *RelayAPI) handleSubmitSignedBeaconBlock(w http.ResponseWriter, req *h
 	if selectedPayload.bid.Message == nil {
 		log.Error("selected Gloas bid is incomplete")
 		api.RespondError(w, http.StatusInternalServerError, "selected Gloas bid is incomplete")
+		return
+	}
+	// A registry outage must stop new bids, not strand a payload already
+	// committed by a proposer. Bind the reveal to the identity in our signed bid.
+	selectedIndex := uint64(selectedPayload.bid.Message.BuilderIndex)
+	if expected := api.opts.GloasBuilderIndex; expected != nil && *expected != selectedIndex {
+		api.RespondError(w, http.StatusInternalServerError, "selected Gloas bid does not match configured builder index")
+		return
+	}
+	verifiedBid, verifyErr := ssz.VerifySignature(selectedPayload.bid.Message,
+		api.opts.EthNetDetails.DomainBeaconBuilderGloas, api.publicKey[:], selectedPayload.bid.Signature[:])
+	if verifyErr != nil || !verifiedBid {
+		api.RespondError(w, http.StatusInternalServerError, "selected Gloas bid has an invalid relay signature")
 		return
 	}
 	payloadContext := selectedPayload.payload
@@ -2329,7 +2364,7 @@ func (api *RelayAPI) handleSubmitSignedBeaconBlock(w http.ResponseWriter, req *h
 	envelope := &common.ExecutionPayloadEnvelope{
 		Payload:               payloadContext.payload,
 		ExecutionRequests:     payloadContext.executionRequests,
-		BuilderIndex:          common.Uint64String(*api.opts.GloasBuilderIndex),
+		BuilderIndex:          common.Uint64String(selectedIndex),
 		BeaconBlockRoot:       phase0.Root(beaconBlockRootHash),
 		ParentBeaconBlockRoot: phase0.Root(parentRootHash),
 	}

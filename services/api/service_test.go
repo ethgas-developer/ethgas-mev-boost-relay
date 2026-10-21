@@ -393,6 +393,7 @@ func TestGetExecutionPayloadBid(t *testing.T) {
 	builderIndex := uint64(7)
 	backend.relay.opts.GloasBuilderIndex = &builderIndex
 	backend.relay.opts.EthNetDetails.GloasForkVersionHex = "0x80000038"
+	backend.relay.setGloasBuilderIdentity(builderIndex, true, "active")
 	proposerPreferencesDomain, err := common.ComputeDomain(
 		common.DomainTypeProposerPreferences,
 		backend.relay.opts.EthNetDetails.GloasForkVersionHex,
@@ -755,12 +756,38 @@ func TestGetExecutionPayloadBid(t *testing.T) {
 		require.Nil(t, mockBeacon.PublishedEnvelope)
 	})
 
+	t.Run("reject forged cached bid signature", func(t *testing.T) {
+		selection, cacheErr := backend.redis.GetGloasSelectedPayload(testSlot)
+		require.NoError(t, cacheErr)
+		require.NotNil(t, selection)
+		originalSignature := selection.Bid.Signature
+		selection.Bid.Signature[0] ^= 1
+		require.NoError(t, backend.redis.SaveGloasSelectedPayload(testSlot, selection))
+		t.Cleanup(func() {
+			selection.Bid.Signature = originalSignature
+			require.NoError(t, backend.redis.SaveGloasSelectedPayload(testSlot, selection))
+			backend.relay.gloasPayloads = make(map[string]*gloasPayloadContext)
+			backend.relay.gloasSelectedPayloads = make(map[uint64]*gloasSelectedPayloadContext)
+		})
+		backend.relay.gloasPayloads = make(map[string]*gloasPayloadContext)
+		backend.relay.gloasSelectedPayloads = make(map[uint64]*gloasSelectedPayloadContext)
+		mockBeacon.PublishedEnvelope = nil
+		response := backend.requestBytes(http.MethodPost, pathSubmitSignedBeaconBlock, []byte(signedBlockBody), headers)
+		require.Equal(t, http.StatusInternalServerError, response.Code, response.Body.String())
+		require.Contains(t, response.Body.String(), "invalid relay signature")
+		require.Nil(t, mockBeacon.PublishedEnvelope)
+	})
+
 	rr = backend.requestBytes(http.MethodPost, pathSubmitSignedBeaconBlock, []byte(fmt.Sprintf(`{"message":{"slot":"%d"}}`, testSlot)), headers)
 	require.Equal(t, http.StatusBadRequest, rr.Code, rr.Body.String())
 	// Clear both maps before the valid request. The selected bid and complete V6
 	// payload must be recovered from Redis rather than process memory.
 	backend.relay.gloasPayloads = make(map[string]*gloasPayloadContext)
 	backend.relay.gloasSelectedPayloads = make(map[uint64]*gloasSelectedPayloadContext)
+	// New bids stop after a registry outage, but a committed reveal must still
+	// recover from Redis using the builder index authenticated by our signed bid.
+	backend.relay.opts.GloasBuilderIndex = nil
+	backend.relay.setGloasBuilderIdentity(0, false, "beacon unavailable")
 	// Broadcast-only envelopes do not mark the slot as delivered.
 	mockBeacon.PublishEnvelopeCode = http.StatusAccepted
 	rr = backend.requestBytes(http.MethodPost, pathSubmitSignedBeaconBlock, []byte(signedBlockBody), headers)
