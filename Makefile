@@ -43,7 +43,7 @@ cover-html:
 	unlink /tmp/boost-relay.cover.tmp
 
 docker-image:
-	DOCKER_BUILDKIT=1 docker build --platform linux/amd64 --build-arg VERSION=${VERSION} . -t flashbots/mev-boost-relay
+	DOCKER_BUILDKIT=1 docker build --pull --platform linux/amd64 --build-arg VERSION=${VERSION} . -t flashbots/mev-boost-relay
 
 lt: lint test
 flt: fmt lint test

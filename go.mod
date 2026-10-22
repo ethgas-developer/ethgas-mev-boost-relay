@@ -1,6 +1,6 @@
 module bitbucket.org/infinity-exchange/mev-boost-relay
 
-go 1.24.0
+go 1.26.10
 
 require (
 	github.com/NYTimes/gziphandler v1.1.1
