@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -60,7 +61,7 @@ func TestGetHeaderMarketMode(t *testing.T) {
 		getHeaderRequestCutoffMs, delayGetHeader, getExchangeFinalizedCutoffMs = oldCutoff, oldDelay, oldFinalized
 		metrics.GetHeaderLatencyHistogram = oldHistogram
 	})
-	disableEthgasMarketAPI, realTimeBidMultiplier = false, "2"
+	disableEthgasMarketAPI, realTimeBidMultiplier = false, "100"
 	getHeaderRequestCutoffMs, delayGetHeader, getExchangeFinalizedCutoffMs = 0, 0, -2000
 	metrics.GetHeaderLatencyHistogram, _ = noop.NewMeterProvider().Meter("market-mode-test").Float64Histogram("latency")
 	explicitTrue, explicitFalse := true, false
@@ -96,7 +97,15 @@ func TestGetHeaderMarketMode(t *testing.T) {
 		{name: "explicit single relay", body: `{"success":true,"data":{"markets":{"slot":42,"multiRelay":false,"realtime":false}}}`, wantValue: "11000000000000000000099"},
 		{name: "explicit realtime single relay", body: `{"success":true,"data":{"markets":{"slot":42,"multiRelay":false,"realtime":true}}}`, wantValue: "11000000000000000000099"},
 		{name: "explicit multi relay", body: `{"success":true,"data":{"markets":{"slot":42,"multiRelay":true,"realtime":false}}}`, wantValue: "99"},
-		{name: "explicit realtime multi relay", body: `{"success":true,"data":{"markets":{"slot":42,"multiRelay":true,"realtime":true}}}`, wantValue: "198"},
+		{name: "explicit realtime multi relay", body: `{"success":true,"data":{"markets":{"slot":42,"multiRelay":true,"realtime":true}}}`, wantValue: "9900"},
+		{name: "realtime market slower than old deadline", transport: exchangeTestTransport(func(r *http.Request) (*http.Response, error) {
+			select {
+			case <-time.After(300 * time.Millisecond):
+				return marketModeTransport{status: http.StatusOK, body: `{"success":true,"data":{"markets":{"slot":42,"multiRelay":true,"realtime":true}}}`}.RoundTrip(r)
+			case <-r.Context().Done():
+				return nil, r.Context().Err()
+			}
+		}), wantValue: "9900"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			status := tc.status
@@ -107,7 +116,11 @@ func TestGetHeaderMarketMode(t *testing.T) {
 			if transport == nil {
 				transport = marketModeTransport{status: status, body: tc.body}
 			}
-			client = &ApiClient{AccessToken: "test-token", Client: &http.Client{Transport: transport}}
+			var requests atomic.Int32
+			client = &ApiClient{AccessToken: "test-token", Client: &http.Client{Transport: exchangeTestTransport(func(r *http.Request) (*http.Response, error) {
+				requests.Add(1)
+				return transport.RoundTrip(r)
+			})}}
 			if tc.missingToken {
 				client.AccessToken = ""
 			}
@@ -134,12 +147,18 @@ func TestGetHeaderMarketMode(t *testing.T) {
 			}
 			if tc.cachedMarket != nil {
 				api.marketCache.Store(uint64(42), &marketCacheEntry{value: tc.cachedMarket, expiration: time.Now().Add(time.Minute)})
+			} else {
+				// Complete the background attempt before serving a bid. Failed and
+				// incomplete market responses must still preserve the original bid.
+				_ = api.prefetchMarket(t.Context(), client, exchangeAPIURL, 42)
 			}
+			prefetchRequests := requests.Load()
 			req := mux.SetURLVars(httptest.NewRequest(http.MethodGet, "/eth/v1/builder/header/42/"+parent+"/"+proposer, nil), map[string]string{"slot": "42", "parent_hash": parent, "pubkey": proposer})
 			req.Header.Set("Accept", common.ApplicationJSON)
 			rr := httptest.NewRecorder()
 			start := time.Now()
 			api.handleGetHeader(rr, req)
+			require.Equal(t, prefetchRequests, requests.Load(), "getHeader must never call the market API, even on a cache miss")
 			require.Less(t, time.Since(start), 750*time.Millisecond, "exchange outages must not exhaust the proposer deadline")
 			require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
 			var response builderSpec.VersionedSignedBuilderBid

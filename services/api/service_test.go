@@ -568,6 +568,36 @@ func TestGetExecutionPayloadBid(t *testing.T) {
 		})
 	}
 
+	t.Run("prefetched realtime market", func(t *testing.T) {
+		previousMultiplier := realTimeBidMultiplier
+		previousGenesis := backend.relay.genesisInfo
+		t.Cleanup(func() {
+			realTimeBidMultiplier = previousMultiplier
+			backend.relay.genesisInfo = previousGenesis
+		})
+		realTimeBidMultiplier = "100"
+		backend.relay.genesisInfo = &beaconclient.GetGenesisResponse{Data: beaconclient.GetGenesisResponseData{
+			GenesisTime: uint64(time.Now().Unix()) - testSlot*common.SecondsPerSlot,
+		}}
+		var requests atomic.Int32
+		prefetchClient := &ApiClient{AccessToken: "test-token", Client: &http.Client{Transport: exchangeTestTransport(func(r *http.Request) (*http.Response, error) {
+			requests.Add(1)
+			return marketPrefetchResponse(r, true)
+		})}}
+		require.NoError(t, backend.relay.prefetchMarket(t.Context(), prefetchClient, "http://exchange.test", testSlot))
+		rr := backend.requestBytes(http.MethodPost, path, authJSON, headers)
+		require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+		result := new(common.VersionedSignedExecutionPayloadBidResponse)
+		require.NoError(t, json.Unmarshal(rr.Body.Bytes(), result))
+		require.Equal(t, phase0.Gwei(1100), result.Data.Message.ExecutionPayment)
+		verified, err := ssz.VerifySignature(result.Data.Message,
+			backend.relay.opts.EthNetDetails.DomainBeaconBuilderGloas,
+			backend.relay.publicKey[:], result.Data.Signature[:])
+		require.NoError(t, err)
+		require.True(t, verified)
+		require.Equal(t, int32(1), requests.Load())
+	})
+
 	for _, tc := range []struct {
 		name   string
 		status int
@@ -603,7 +633,11 @@ func TestGetExecutionPayloadBid(t *testing.T) {
 			exchangeAPIURL = server.URL
 			backend.relay.marketCache.Delete(testSlot)
 
-			// Both the initial lookup and its cached absence must preserve the bid.
+			// Failed background lookups preserve the bid; getBid never retries
+			// the exchange synchronously or caches a failed lookup for a full slot.
+			_ = backend.relay.prefetchMarket(t.Context(), client, exchangeAPIURL, testSlot)
+			_, cached := backend.relay.marketCache.Load(testSlot)
+			require.False(t, cached)
 			for attempt := 0; attempt < 2; attempt++ {
 				rr := backend.requestBytes(http.MethodPost, path, authJSON, headers)
 				require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
@@ -616,7 +650,7 @@ func TestGetExecutionPayloadBid(t *testing.T) {
 				require.NoError(t, err)
 				require.True(t, verified)
 			}
-			require.Equal(t, int32(1), requests.Load(), "second bid request should use the cached market absence")
+			require.Equal(t, int32(1), requests.Load(), "bid requests must not call the market API")
 		})
 	}
 
