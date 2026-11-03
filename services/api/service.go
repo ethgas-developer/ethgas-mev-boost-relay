@@ -491,9 +491,12 @@ type RelayAPI struct {
 	// Wait group used to monitor status of per-slot optimistic processing.
 	optimisticBlocksWG sync.WaitGroup
 	// Cache for builder statuses and collaterals.
-	blockBuildersCache map[string]*blockBuilderCacheEntry
-	builderCache       sync.Map // Key: slot (uint64), Value: *cacheEntry
-	marketCache        sync.Map // Key: slot (uint64), Value: *marketCacheEntry
+	blockBuildersCache   map[string]*blockBuilderCacheEntry
+	builderCache         sync.Map // Key: slot (uint64), Value: *cacheEntry
+	marketCache          sync.Map // Key: slot (uint64), Value: *marketCacheEntry
+	marketPrefetchMu     sync.Mutex
+	marketPrefetchCancel context.CancelFunc
+	marketPrefetchDone   chan struct{}
 }
 
 // Add a cache map and a mutex for thread safety
@@ -991,6 +994,9 @@ func (api *RelayAPI) StartServer() (err error) {
 		}()
 	}
 
+	api.startMarketPrefetch()
+	defer api.stopMarketPrefetch()
+
 	// Process current slot
 	api.processNewSlot(currentSlot)
 
@@ -1077,6 +1083,7 @@ func (api *RelayAPI) StopServer() (err error) {
 
 	// Drain HTTP handlers before waiting, so no new payload saves can be added.
 	err = api.srv.Shutdown(context.Background())
+	api.stopMarketPrefetch()
 	api.payloadSavesWG.Wait()
 	return err
 }
@@ -1992,10 +1999,8 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 	var marketAvailable, multiRelay, realTime bool
 
 	if !disableEthgasMarketAPI {
-		market, marketErr := api.getMarketForSlot(slot)
-		if marketErr != nil {
-			log.WithError(marketErr).Warn("failed to fetch market info; bid value left unchanged")
-		} else if market != nil && market.MultiRelay != nil && market.RealTime != nil {
+		market := api.cachedMarketForSlot(slot)
+		if market != nil && market.MultiRelay != nil && market.RealTime != nil {
 			marketAvailable = true
 			multiRelay = *market.MultiRelay
 			realTime = *market.RealTime
@@ -4375,10 +4380,6 @@ func FetchBuilderPubKey(ctx context.Context, apiURL string, slot uint64) (*Build
 	return &builderResp, nil
 }
 
-// Market lookups share the proposer's short getHeader deadline. Authentication
-// retries belong to the background worker, never to this request path.
-const marketRequestTimeout = 200 * time.Millisecond
-
 func (c *ApiClient) tokens() (string, string) {
 	c.tokenMutex.RLock()
 	defer c.tokenMutex.RUnlock()
@@ -4401,13 +4402,18 @@ func (c *ApiClient) invalidateAccessToken(rejectedToken string) {
 }
 
 func FetchWholeBlockMarket(apiURL string, slot uint64) (*WholeBlockMarket, error) {
-	c := client
+	return client.fetchWholeBlockMarket(context.Background(), apiURL, slot)
+}
+
+// Market requests run in the prefetch worker, outside the proposer's deadline.
+// Authentication retries remain the responsibility of the token refresh worker.
+func (c *ApiClient) fetchWholeBlockMarket(ctx context.Context, apiURL string, slot uint64) (*WholeBlockMarket, error) {
 	accessToken, _ := c.tokens()
 	if accessToken == "" {
 		return nil, errors.New("exchange authentication unavailable; background login pending")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), marketRequestTimeout)
+	ctx, cancel := context.WithTimeout(ctx, marketRequestTimeout)
 	defer cancel()
 	market, statusCode, err := c.requestWholeBlockMarket(ctx, apiURL, slot, accessToken)
 	if statusCode == http.StatusUnauthorized {
@@ -4893,7 +4899,7 @@ func (api *RelayAPI) startCacheCleaner() {
 			api.marketCache.Range(func(key, value interface{}) bool {
 				entry := value.(*marketCacheEntry)
 				if time.Now().After(entry.expiration) {
-					api.marketCache.Delete(key)
+					api.marketCache.CompareAndDelete(key, value)
 				}
 				return true
 			})
@@ -4915,31 +4921,16 @@ func (br *BuilderResponse) isBuilder(pubkey string) bool {
 	return false
 }
 
-func (api *RelayAPI) getMarketForSlot(slot uint64) (*WholeBlockMarket, error) {
+func (api *RelayAPI) cachedMarketForSlot(slot uint64) *WholeBlockMarket {
 	if cached, ok := api.marketCache.Load(slot); ok {
 		entry := cached.(*marketCacheEntry)
 		if time.Now().Before(entry.expiration) {
-			return entry.value, nil
+			return entry.value
 		}
-		api.marketCache.Delete(slot)
 	}
-
-	market, err := FetchWholeBlockMarket(exchangeAPIURL, slot)
-	cacheDuration := time.Duration(common.SecondsPerSlot) * time.Second
-	if err != nil || market == nil {
-		// Cache absence without inventing a single-relay market.
-		api.marketCache.Store(slot, &marketCacheEntry{
-			expiration: time.Now().Add(cacheDuration),
-		})
-		return nil, err
-	}
-
-	api.marketCache.Store(slot, &marketCacheEntry{
-		value:      market,
-		expiration: time.Now().Add(cacheDuration),
-	})
-
-	return market, nil
+	// Never call the exchange or cache absence on the bid response path. The
+	// background worker retries independently, including before this slot starts.
+	return nil
 }
 
 const validatorRegistrationRefreshInterval = 24 * time.Hour
