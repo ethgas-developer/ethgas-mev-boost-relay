@@ -379,11 +379,6 @@ func (br *BuilderResponse) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-type cacheBuilder struct {
-	value      *BuilderResponse
-	expiration time.Time
-}
-
 type marketCacheEntry struct {
 	value      *WholeBlockMarket
 	expiration time.Time
@@ -593,19 +588,12 @@ type RelayAPI struct {
 	optimisticBlocksWG sync.WaitGroup
 	// Cache for builder statuses and collaterals.
 	blockBuildersCache   map[string]*blockBuilderCacheEntry
-	builderCache         sync.Map // Key: slot (uint64), Value: *cacheEntry
+	exchangeLookups      exchangeLookupCache
 	marketCache          sync.Map // Key: slot (uint64), Value: *marketCacheEntry
 	marketPrefetchMu     sync.Mutex
 	marketPrefetchCancel context.CancelFunc
 	marketPrefetchDone   chan struct{}
 }
-
-// Add a cache map and a mutex for thread safety
-var (
-	preconfCache      = make(map[uint64]PreconfBundles)
-	preconfCacheMutex sync.RWMutex
-	currentSlot       uint64
-)
 
 type LoginCache struct {
 	AccessToken  string
@@ -4108,36 +4096,17 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		return
 	} else if !disableEthgasMarketAPI && msIntoSlot >= int64(getExchangeMarketCloseCutoffMs) {
 		slot := submission.BidTrace.Slot
-		var builderResp *BuilderResponse
-		if cachedBuilder, ok := api.builderCache.Load(slot); ok {
-			entry := cachedBuilder.(*cacheBuilder)
-			if time.Now().Before(entry.expiration) {
-				// Cache hit and not expired
-				builderResp = entry.value
-			} else {
-				// Cache expired, remove it
-				api.builderCache.Delete(slot)
-			}
-		}
-
-		// If not in cache or expired, fetch the builder response
-		if builderResp == nil {
-			builderResp, err = FetchBuilderPubKey(req.Context(), exchangeAPIURL, slot)
-			if err != nil {
-				log.WithError(err).Error("failed to get builder id from API")
-				builderResp = &BuilderResponse{
-					Slot:            slot,
-					Builders:        []string{},
-					FallbackBuilder: defaultBuilder,
-				}
-			}
-
+		builderResp, lookupErr := api.getBuilderAssignment(req.Context(), slot)
+		if lookupErr != nil {
+			log.WithError(lookupErr).WithField("slot", slot).Warn("builder assignment unavailable; rejecting submission")
+			api.RespondError(w, http.StatusServiceUnavailable, "builder assignment unavailable; retry submission")
+			return
 		}
 
 		builderPubkey := submission.BidTrace.BuilderPubkey.String()
 		// If Builders array is empty, allow all builders
 		if len(builderResp.Builders) == 0 {
-			log.Printf("Array list is empty, indicate market is not open or exchange issue, allow all builder")
+			log.Info("exchange returned an empty builder list; allowing all builders")
 		} else if builderResp.isBuilder(builderPubkey) {
 			log.Info("Builder pubkey matches FallbackBuilder or one of the Builders")
 		} else {
@@ -4146,82 +4115,19 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 			return
 		}
 
-		// Store when exchange finalized result in the cache with a 1-minute TTL
-		api.builderCache.Store(slot, &cacheBuilder{
-			value:      builderResp,
-			expiration: time.Now().Add(1 * time.Minute),
-		})
 		if msIntoSlot >= int64(getExchangeFinalizedCutoffMs) {
-			// Cache management code
-			preconfCacheMutex.Lock()
-			if submission.BidTrace.Slot != currentSlot {
-				preconfCache = make(map[uint64]PreconfBundles)
-				currentSlot = submission.BidTrace.Slot
+			cachedPreconfs, lookupErr := api.getSlotBundles(req.Context(), slot)
+			if lookupErr != nil {
+				log.WithError(lookupErr).WithField("slot", slot).Warn("slot bundles unavailable; rejecting submission")
+				api.RespondError(w, http.StatusServiceUnavailable, "slot bundles unavailable; retry submission")
+				return
 			}
-			preconfCacheMutex.Unlock()
 
-			// Check cache first
-			preconfCacheMutex.RLock()
-			cachedPreconfs, exists := preconfCache[submission.BidTrace.Slot]
-			preconfCacheMutex.RUnlock()
-
-			if !exists {
-				// Bound the lookup so an exchange outage does not consume the bidding window.
-				ctx, cancel := context.WithTimeout(req.Context(), 500*time.Millisecond)
-				url := fmt.Sprintf("%s/api/v1/slot/bundles?slot=%d", client.APIURL, submission.BidTrace.Slot)
-				bundleReq, fetchErr := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-				var apiResponse ApiResponse
-				if fetchErr == nil {
-					accessToken, _ := client.tokens()
-					bundleReq.Header.Set("Authorization", "Bearer "+accessToken)
-					var resp *http.Response
-					resp, fetchErr = client.Client.Do(bundleReq)
-					if fetchErr == nil {
-						if resp.StatusCode != http.StatusOK {
-							fetchErr = fmt.Errorf("slot bundles returned HTTP %d", resp.StatusCode)
-						} else {
-							fetchErr = json.NewDecoder(resp.Body).Decode(&apiResponse)
-						}
-						resp.Body.Close()
-					}
-				}
-				cancel()
-
-				if fetchErr == nil && !apiResponse.Success {
-					fetchErr = errors.New("slot bundles response indicates failure")
-				}
-				var preconfBundles *PreconfBundles
-				if fetchErr == nil {
-					fetchErr = json.Unmarshal(apiResponse.Data, &preconfBundles)
-					if fetchErr == nil && preconfBundles == nil {
-						fetchErr = errors.New("slot bundles response has no data")
-					}
-					if fetchErr == nil {
-						if preconfBundles.Slot == nil {
-							fetchErr = errors.New("slot bundles response has no slot")
-						} else if *preconfBundles.Slot != submission.BidTrace.Slot {
-							fetchErr = fmt.Errorf("slot bundles response slot %d does not match requested slot %d", *preconfBundles.Slot, submission.BidTrace.Slot)
-						}
-					}
-				}
-				if fetchErr != nil {
-					// Fail open without caching an empty response, so later submissions
-					// retry the exchange and enforce its constraints once it recovers.
-					log.WithError(fetchErr).WithField("slot", submission.BidTrace.Slot).
-						Warn("slot bundles unavailable; continuing bid without exchange bundle checks")
-				} else {
-					preconfCacheMutex.Lock()
-					preconfCache[submission.BidTrace.Slot] = *preconfBundles
-					preconfCacheMutex.Unlock()
-					cachedPreconfs = *preconfBundles
-					exists = true
-				}
-			}
-			if exists && cachedPreconfs.FeeRecipient != "" {
+			if cachedPreconfs.FeeRecipient != "" {
 				feeRecipient = cachedPreconfs.FeeRecipient
 			}
 
-			if exists && !skipPreconfCheck {
+			if !skipPreconfCheck {
 
 				// Transaction checking logic
 				// Convert all block transactions to lowercase for case-insensitive comparison
@@ -4344,7 +4250,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 					// Remains empty string for valid case
 				}
 			}
-			if exists && !skipEmptySpaceCheck {
+			if !skipEmptySpaceCheck {
 				//check remain empty space
 				if cachedPreconfs.EmptySpace > 0 { // Check if EmptySpace is greater than 0
 					//empty space === -1 = full block empty submission.BidTrace.GasLimit
@@ -5286,6 +5192,10 @@ func FetchBuilderPubKey(ctx context.Context, apiURL string, slot uint64) (*Build
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return nil, newExchangeRateLimitError(resp.Header.Get("Retry-After"))
+	}
+
 	// Read the response body
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -5847,13 +5757,6 @@ func (api *RelayAPI) startCacheCleaner() {
 	go func() {
 		for {
 			time.Sleep(1 * time.Minute) // Run every minute
-			api.builderCache.Range(func(key, value interface{}) bool {
-				entry := value.(*cacheBuilder)
-				if time.Now().After(entry.expiration) {
-					api.builderCache.Delete(key)
-				}
-				return true
-			})
 			api.marketCache.Range(func(key, value interface{}) bool {
 				entry := value.(*marketCacheEntry)
 				if time.Now().After(entry.expiration) {

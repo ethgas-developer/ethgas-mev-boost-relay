@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -41,15 +42,8 @@ func newGloasExchangeBidFixture(t *testing.T, payout bellatrix.ExecutionAddress,
 	t.Helper()
 	f := new(gloasExchangeBidFixture)
 	previousClient, previousDisabled := client, disableEthgasMarketAPI
-	preconfCacheMutex.Lock()
-	previousPreconfs := preconfCache
-	preconfCache = make(map[uint64]PreconfBundles)
-	preconfCacheMutex.Unlock()
 	t.Cleanup(func() {
 		client, disableEthgasMarketAPI = previousClient, previousDisabled
-		preconfCacheMutex.Lock()
-		preconfCache = previousPreconfs
-		preconfCacheMutex.Unlock()
 		require.Zero(t, f.requests.Load(), "getBid must not make additional exchange HTTP calls")
 	})
 	disableEthgasMarketAPI = true
@@ -138,9 +132,15 @@ func (f *gloasExchangeBidFixture) cacheMarketMode() {
 }
 
 func (f *gloasExchangeBidFixture) cacheBuyer(buyer string, slot *uint64) {
-	preconfCacheMutex.Lock()
-	preconfCache[testSlot] = PreconfBundles{Slot: slot, FeeRecipient: buyer}
-	preconfCacheMutex.Unlock()
+	f.backend.relay.exchangeLookups.save(f.bundleLookupKey(), &PreconfBundles{Slot: slot, FeeRecipient: buyer}, nil)
+}
+
+func (f *gloasExchangeBidFixture) bundleLookupKey() exchangeLookupKey {
+	apiURL := exchangeAPIURL
+	if client != nil && client.APIURL != "" {
+		apiURL = client.APIURL
+	}
+	return exchangeLookupKey{apiURL: strings.TrimRight(apiURL, "/"), endpoint: "bundles", slot: testSlot}
 }
 
 func (f *gloasExchangeBidFixture) request(t *testing.T, contentType string) *httptest.ResponseRecorder {
@@ -241,9 +241,6 @@ func TestGloasExchangeBidPersistedOverrideAcrossInstances(t *testing.T) {
 	f.cacheBuyer(buyer.String(), &slot)
 	firstBid := f.requireBid(t, common.ApplicationJSON)
 	firstRelay := f.backend.relay
-	preconfCacheMutex.Lock()
-	preconfCache = make(map[uint64]PreconfBundles)
-	preconfCacheMutex.Unlock()
 	previousDisabled := disableEthgasMarketAPI
 	disableEthgasMarketAPI = true
 	secondRelay, err := NewRelayAPI(firstRelay.opts)
@@ -265,6 +262,62 @@ func TestGloasExchangeBidPersistedOverrideAcrossInstances(t *testing.T) {
 	require.Equal(t, &buyer, recovered.exchangeFeeRecipient)
 	require.Equal(t, buyer, recovered.feeRecipient)
 	require.Equal(t, buyer, recovered.bidTrace.ProposerFeeRecipient)
+}
+
+func TestGloasExchangeBidCachedLookupPolicy(t *testing.T) {
+	for _, name := range []string{
+		"client URL selects current bundle cache",
+		"temporary lookup failure preserves snapshot",
+		"rate limit preserves snapshot",
+		"expired current response preserves snapshot",
+		"cached revocation wins over rate limit",
+		"wrong slot in current cache rejects payout",
+	} {
+		t.Run(name, func(t *testing.T) {
+			buyer := testAddress2
+			f := newGloasExchangeBidFixture(t, buyer, &buyer)
+			client.APIURL = "https://cached-exchange.test///"
+			key := f.bundleLookupKey()
+			slot := testSlot
+			rejected := false
+			switch name {
+			case "client URL selects current bundle cache":
+				f.cacheBuyer("", &slot)
+				rejected = true
+			case "temporary lookup failure preserves snapshot":
+				f.backend.relay.exchangeLookups.save(key, nil, errors.New("exchange unavailable"))
+			case "rate limit preserves snapshot":
+				f.backend.relay.exchangeLookups.save(key, nil, newExchangeRateLimitError("60"))
+			case "expired current response preserves snapshot":
+				f.cacheBuyer("", &slot)
+				cache := &f.backend.relay.exchangeLookups
+				cache.mu.Lock()
+				entry := cache.entries[key]
+				entry.expiration = time.Now().Add(-time.Second)
+				cache.entries[key] = entry
+				cache.mu.Unlock()
+			case "cached revocation wins over rate limit":
+				f.cacheBuyer("", &slot)
+				key.endpoint = "builders"
+				f.backend.relay.exchangeLookups.save(key, nil, newExchangeRateLimitError("60"))
+				rejected = true
+			case "wrong slot in current cache rejects payout":
+				slot++
+				f.cacheBuyer(buyer.String(), &slot)
+				rejected = true
+			}
+			for _, contentType := range []string{common.ApplicationJSON, common.ApplicationOctetStream} {
+				if rejected {
+					rr := f.request(t, contentType)
+					require.Equal(t, http.StatusNoContent, rr.Code, rr.Body.String())
+					require.Empty(t, f.backend.relay.gloasSelectedPayloads)
+					f.requireUnchanged(t)
+				} else {
+					f.requireBid(t, contentType)
+				}
+			}
+		})
+	}
 }
 
 func TestGloasExchangeBidRejectsUnauthorizedPayout(t *testing.T) {

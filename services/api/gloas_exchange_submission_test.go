@@ -204,8 +204,10 @@ func (fixture *gloasExchangeSubmissionFixture) requireAccepted(t *testing.T, enc
 }
 
 type gloasExchangeStub struct {
-	builderCalls atomic.Int32
-	bundleCalls  atomic.Int32
+	builderCalls  atomic.Int32
+	bundleCalls   atomic.Int32
+	builderStatus atomic.Int32
+	bundleStatus  atomic.Int32
 }
 
 func stubGloasSubmissionExchange(t *testing.T, assignment BuilderResponse, bundles PreconfBundles) *gloasExchangeStub {
@@ -213,12 +215,15 @@ func stubGloasSubmissionExchange(t *testing.T, assignment BuilderResponse, bundl
 	stub := new(gloasExchangeStub)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var data any
+		var status int32
 		switch r.URL.Path {
 		case fmt.Sprintf("/api/v1/p/builder/%d", testSlot):
 			stub.builderCalls.Add(1)
+			status = stub.builderStatus.Load()
 			data = assignment
 		case "/api/v1/slot/bundles":
 			stub.bundleCalls.Add(1)
+			status = stub.bundleStatus.Load()
 			if r.URL.Query().Get("slot") != fmt.Sprint(testSlot) || r.Header.Get("Authorization") != "Bearer gloas-exchange-test-token" {
 				t.Error("bundle lookup must use the submission slot and authenticated exchange client")
 				http.Error(w, "incorrect bundle lookup", http.StatusUnauthorized)
@@ -233,6 +238,11 @@ func stubGloasSubmissionExchange(t *testing.T, assignment BuilderResponse, bundl
 		if r.Method != http.MethodGet {
 			t.Errorf("exchange lookup method = %s, want GET", r.Method)
 		}
+		if status != 0 {
+			w.Header().Set("Retry-After", "60")
+			http.Error(w, "exchange unavailable", int(status))
+			return
+		}
 		w.Header().Set(HeaderContentType, ApplicationJSON)
 		_ = json.NewEncoder(w).Encode(struct {
 			Success bool `json:"success"`
@@ -246,23 +256,17 @@ func stubGloasSubmissionExchange(t *testing.T, assignment BuilderResponse, bundl
 }
 
 func TestBuilderSubmitBlockGloasExchange(t *testing.T) {
-	// Package tests deliberately run serially: these settings and the bundle
-	// cache are process-wide, while the assignment cache belongs to each relay.
+	// Package tests deliberately run serially because exchange settings are
+	// process-wide. Each fixture has its own assignment and bundle cache.
 	previousDisabled, previousURL, previousClient := disableEthgasMarketAPI, exchangeAPIURL, client
 	previousFinalized, previousClose := getExchangeFinalizedCutoffMs, getExchangeMarketCloseCutoffMs
 	previousPreconfCheck, previousSpaceCheck := skipPreconfCheck, skipEmptySpaceCheck
 	previousNamespace := simRPCNamespace
-	preconfCacheMutex.Lock()
-	previousCache, previousSlot := preconfCache, currentSlot
-	preconfCacheMutex.Unlock()
 	t.Cleanup(func() {
 		disableEthgasMarketAPI, exchangeAPIURL, client = previousDisabled, previousURL, previousClient
 		getExchangeFinalizedCutoffMs, getExchangeMarketCloseCutoffMs = previousFinalized, previousClose
 		skipPreconfCheck, skipEmptySpaceCheck = previousPreconfCheck, previousSpaceCheck
 		simRPCNamespace = previousNamespace
-		preconfCacheMutex.Lock()
-		preconfCache, currentSlot = previousCache, previousSlot
-		preconfCacheMutex.Unlock()
 	})
 	getExchangeFinalizedCutoffMs, getExchangeMarketCloseCutoffMs = -2000, -4000
 	skipPreconfCheck, skipEmptySpaceCheck = false, false
@@ -277,23 +281,22 @@ func TestBuilderSubmitBlockGloasExchange(t *testing.T) {
 				"markets disabled avoid exchange",
 				"empty exchange recipient falls back to signed preferences",
 				"cached assignment and bundles avoid fetch",
-				"cross-slot bundles fail open without caching",
-				"cross-slot assignment fails open",
+				"cross-slot bundles rejected without caching",
+				"cross-slot assignment rejected without caching",
+				"rate-limited assignment rejected with cooldown",
+				"rate-limited bundles rejected with cooldown",
 				"exchange recipient does not bypass missing preferences",
 				"exchange recipient does not bypass signed gas target",
 			} {
 				t.Run(name, func(t *testing.T) {
 					disableEthgasMarketAPI = false
-					preconfCacheMutex.Lock()
-					preconfCache, currentSlot = make(map[uint64]PreconfBundles), testSlot
-					preconfCacheMutex.Unlock()
 					fixture := newGloasExchangeSubmissionFixture(t, name != "exchange recipient does not bypass missing preferences")
 					assignment := BuilderResponse{Slot: testSlot, Builders: []string{fixture.request.Message.BuilderPubkey.String()}}
 					bundleSlot := testSlot
 					bundles := PreconfBundles{Slot: &bundleSlot, FeeRecipient: testAddress2.String()}
 					fixture.request.Message.ProposerFeeRecipient = testAddress2
 					switch name {
-					case "validator recipient rejected when buyer differs", "markets disabled avoid exchange", "empty exchange recipient falls back to signed preferences", "cross-slot bundles fail open without caching":
+					case "validator recipient rejected when buyer differs", "markets disabled avoid exchange", "empty exchange recipient falls back to signed preferences", "cross-slot bundles rejected without caching":
 						fixture.request.Message.ProposerFeeRecipient = testAddress
 					}
 					switch name {
@@ -304,9 +307,9 @@ func TestBuilderSubmitBlockGloasExchange(t *testing.T) {
 						assignment.Builders = []string{testBuilderPubkey}
 					case "empty exchange recipient falls back to signed preferences":
 						bundles.FeeRecipient = ""
-					case "cross-slot bundles fail open without caching":
+					case "cross-slot bundles rejected without caching":
 						bundleSlot++
-					case "cross-slot assignment fails open":
+					case "cross-slot assignment rejected without caching":
 						assignment.Slot++
 						assignment.Builders = []string{testBuilderPubkey}
 					case "exchange recipient does not bypass signed gas target":
@@ -318,14 +321,25 @@ func TestBuilderSubmitBlockGloasExchange(t *testing.T) {
 						fixture.request.ExecutionPayload.GasLimit++
 					}
 					exchange := stubGloasSubmissionExchange(t, assignment, bundles)
+					switch name {
+					case "rate-limited assignment rejected with cooldown":
+						exchange.builderStatus.Store(http.StatusTooManyRequests)
+					case "rate-limited bundles rejected with cooldown":
+						exchange.bundleStatus.Store(http.StatusTooManyRequests)
+					}
 					if name == "cached assignment and bundles avoid fetch" {
-						fixture.backend.relay.builderCache.Store(testSlot, &cacheBuilder{value: &assignment, expiration: time.Now().Add(time.Minute)})
-						preconfCacheMutex.Lock()
-						preconfCache[testSlot] = bundles
-						preconfCacheMutex.Unlock()
+						_, err := fixture.backend.relay.exchangeLookups.save(exchangeLookupKey{apiURL: exchangeAPIURL, endpoint: "builders", slot: testSlot}, &assignment, nil)
+						require.NoError(t, err)
+						_, err = fixture.backend.relay.exchangeLookups.save(exchangeLookupKey{apiURL: exchangeAPIURL, endpoint: "bundles", slot: testSlot}, &bundles, nil)
+						require.NoError(t, err)
 					}
 					var rejected string
+					rejectedStatus := http.StatusBadRequest
 					switch name {
+					case "cross-slot assignment rejected without caching", "rate-limited assignment rejected with cooldown":
+						rejected, rejectedStatus = "builder assignment unavailable", http.StatusServiceUnavailable
+					case "cross-slot bundles rejected without caching", "rate-limited bundles rejected with cooldown":
+						rejected, rejectedStatus = "slot bundles unavailable", http.StatusServiceUnavailable
 					case "validator recipient rejected when buyer differs":
 						rejected = "fee recipient does not match"
 					case "nondelegated builder rejected":
@@ -337,7 +351,7 @@ func TestBuilderSubmitBlockGloasExchange(t *testing.T) {
 					}
 					if rejected != "" {
 						rr := fixture.submit(t, encoding)
-						require.Equal(t, http.StatusBadRequest, rr.Code, rr.Body.String())
+						require.Equal(t, rejectedStatus, rr.Code, rr.Body.String())
 						require.Contains(t, rr.Body.String(), rejected)
 						require.Empty(t, fixture.simulated, "rejected submission must not be simulated")
 						cached, err := fixture.backend.redis.GetGloasPayload(testSlot, fixture.request.ExecutionPayload.BlockHash.String())
@@ -350,26 +364,32 @@ func TestBuilderSubmitBlockGloasExchange(t *testing.T) {
 					case "markets disabled avoid exchange", "cached assignment and bundles avoid fetch":
 						require.Zero(t, exchange.builderCalls.Load())
 						require.Zero(t, exchange.bundleCalls.Load())
-					case "nondelegated builder rejected":
+					case "nondelegated builder rejected", "cross-slot assignment rejected without caching", "rate-limited assignment rejected with cooldown":
 						require.EqualValues(t, 1, exchange.builderCalls.Load())
 						require.Zero(t, exchange.bundleCalls.Load())
 					default:
 						require.EqualValues(t, 1, exchange.builderCalls.Load())
 						require.EqualValues(t, 1, exchange.bundleCalls.Load())
 					}
-					if name == "cross-slot bundles fail open without caching" {
-						preconfCacheMutex.RLock()
-						_, cached := preconfCache[testSlot]
-						preconfCacheMutex.RUnlock()
-						require.False(t, cached, "another slot's recipient must not poison the submission cache")
-						fixture.request.Message.Value = uint256.NewInt(2)
-						fixture.requireAccepted(t, encoding)
-						require.EqualValues(t, 1, exchange.builderCalls.Load(), "valid assignment should be cached")
-						require.EqualValues(t, 2, exchange.bundleCalls.Load(), "invalid bundle response must be retried")
-						fixture.request.Message.ProposerFeeRecipient = testAddress2
+					if rejectedStatus == http.StatusServiceUnavailable {
+						endpoint := "bundles"
+						if rejected == "builder assignment unavailable" {
+							endpoint = "builders"
+						}
+						cache := &fixture.backend.relay.exchangeLookups
+						cache.mu.Lock()
+						_, cached := cache.entries[exchangeLookupKey{apiURL: exchangeAPIURL, endpoint: endpoint, slot: testSlot}]
+						cache.mu.Unlock()
+						require.False(t, cached, "an unavailable or cross-slot response must not become a successful cached response")
+					}
+					if name == "rate-limited assignment rejected with cooldown" || name == "rate-limited bundles rejected with cooldown" {
+						builderCalls, bundleCalls := exchange.builderCalls.Load(), exchange.bundleCalls.Load()
 						rr := fixture.submit(t, encoding)
-						require.Equal(t, http.StatusBadRequest, rr.Code, rr.Body.String())
-						require.Contains(t, rr.Body.String(), "fee recipient does not match")
+						require.Equal(t, http.StatusServiceUnavailable, rr.Code, rr.Body.String())
+						require.Contains(t, rr.Body.String(), rejected)
+						require.Equal(t, builderCalls, exchange.builderCalls.Load(), "retry must not refetch during cooldown")
+						require.Equal(t, bundleCalls, exchange.bundleCalls.Load(), "retry must not refetch during cooldown")
+						require.Empty(t, fixture.simulated)
 					}
 				})
 			}

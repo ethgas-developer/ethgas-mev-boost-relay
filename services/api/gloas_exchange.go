@@ -3,6 +3,7 @@ package api
 import (
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/attestantio/go-eth2-client/spec/bellatrix"
 	"github.com/flashbots/go-boost-utils/utils"
@@ -30,11 +31,18 @@ func (api *RelayAPI) gloasPayloadPayoutRecipient(payload *gloasPayloadContext, p
 	if disableEthgasMarketAPI {
 		return proposerRecipient, nil
 	}
-	preconfCacheMutex.RLock()
-	preconfs, known := preconfCache[payload.slot]
-	preconfCacheMutex.RUnlock()
-	if known {
-		if preconfs.Slot == nil || *preconfs.Slot != payload.slot {
+	apiURL := exchangeAPIURL
+	if client != nil && client.APIURL != "" {
+		apiURL = client.APIURL
+	}
+	// This is deliberately cache-only: the proposer deadline must not wait
+	// for an exchange request or treat a lookup cooldown as payout policy.
+	value, cacheErr, known := api.exchangeLookups.load(exchangeLookupKey{
+		apiURL: strings.TrimRight(apiURL, "/"), endpoint: "bundles", slot: payload.slot,
+	})
+	if known && cacheErr == nil {
+		preconfs, ok := value.(*PreconfBundles)
+		if !ok || preconfs == nil || preconfs.Slot == nil || *preconfs.Slot != payload.slot {
 			return bellatrix.ExecutionAddress{}, errors.New("cached exchange bundles do not match Gloas slot")
 		}
 		recipient, _, err := gloasSubmissionFeeRecipient(proposerRecipient, preconfs.FeeRecipient)
