@@ -587,12 +587,15 @@ type RelayAPI struct {
 	// Wait group used to monitor status of per-slot optimistic processing.
 	optimisticBlocksWG sync.WaitGroup
 	// Cache for builder statuses and collaterals.
-	blockBuildersCache   map[string]*blockBuilderCacheEntry
-	exchangeLookups      exchangeLookupCache
-	marketCache          sync.Map // Key: slot (uint64), Value: *marketCacheEntry
-	marketPrefetchMu     sync.Mutex
-	marketPrefetchCancel context.CancelFunc
-	marketPrefetchDone   chan struct{}
+	blockBuildersCache     map[string]*blockBuilderCacheEntry
+	exchangeLookups        exchangeLookupCache
+	exchangePrefetchMu     sync.Mutex
+	exchangePrefetchCancel context.CancelFunc
+	exchangePrefetchDone   chan struct{}
+	marketCache            sync.Map // Key: slot (uint64), Value: *marketCacheEntry
+	marketPrefetchMu       sync.Mutex
+	marketPrefetchCancel   context.CancelFunc
+	marketPrefetchDone     chan struct{}
 }
 
 type LoginCache struct {
@@ -1133,6 +1136,8 @@ func (api *RelayAPI) StartServer() (err error) {
 		}
 	}
 
+	api.startExchangePrefetch()
+	defer api.stopExchangePrefetch()
 	api.startMarketPrefetch()
 	defer api.stopMarketPrefetch()
 
@@ -1229,6 +1234,7 @@ func (api *RelayAPI) StopServer() (err error) {
 
 	// Drain HTTP handlers before waiting, so no new payload saves can be added.
 	err = api.srv.Shutdown(context.Background())
+	api.stopExchangePrefetch()
 	api.stopMarketPrefetch()
 	api.payloadSavesWG.Wait()
 	return err
