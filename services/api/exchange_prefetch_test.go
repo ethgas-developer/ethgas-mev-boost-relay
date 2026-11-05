@@ -160,13 +160,49 @@ func TestExchangePrefetchParallelAndSharedWithSubmissions(t *testing.T) {
 	require.EqualValues(t, 2, requests.Load(), "background and concurrent submission lookups must share their requests")
 }
 
+func TestExchangePrefetchEmptyBuilderAssignment(t *testing.T) {
+	var upcomingCalls atomic.Int32
+	api := newExchangePrefetchTestAPI(t, exchangeTestTransport(func(r *http.Request) (*http.Response, error) {
+		endpoint, slot, err := exchangePrefetchRequest(r)
+		if err != nil {
+			return nil, err
+		}
+		if slot == 42 {
+			upcomingCalls.Add(1)
+		}
+		if endpoint == "builders" {
+			return marketModeTransport{status: http.StatusOK, body: `{"success":true,"data":{}}`}.RoundTrip(r)
+		}
+		return exchangePrefetchResponse(r)
+	}))
+	finalized := time.Unix(int64(api.genesisInfo.Data.GenesisTime+42*common.SecondsPerSlot), 0).
+		Add(time.Duration(getExchangeFinalizedCutoffMs) * time.Millisecond)
+	lastResults := make(map[exchangePrefetchKey]string)
+	api.prefetchExchangeWindow(context.Background(), finalized.Add(-time.Nanosecond), lastResults)
+	require.Zero(t, upcomingCalls.Load(), "empty assignments must not be cached before finalization")
+	api.prefetchExchangeWindow(context.Background(), finalized, lastResults)
+	require.EqualValues(t, 2, upcomingCalls.Load())
+	for range 2 {
+		assignment, err := api.getBuilderAssignment(context.Background(), 42)
+		require.NoError(t, err)
+		require.Equal(t, uint64(42), assignment.Slot)
+		require.Empty(t, assignment.Builders, "empty builder lists allow all builders at submission admission")
+		require.Empty(t, assignment.FallbackBuilder)
+		bundles, err := api.getSlotBundles(context.Background(), 42)
+		require.NoError(t, err)
+		require.Equal(t, testAddress2.String(), bundles.FeeRecipient, "allow-all must preserve other submission constraints")
+	}
+	api.prefetchExchangeWindow(context.Background(), finalized, lastResults)
+	require.EqualValues(t, 2, upcomingCalls.Load(), "submission and background lookups must reuse the cached empty assignment")
+}
+
 func TestExchangePrefetchInvalidResponseRecovery(t *testing.T) {
 	var requests atomic.Int32
 	var recovered atomic.Bool
 	api := newExchangePrefetchTestAPI(t, exchangeTestTransport(func(r *http.Request) (*http.Response, error) {
 		requests.Add(1)
 		if !recovered.Load() {
-			return marketModeTransport{status: http.StatusOK, body: `{"success":true,"data":{}}`}.RoundTrip(r)
+			return marketModeTransport{status: http.StatusOK, body: `{"success":true,"data":null}`}.RoundTrip(r)
 		}
 		return exchangePrefetchResponse(r)
 	}))
