@@ -5233,6 +5233,19 @@ func FetchBuilderPubKey(ctx context.Context, apiURL string, slot uint64) (*Build
 		return nil, fmt.Errorf("empty data in API response")
 	}
 
+	var builderFields map[string]json.RawMessage
+	if err := json.Unmarshal(apiResponse.Data, &builderFields); err != nil {
+		return nil, fmt.Errorf("failed to decode builder response: %w", err)
+	}
+	if builderFields == nil {
+		return nil, errors.New("builder response must be a JSON object")
+	}
+	if len(builderFields) == 0 {
+		// A successful empty object means the exchange imposes no builder
+		// restriction. Bind it to the requested slot for caching and admission.
+		return &BuilderResponse{Slot: slot}, nil
+	}
+
 	var builderResp BuilderResponse
 	err = json.Unmarshal(apiResponse.Data, &builderResp)
 	if err != nil {
